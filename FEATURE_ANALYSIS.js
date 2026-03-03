@@ -58,8 +58,8 @@ const features = {
     { name: "Remote Development", status: "❌", reason: "Not implemented" },
   ],
   "Performance & Navigation": [
-    { name: "Fast File Navigation (Ctrl+P)", status: "❌", reason: "CommandPalette exists but limited" },
-    { name: "Project-wide Search", status: "⚠️", reason: "Only searches open files" },
+    { name: "Fast File Navigation (Ctrl+P)", status: "✅", reason: "Implemented via QuickOpenPanel with fuzzy search" },
+    { name: "Project-wide Search", status: "✅", reason: "SearchReplacePanel scans workspace folders" },
     { name: "Symbol Search (Ctrl+T)", status: "✅", reason: "Implemented with SymbolSearchPanel" },
     { name: "Lightweight Execution", status: "✅", reason: "Proven by fast startup" },
   ],
@@ -115,12 +115,9 @@ console.log(`  ❌ Missing:            ${missing} (${Math.round((missing/totalFe
 
 console.log('\n🎯 HIGH-IMPACT MISSING FEATURES (Recommended Implementation Order)\n');
 const recommendations = [
-  { priority: 1, feature: "Quick File Open (Ctrl+P)", impact: "High", effort: "Medium", status: "QuickOpenPanel" },
-  { priority: 2, feature: "Search & Replace (Regex)", impact: "High", effort: "Medium", status: "EnhanceSearchPanel" },
-  { priority: 3, feature: "Symbol Search (Ctrl+T)", impact: "High", effort: "Medium", status: "SymbolSearchPanel" },
-  { priority: 4, feature: "Settings Panel", impact: "Medium", effort: "Medium", status: "SettingsPanel" },
-  { priority: 5, feature: "Basic Git Status", impact: "Medium", effort: "Low", status: "Enhance StatusBar" },
-  { priority: 6, feature: "Keyboard Shortcuts Viewer", impact: "Low", effort: "Low", status: "KeyBindingsPanel" },
+  { priority: 1, feature: "Settings Panel", impact: "Medium", effort: "Medium", status: "SettingsPanel" },
+  { priority: 2, feature: "Basic Git Status", impact: "Medium", effort: "Low", status: "Enhance StatusBar" },
+  { priority: 3, feature: "Keyboard Shortcuts Viewer", impact: "Low", effort: "Low", status: "KeyBindingsPanel" },
 ];
 
 recommendations.forEach(item => {

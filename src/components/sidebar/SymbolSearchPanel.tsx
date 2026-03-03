@@ -8,12 +8,13 @@ interface Symbol {
   type: "function" | "class" | "variable" | "constant";
   line: number;
   filePath: string;
+  fileName: string;
 }
 
 export function SymbolSearchPanel() {
   const [query, setQuery] = useState("");
   const [symbols, setSymbols] = useState<Symbol[]>([]);
-  const { tabs, openFile, setCursorPosition, activeTabId } = useEditorStore();
+  const { tabs, openFileAt } = useEditorStore();
   const inputRef = useRef<HTMLInputElement>(null);
 
   useEffect(() => {
@@ -37,6 +38,7 @@ export function SymbolSearchPanel() {
             type: "function",
             line: idx + 1,
             filePath: tab.filePath,
+            fileName: tab.fileName,
           });
         }
 
@@ -48,6 +50,7 @@ export function SymbolSearchPanel() {
             type: "class",
             line: idx + 1,
             filePath: tab.filePath,
+            fileName: tab.fileName,
           });
         }
 
@@ -59,6 +62,7 @@ export function SymbolSearchPanel() {
             type: "constant",
             line: idx + 1,
             filePath: tab.filePath,
+            fileName: tab.fileName,
           });
         }
       });
@@ -80,11 +84,8 @@ export function SymbolSearchPanel() {
     }
   }, [query, tabs]);
 
-  const handleSelectSymbol = (symbol: Symbol) => {
-    openFile(symbol.filePath);
-    if (activeTabId) {
-      setCursorPosition(activeTabId, symbol.line, 1);
-    }
+  const handleSelectSymbol = async (symbol: Symbol) => {
+    await openFileAt(symbol.filePath, symbol.line, 1);
   };
 
   const typeIcons: Record<string, string> = {
@@ -149,7 +150,7 @@ export function SymbolSearchPanel() {
                   </span>
                 </div>
                 <span style={{ fontSize: 11, color: "var(--text-secondary)", marginTop: "3px" }}>
-                  {symbol.filePath.split(/[\\/]/).pop()}:{symbol.line}
+                  {symbol.fileName}:{symbol.line}
                 </span>
               </div>
             ))

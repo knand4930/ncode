@@ -49,6 +49,22 @@ export function EditorArea() {
       await saveFile(currentTabId);
     });
 
+    // find / replace commands
+    editor.addCommand(monaco.KeyMod.CtrlCmd | monaco.KeyCode.KeyF, () => {
+      // open inline find widget
+      editor.getAction("actions.find")?.run();
+    });
+    editor.addCommand(monaco.KeyMod.CtrlCmd | monaco.KeyCode.KeyH, () => {
+      // open find & replace widget
+      editor.getAction("editor.action.startFindReplaceAction")?.run();
+    });
+    editor.addCommand(monaco.KeyCode.F3, () => {
+      editor.getAction("editor.action.nextMatchFindAction")?.run();
+    });
+    editor.addCommand(monaco.KeyMod.Shift | monaco.KeyCode.F3, () => {
+      editor.getAction("editor.action.previousMatchFindAction")?.run();
+    });
+
     // Register AI inline completion provider
     if (isOllamaRunning) {
       monaco.languages.registerInlineCompletionsProvider("*", {
@@ -70,7 +86,7 @@ export function EditorArea() {
                 return;
               }
 
-              const lang = activeTab?.language || "plaintext";
+              const lang = model.getLanguageId() || "plaintext";
               const completion = await getInlineCompletion(lineContent, lang);
 
               if (completion) {
@@ -99,8 +115,9 @@ export function EditorArea() {
 
     // Track cursor
     editor.onDidChangeCursorPosition((e) => {
-      if (activeTabId) {
-        setCursorPosition(activeTabId, e.position.lineNumber, e.position.column);
+      const currentTabId = activeTabIdRef.current;
+      if (currentTabId) {
+        setCursorPosition(currentTabId, e.position.lineNumber, e.position.column);
       }
     });
   };
@@ -126,6 +143,19 @@ export function EditorArea() {
       }
     }
   }, [activeTabId, activeTab])
+
+  useEffect(() => {
+    if (!editorRef.current || !activeTab) return;
+    const current = editorRef.current.getPosition();
+    const target = {
+      lineNumber: activeTab.cursorPosition.line,
+      column: activeTab.cursorPosition.column,
+    };
+    if (!current || current.lineNumber !== target.lineNumber || current.column !== target.column) {
+      editorRef.current.setPosition(target);
+      editorRef.current.revealLineInCenterIfOutsideViewport(target.lineNumber);
+    }
+  }, [activeTab?.id, activeTab?.cursorPosition.line, activeTab?.cursorPosition.column]);
 
   useEffect(() => {
     if (!autoSave || !activeTabId || !activeTab?.isDirty) return;

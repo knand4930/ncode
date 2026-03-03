@@ -20,20 +20,47 @@ export function StatusBar() {
   const activeTab = tabs.find((t) => t.id === activeTabId);
   const [branch, setBranch] = useState("main");
 
+  const [gitCounts, setGitCounts] = useState({ staged: 0, unstaged: 0, total: 0 });
+
   useEffect(() => {
     if (!openFolder) {
       setBranch("main");
+      setGitCounts({ staged: 0, unstaged: 0, total: 0 });
       return;
     }
-    invoke<string>("run_command", {
-      cmd: "git rev-parse --abbrev-ref HEAD",
-      cwd: openFolder,
-    })
-      .then((out) => {
-        const name = out.trim();
+
+    const loadGitInfo = async () => {
+      try {
+        const branchOut = await invoke<string>("run_command", {
+          cmd: "git rev-parse --abbrev-ref HEAD",
+          cwd: openFolder,
+        });
+        const name = branchOut.trim();
         if (name) setBranch(name);
-      })
-      .catch(() => {});
+      } catch (e) {
+        setBranch("(no repo)");
+      }
+
+      try {
+        const statusOut = await invoke<string>("run_command", {
+          cmd: "git status --porcelain",
+          cwd: openFolder,
+        });
+        const lines = statusOut.split('\n').filter(Boolean);
+        let staged = 0;
+        let unstaged = 0;
+        for (const l of lines) {
+          const code = l.slice(0, 2);
+          if (/[^\s]/.test(code[0] || '')) staged++;
+          if (/[^\s]/.test(code[1] || '')) unstaged++;
+        }
+        setGitCounts({ staged, unstaged, total: lines.length });
+      } catch (e) {
+        setGitCounts({ staged: 0, unstaged: 0, total: 0 });
+      }
+    };
+
+    loadGitInfo();
   }, [openFolder, activeTabId]);
 
   return (

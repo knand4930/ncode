@@ -35,6 +35,20 @@ export function SettingsPanel() {
     selectedProvider,
     selectedApiKeyIndex,
     selectAPIKey,
+    setProvider,
+    ollamaBaseUrl,
+    setOllamaBaseUrl,
+    ollamaModelsLoading,
+    ollamaModelsError,
+    selectedOllamaModels,
+    toggleOllamaModel,
+    fetchOllamaModels,
+    fetchOpenAIModels,
+    fetchAnthropicModels,
+    fetchGroqModels,
+    apiProviderLoading,
+    apiProviderErrors,
+    apiProviderModels,
   } = useAIStore();
 
   const [newApi, setNewApi] = useState({ provider: "", model: "", apiKey: "" });
@@ -199,77 +213,218 @@ export function SettingsPanel() {
         {selectedTab === "ai" && (
           <div className="settings-section">
             <h3>AI / LLM Configuration</h3>
+
+            {/* Provider Selector */}
             <div className="setting-item">
-              <label>Ollama Status</label>
-              <span>{isOllamaRunning ? "Running" : "Not running"}</span>
-              <button className="btn-sm" onClick={checkOllama}>
-                Refresh
-              </button>
-              {!isOllamaRunning && (
-                <button
-                  className="btn-sm"
-                  onClick={async () => {
-                    await startOllama();
-                  }}
-                >
-                  Start Ollama
-                </button>
-              )}
-            </div>
-            <div className="setting-item">
-              <label>Installed Ollama Models</label>
-              <div style={{ maxHeight: 120, overflowY: "auto" }}>
-                {availableModels.length === 0 && <em>none</em>}
-                {availableModels.map((m) => (
-                  <div key={m} style={{ fontSize: 12 }}>{m}</div>
-                ))}
-              </div>
-            </div>
-            <hr />
-            <div className="setting-item">
-              <label>Add API Key</label>
-              <input
-                placeholder="Provider (e.g. openai)"
-                value={newApi.provider}
-                onChange={(e) => setNewApi({ ...newApi, provider: e.target.value })}
-                style={{ marginBottom: 4, width: "100%" }}
-              />
-              <input
-                placeholder="Model (e.g. gpt-3.5-turbo)"
-                value={newApi.model}
-                onChange={(e) => setNewApi({ ...newApi, model: e.target.value })}
-                style={{ marginBottom: 4, width: "100%" }}
-              />
-              <input
-                type="password"
-                placeholder="API Key"
-                value={newApi.apiKey}
-                onChange={(e) => setNewApi({ ...newApi, apiKey: e.target.value })}
-                style={{ marginBottom: 4, width: "100%" }}
-              />
-              <button
-                className="btn-primary btn-sm"
-                onClick={() => {
-                  if (newApi.provider && newApi.model && newApi.apiKey) {
-                    addAPIKey({ ...newApi });
-                    setNewApi({ provider: "", model: "", apiKey: "" });
+              <label>Provider</label>
+              <select
+                value={selectedProvider}
+                onChange={(e) => {
+                  const newProvider = e.target.value as "ollama" | "api";
+                  setProvider(newProvider);
+                  if (newProvider === "ollama") {
+                    checkOllama();
                   }
                 }}
+                className="setting-select"
+                style={{ marginBottom: 12, width: "100%" }}
               >
-                Add Key
-              </button>
+                <option value="ollama">Ollama (Local)</option>
+                <option value="api">API Key (Cloud)</option>
+              </select>
             </div>
-            <div className="setting-item">
-              <label>Saved Keys</label>
-              {apiKeys.length === 0 && <em>none</em>}
-              {apiKeys.map((k, i) => (
-                <div key={i} style={{ display: "flex", alignItems: "center", gap: 8 }}>
-                  <span style={{ fontSize: 12 }}>{k.provider}: {k.model}</span>
-                  <button className="btn-sm" onClick={() => removeAPIKey(i)}>
-                    Remove
+
+            {selectedProvider === "ollama" ? (
+              <>
+                {/* Ollama Configuration */}
+                <div className="setting-item">
+                  <label>Ollama Base URL</label>
+                  <div style={{ display: "flex", gap: 8, marginBottom: 8 }}>
+                    <input
+                      type="text"
+                      value={ollamaBaseUrl || "http://localhost:11434"}
+                      onChange={(e) => setOllamaBaseUrl(e.target.value)}
+                      placeholder="http://localhost:11434"
+                      style={{ flex: 1 }}
+                    />
+                    <button
+                      className="btn-primary btn-sm"
+                      onClick={async () => {
+                        await fetchOllamaModels();
+                      }}
+                      disabled={ollamaModelsLoading}
+                    >
+                      {ollamaModelsLoading ? "Fetching..." : "Fetch"}
+                    </button>
+                  </div>
+                </div>
+
+                <div className="setting-item">
+                  <label>Status</label>
+                  <div style={{ fontSize: 12, marginBottom: 8, color: isOllamaRunning ? "#4ec9b0" : "#ce9178" }}>
+                    {isOllamaRunning ? "✓ Running" : "✗ Not running"}
+                  </div>
+                  {!isOllamaRunning && (
+                    <button className="btn-primary btn-sm" onClick={startOllama}>
+                      Start Ollama
+                    </button>
+                  )}
+                </div>
+
+                {/* Model Selector */}
+                {availableModels.length > 0 && (
+                  <div className="setting-item">
+                    <label>Available Models ({availableModels.length})</label>
+                    <select
+                      value={selectedOllamaModels[0] || ""}
+                      onChange={(e) => toggleOllamaModel(e.target.value)}
+                      className="setting-select"
+                      style={{ marginBottom: 8, width: "100%" }}
+                    >
+                      <option value="">-- Select a model --</option>
+                      {availableModels.map((m) => (
+                        <option key={m} value={m}>
+                          {m}
+                        </option>
+                      ))}
+                    </select>
+                    {selectedOllamaModels.length > 0 && (
+                      <div style={{ fontSize: 11, color: "var(--text-secondary)", padding: 8, background: "var(--bg-input)", borderRadius: 4 }}>
+                        <strong>Selected:</strong> {selectedOllamaModels[0]}
+                      </div>
+                    )}
+                  </div>
+                )}
+
+                {ollamaModelsLoading && (
+                  <div style={{ color: "var(--text-muted)", fontSize: 12 }}>Fetching models...</div>
+                )}
+                {ollamaModelsError && (
+                  <div style={{ color: "#ce9178", fontSize: 12, padding: "8px", backgroundColor: "rgba(206, 145, 120, 0.1)", borderRadius: "4px", marginBottom: "8px" }}>
+                    Error: {ollamaModelsError}
+                  </div>
+                )}
+              </>
+            ) : (
+              <>
+                {/* API Key Configuration */}
+                <div className="setting-item">
+                  <label>Add New API Key</label>
+                  <select
+                    value={newApi.provider}
+                    onChange={(e) => setNewApi({ ...newApi, provider: e.target.value })}
+                    className="setting-select"
+                    style={{ marginBottom: 8, width: "100%" }}
+                  >
+                    <option value="">-- Select Provider --</option>
+                    <option value="openai">OpenAI</option>
+                    <option value="anthropic">Anthropic</option>
+                    <option value="groq">Groq</option>
+                  </select>
+
+                  <input
+                    type="password"
+                    placeholder="API Key"
+                    value={newApi.apiKey}
+                    onChange={(e) => setNewApi({ ...newApi, apiKey: e.target.value })}
+                    style={{ marginBottom: 8, width: "100%" }}
+                  />
+                  <input
+                    placeholder="Model (e.g., gpt-4o)"
+                    value={newApi.model}
+                    onChange={(e) => setNewApi({ ...newApi, model: e.target.value })}
+                    style={{ marginBottom: 8, width: "100%" }}
+                  />
+                  <button
+                    className="btn-primary btn-sm"
+                    onClick={() => {
+                      if (newApi.provider && newApi.apiKey && newApi.model) {
+                        addAPIKey({ ...newApi });
+                        setNewApi({ provider: "", model: "", apiKey: "" });
+                      }
+                    }}
+                    style={{ width: "100%" }}
+                  >
+                    Add Key
                   </button>
                 </div>
-              ))}
+
+                {/* Saved API Keys */}
+                {apiKeys.length > 0 && (
+                  <div className="setting-item">
+                    <label>Saved API Keys</label>
+                    {apiKeys.map((k, i) => (
+                      <div key={i} style={{ marginBottom: 8 }}>
+                        <div
+                          style={{
+                            display: "flex",
+                            alignItems: "center",
+                            gap: 8,
+                            padding: 8,
+                            background: "var(--bg-input)",
+                            borderRadius: 4,
+                            cursor: "pointer",
+                            opacity: selectedApiKeyIndex === i ? 1 : 0.7,
+                            border: selectedApiKeyIndex === i ? "1px solid var(--accent)" : "1px solid transparent",
+                          }}
+                          onClick={() => selectAPIKey(i)}
+                        >
+                          <span style={{ flex: 1, fontSize: 12 }}>
+                            <strong>{k.provider.toUpperCase()}</strong> • {k.model}
+                          </span>
+                          <button
+                            className="btn-sm"
+                            onClick={(e) => {
+                              e.stopPropagation();
+                              if (k.provider === "openai") {
+                                fetchOpenAIModels();
+                              } else if (k.provider === "anthropic") {
+                                fetchAnthropicModels();
+                              } else if (k.provider === "groq") {
+                                fetchGroqModels();
+                              }
+                            }}
+                            disabled={apiProviderLoading[k.provider]}
+                          >
+                            {apiProviderLoading[k.provider] ? "Fetching..." : "Fetch Models"}
+                          </button>
+                          <button
+                            className="btn-sm danger"
+                            onClick={(e) => {
+                              e.stopPropagation();
+                              removeAPIKey(i);
+                            }}
+                          >
+                            Remove
+                          </button>
+                        </div>
+                        {apiProviderErrors[k.provider] && (
+                          <div style={{ fontSize: 11, color: "#ce9178", padding: "4px 8px", marginTop: "4px" }}>
+                            Error: {apiProviderErrors[k.provider]}
+                          </div>
+                        )}
+                        {apiProviderModels[k.provider] && apiProviderModels[k.provider].length > 0 && (
+                          <div style={{ fontSize: 10, color: "var(--text-secondary)", padding: "4px 8px", marginTop: "4px" }}>
+                            Available: {apiProviderModels[k.provider].slice(0, 3).join(", ")}
+                            {apiProviderModels[k.provider].length > 3 && ` +${apiProviderModels[k.provider].length - 3} more`}
+                          </div>
+                        )}
+                      </div>
+                    ))}
+                  </div>
+                )}
+              </>
+            )}
+
+            <hr style={{ margin: "16px 0" }} />
+            <div style={{ fontSize: 11, color: "var(--text-muted)" }}>
+              <p><strong>Current Provider:</strong> {selectedProvider === "ollama" ? "Ollama (Local)" : `API (${apiKeys[selectedApiKeyIndex || 0]?.provider.toUpperCase() || "None"})`}</p>
+              {selectedProvider === "ollama" && selectedOllamaModels.length > 0 && (
+                <p><strong>Selected Model:</strong> {selectedOllamaModels[0]}</p>
+              )}
+              {selectedProvider === "api" && selectedApiKeyIndex !== null && (
+                <p><strong>Selected Model:</strong> {apiKeys[selectedApiKeyIndex]?.model}</p>
+              )}
             </div>
           </div>
         )}

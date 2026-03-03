@@ -53,7 +53,8 @@
 - **Options**:
   - `.*` button for regex mode
   - `Aa` button for case sensitivity
-- **Keyboard Shortcut**: `Ctrl+H`
+- **Keyboard Shortcut**: `Ctrl+H` (panel)
+- **Additional Edit Shortcuts**: `Ctrl+F` for inline find, `F3`/`Shift+F3` navigate matches
 - **Status**: ✅ WORKING
 
 ```typescript

@@ -393,7 +393,14 @@ export function AIPanel() {
             return (
             <div key={msg.id} className={`ai-message ai-message-${msg.role}`}>
               <div className="ai-message-header">
-                <span>{msg.role === "user" ? "You" : "AI"}</span>
+                <span>
+                  {msg.role === "user" ? "You" : "AI"}
+                  {msg.role === "assistant" && msg.model && (
+                    <span style={{ fontSize: "0.85em", color: "var(--text-secondary)", marginLeft: "6px" }}>
+                      ({msg.provider === "ollama" ? "Local" : "API"}: {msg.model})
+                    </span>
+                  )}
+                </span>
                 <span className="ai-message-time">
                   {new Date(msg.timestamp).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}
                 </span>

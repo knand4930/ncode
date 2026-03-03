@@ -9,6 +9,10 @@ export interface ChatMessage {
   content: string;
   sources?: Array<{ filePath: string; startLine: number; endLine: number }>;
   timestamp: number;
+  model?: string;
+  provider?: "ollama" | "openai" | "anthropic" | "groq";
+  isStreaming?: boolean;
+  tokens?: number;
 }
 
 export type AIMode = "chat" | "think" | "agent";
@@ -52,6 +56,7 @@ type PersistedAISettings = {
 };
 
 const AI_SETTINGS_KEY = "NCode.ai.settings.v1";
+const AI_CHAT_HISTORY_KEY = "NCode.ai.chatHistory.v1";
 
 function loadAISettings(): PersistedAISettings | null {
   try {
@@ -77,21 +82,51 @@ function saveAISettings(settings: PersistedAISettings) {
   }
 }
 
+function loadChatHistory(): ChatMessage[] {
+  try {
+    if (typeof window === "undefined") return [];
+    const raw = window.localStorage.getItem(AI_CHAT_HISTORY_KEY);
+    if (!raw) return [];
+    const messages = JSON.parse(raw) as ChatMessage[];
+    return Array.isArray(messages) ? messages : [];
+  } catch (e) {
+    console.error("Failed to load chat history:", e);
+    return [];
+  }
+}
+
+function saveChatHistory(messages: ChatMessage[]) {
+  try {
+    if (typeof window === "undefined") return;
+    window.localStorage.setItem(AI_CHAT_HISTORY_KEY, JSON.stringify(messages));
+  } catch (e) {
+    console.error("Failed to save chat history:", e);
+  }
+}
+
 const persisted = loadAISettings();
 
 interface AIStore {
   isOllamaRunning: boolean;
   availableModels: string[];
-
+  ollamaBaseUrl: string;
+  ollamaModelsLoading: boolean;
+  ollamaModelsError: string | null;
+  
   // single active Ollama model selected by user
   selectedOllamaModels: string[];
 
   apiKeys: ApiKeyEntry[];
   selectedProvider: "ollama" | "api";
   selectedApiKeyIndex: number | null;
+  apiProviderModels: Record<string, string[]>; // cache of models per provider
+  apiProviderLoading: Record<string, boolean>; // loading state per provider
+  apiProviderErrors: Record<string, string>; // error messages per provider
 
   chatHistory: ChatMessage[];
   isThinking: boolean;
+  isStreaming: boolean;
+  streamingMessageId: string | null;
   isIndexing: boolean;
   indexedChunks: number;
   indexDirty: boolean;
@@ -109,8 +144,15 @@ interface AIStore {
   removeAPIKey: (index: number) => void;
   selectAPIKey: (index: number) => void;
   setProvider: (provider: "ollama" | "api") => void;
+  setOllamaBaseUrl: (url: string) => void;
+  fetchOllamaModels: () => Promise<void>;
+  fetchOpenAIModels: () => Promise<void>;
+  fetchAnthropicModels: () => Promise<void>;
+  fetchGroqModels: () => Promise<void>;
   sendMessage: (content: string) => Promise<void>;
   clearChat: () => void;
+  addStreamToken: (messageId: string, token: string) => void;
+  updateMessage: (id: string, content: string, metadata?: Partial<ChatMessage>) => void;
   indexCodebase: (path: string) => Promise<void>;
   toggleRAG: () => void;
   setAIMode: (mode: AIMode) => void;
@@ -124,14 +166,22 @@ interface AIStore {
 export const useAIStore = create<AIStore>((set, get) => ({
   isOllamaRunning: false,
   availableModels: [],
+  ollamaBaseUrl: "http://localhost:11434",
+  ollamaModelsLoading: false,
+  ollamaModelsError: null,
   selectedOllamaModels: persisted?.selectedOllamaModel ? [persisted.selectedOllamaModel] : [],
 
   apiKeys: [],
   selectedProvider: persisted?.selectedProvider || "ollama",
   selectedApiKeyIndex: persisted?.selectedApiKeyIndex ?? null,
+  apiProviderModels: {},
+  apiProviderLoading: {},
+  apiProviderErrors: {},
 
-  chatHistory: [],
+  chatHistory: loadChatHistory(),
   isThinking: false,
+  isStreaming: false,
+  streamingMessageId: null,
   isIndexing: false,
   indexedChunks: 0,
   indexDirty: false,
@@ -141,6 +191,82 @@ export const useAIStore = create<AIStore>((set, get) => ({
   agentLiveOutput: "",
   agentEvents: [],
   showThinking: persisted?.showThinking ?? true,
+
+  setOllamaBaseUrl: (url) => {
+    set({ ollamaBaseUrl: url });
+  },
+
+  fetchOllamaModels: async () => {
+    const { ollamaBaseUrl } = get();
+    set({ ollamaModelsLoading: true, ollamaModelsError: null });
+    try {
+      const models = await invoke<string[]>("fetch_ollama_models", { baseUrl: ollamaBaseUrl });
+      set({ availableModels: models, isOllamaRunning: true, ollamaModelsError: null });
+    } catch (e) {
+      const errorMsg = String(e);
+      console.error("Failed to fetch Ollama models:", e);
+      set({ isOllamaRunning: false, ollamaModelsError: errorMsg });
+    } finally {
+      set({ ollamaModelsLoading: false });
+    }
+  },
+
+  fetchOpenAIModels: async () => {
+    const { apiKeys, selectedApiKeyIndex } = get();
+    if (selectedApiKeyIndex === null || !apiKeys[selectedApiKeyIndex]) return;
+    const key = apiKeys[selectedApiKeyIndex];
+    if (key.provider !== "openai") return;
+    
+    set((s) => ({ apiProviderLoading: { ...s.apiProviderLoading, openai: true }, apiProviderErrors: { ...s.apiProviderErrors, openai: "" } }));
+    try {
+      const models = await invoke<string[]>("fetch_openai_models", { apiKey: key.apiKey });
+      set((s) => ({ apiProviderModels: { ...s.apiProviderModels, openai: models }, apiProviderErrors: { ...s.apiProviderErrors, openai: "" } }));
+    } catch (e) {
+      const errorMsg = String(e);
+      console.error("Failed to fetch OpenAI models:", e);
+      set((s) => ({ apiProviderErrors: { ...s.apiProviderErrors, openai: errorMsg } }));
+    } finally {
+      set((s) => ({ apiProviderLoading: { ...s.apiProviderLoading, openai: false } }));
+    }
+  },
+
+  fetchAnthropicModels: async () => {
+    const { apiKeys, selectedApiKeyIndex } = get();
+    if (selectedApiKeyIndex === null || !apiKeys[selectedApiKeyIndex]) return;
+    const key = apiKeys[selectedApiKeyIndex];
+    if (key.provider !== "anthropic") return;
+    
+    set((s) => ({ apiProviderLoading: { ...s.apiProviderLoading, anthropic: true }, apiProviderErrors: { ...s.apiProviderErrors, anthropic: "" } }));
+    try {
+      const models = await invoke<string[]>("fetch_anthropic_models", { apiKey: key.apiKey });
+      set((s) => ({ apiProviderModels: { ...s.apiProviderModels, anthropic: models }, apiProviderErrors: { ...s.apiProviderErrors, anthropic: "" } }));
+    } catch (e) {
+      const errorMsg = String(e);
+      console.error("Failed to fetch Anthropic models:", e);
+      set((s) => ({ apiProviderErrors: { ...s.apiProviderErrors, anthropic: errorMsg } }));
+    } finally {
+      set((s) => ({ apiProviderLoading: { ...s.apiProviderLoading, anthropic: false } }));
+    }
+  },
+
+  fetchGroqModels: async () => {
+    const { apiKeys, selectedApiKeyIndex } = get();
+    if (selectedApiKeyIndex === null || !apiKeys[selectedApiKeyIndex]) return;
+    const key = apiKeys[selectedApiKeyIndex];
+    if (key.provider !== "groq") return;
+    
+    set((s) => ({ apiProviderLoading: { ...s.apiProviderLoading, groq: true }, apiProviderErrors: { ...s.apiProviderErrors, groq: "" } }));
+    try {
+      const models = await invoke<string[]>("fetch_groq_models", { apiKey: key.apiKey });
+      set((s) => ({ apiProviderModels: { ...s.apiProviderModels, groq: models }, apiProviderErrors: { ...s.apiProviderErrors, groq: "" } }));
+    } catch (e) {
+      const errorMsg = String(e);
+      console.error("Failed to fetch Groq models:", e);
+      set((s) => ({ apiProviderErrors: { ...s.apiProviderErrors, groq: errorMsg } }));
+    } finally {
+      set((s) => ({ apiProviderLoading: { ...s.apiProviderLoading, groq: false } }));
+    }
+  },
 
   checkOllama: async () => {
     try {
@@ -264,7 +390,11 @@ export const useAIStore = create<AIStore>((set, get) => ({
       /\b(project|projects|codebase|repo|repository|review|analy[sz]e|audit|architecture|one by one|each file|all files)\b/i.test(content);
     const shouldUseAgenticReview = aiMode === "agent" || autoProjectReviewIntent;
 
-    set((s) => ({ chatHistory: [...s.chatHistory, userMsg], isThinking: true }));
+    set((s) => {
+      const updated = [...s.chatHistory, userMsg];
+      saveChatHistory(updated);
+      return { chatHistory: updated, isThinking: true };
+    });
 
     try {
       let response: string;
@@ -392,9 +522,16 @@ export const useAIStore = create<AIStore>((set, get) => ({
         content: response,
         sources,
         timestamp: Date.now(),
+        model: selectedProvider === "ollama" ? selectedOllamaModels[0] : apiKeys[selectedApiKeyIndex!]?.model,
+        provider: selectedProvider === "ollama" ? "ollama" : (apiKeys[selectedApiKeyIndex!]?.provider as "openai" | "anthropic" | "groq" | undefined) || "openai",
+        isStreaming: false,
       };
 
-      set((s) => ({ chatHistory: [...s.chatHistory, assistantMsg], isThinking: false }));
+      set((s) => {
+        const updated = [...s.chatHistory, assistantMsg];
+        saveChatHistory(updated);
+        return { chatHistory: updated, isThinking: false };
+      });
     } catch (e: any) {
       if (shouldUseAgenticReview) {
         set((s) => ({
@@ -409,12 +546,41 @@ export const useAIStore = create<AIStore>((set, get) => ({
         role: "assistant",
         content: `Error: ${e.toString()}. Make sure your LLM service is configured correctly.`,
         timestamp: Date.now(),
+        provider: selectedProvider === "ollama" ? "ollama" : (apiKeys[selectedApiKeyIndex!]?.provider as "openai" | "anthropic" | "groq" | undefined) || "openai",
+        model: selectedProvider === "ollama" ? selectedOllamaModels[0] : apiKeys[selectedApiKeyIndex!]?.model,
       };
-      set((s) => ({ chatHistory: [...s.chatHistory, errMsg], isThinking: false }));
+      set((s) => {
+        const updated = [...s.chatHistory, errMsg];
+        saveChatHistory(updated);
+        return { chatHistory: updated, isThinking: false };
+      });
     }
   },
 
-  clearChat: () => set({ chatHistory: [], agentLiveOutput: "", agentEvents: [] }),
+  addStreamToken: (messageId: string, token: string) => {
+    set((s) => {
+      const updated = s.chatHistory.map((m) =>
+        m.id === messageId ? { ...m, content: m.content + token } : m
+      );
+      saveChatHistory(updated);
+      return { chatHistory: updated };
+    });
+  },
+
+  updateMessage: (id: string, content: string, metadata?: Partial<ChatMessage>) => {
+    set((s) => {
+      const updated = s.chatHistory.map((m) =>
+        m.id === id ? { ...m, content, ...metadata } : m
+      );
+      saveChatHistory(updated);
+      return { chatHistory: updated };
+    });
+  },
+
+  clearChat: () => {
+    saveChatHistory([]);
+    set({ chatHistory: [], agentLiveOutput: "", agentEvents: [] });
+  },
 
   indexCodebase: async (path: string) => {
     set({ isIndexing: true });
@@ -471,7 +637,9 @@ export const useAIStore = create<AIStore>((set, get) => ({
     }
   },
 
-  setOpenFolder: (path) => set({ openFolder: path, indexedChunks: 0, indexDirty: false, agentLiveOutput: "", agentEvents: [] }),
+  setOpenFolder: (path) => {
+    set({ openFolder: path, indexedChunks: 0, indexDirty: false, agentLiveOutput: "", agentEvents: [] });
+  },
 
   markCodebaseChanged: (filePath) =>
     set((s) => {

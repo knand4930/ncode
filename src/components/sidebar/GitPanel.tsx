@@ -88,19 +88,52 @@ export function GitPanel() {
             <div style={{ fontSize: 11, color: "var(--text-muted)", marginBottom: 6 }}>
               {status.length === 0 ? "No changes" : `${status.length} changed file(s)`}
             </div>
-            {status.map((entry) => (
-              <div
-                key={`${entry.code}-${entry.path}`}
-                className="file-entry"
-                style={{ paddingLeft: 6, fontSize: 12 }}
-                title={entry.path}
-              >
-                <span style={{ width: 28, color: "var(--text-accent)", fontFamily: "var(--font-mono)" }}>
-                  {entry.code}
-                </span>
-                <span className="file-entry-name">{entry.path}</span>
-              </div>
-            ))}
+            {status.length > 0 ? status.map((entry) => {
+              const stagedCode = entry.code[0] || "";
+              const unstagedCode = entry.code[1] || "";
+              const isStaged = stagedCode !== "" && stagedCode !== "?";
+              return (
+                <div
+                  key={`${entry.code}-${entry.path}`}
+                  className="file-entry"
+                  style={{ paddingLeft: 6, fontSize: 12, display: 'flex', alignItems: 'center', gap: 8 }}
+                  title={entry.path}
+                >
+                  <span style={{ width: 48, color: "var(--text-accent)", fontFamily: "var(--font-mono)" }}>
+                    {entry.code}
+                  </span>
+                  <span className="file-entry-name" style={{ flex: 1 }}>{entry.path}</span>
+                  <div style={{ display: 'flex', gap: 6 }}>
+                    {isStaged ? (
+                      <button className="btn-sm" onClick={async () => { 
+                        try { await invoke('run_command', { cmd: `git restore --staged -- "${entry.path}"`, cwd: openFolder }); } catch(e){}
+                        await loadGit();
+                      }}>Unstage</button>
+                    ) : (
+                      <button className="btn-sm" onClick={async () => { 
+                        try { await invoke('run_command', { cmd: `git add -- "${entry.path}"`, cwd: openFolder }); } catch(e){}
+                        await loadGit();
+                      }}>Stage</button>
+                    )}
+                    <button className="btn-sm" onClick={async () => { 
+                      try {
+                        const out = await invoke<string>('run_command', { cmd: `git --no-pager diff -- "${entry.path}"`, cwd: openFolder });
+                        alert(out || 'No diff');
+                      } catch(e:any){ alert(String(e)); }
+                    }}>Diff</button>
+                    <button className="btn-sm danger" onClick={async () => { 
+                      if (!confirm(`Discard changes to ${entry.path}? This cannot be undone for unstaged changes.`)) return;
+                      try {
+                        await invoke('run_command', { cmd: `git checkout -- "${entry.path}"`, cwd: openFolder });
+                      } catch(e){}
+                      await loadGit();
+                    }}>Discard</button>
+                  </div>
+                </div>
+              );
+            }) : (
+              <div style={{ color: "var(--text-muted)", padding: "8px 0" }}>No changes</div>
+            )}
             {grouped.staged.length > 0 || grouped.unstaged.length > 0 ? (
               <div style={{ marginTop: 8, fontSize: 11, color: "var(--text-secondary)" }}>
                 Staged: {grouped.staged.length} | Unstaged: {grouped.unstaged.length}

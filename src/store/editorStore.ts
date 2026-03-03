@@ -30,7 +30,8 @@ interface EditorStore {
   recentFiles: string[];
   aiChangeHistory: AIChangeEntry[];
   
-  openFile: (filePath: string) => Promise<void>;
+  openFile: (filePath: string) => Promise<string | null>;
+  openFileAt: (filePath: string, line: number, column?: number) => Promise<void>;
   closeTab: (tabId: string) => void;
   setActiveTab: (tabId: string) => void;
   updateContent: (tabId: string, content: string) => void;
@@ -75,7 +76,7 @@ export const useEditorStore = create<EditorStore>((set, get) => ({
         activeTabId: existing.id,
         recentFiles: [filePath, ...s.recentFiles.filter((p) => p !== filePath)].slice(0, 50),
       }));
-      return;
+      return existing.id;
     }
 
     try {
@@ -94,9 +95,30 @@ export const useEditorStore = create<EditorStore>((set, get) => ({
         const recent = [filePath, ...s.recentFiles.filter((p) => p !== filePath)].slice(0, 50);
         return { tabs: [...s.tabs, tab], activeTabId: tab.id, recentFiles: recent };
       });
+      return tab.id;
     } catch (e) {
       console.error("Failed to open file:", e);
+      return null;
     }
+  },
+
+  openFileAt: async (filePath, line, column = 1) => {
+    const tabId = await get().openFile(filePath);
+    if (!tabId) return;
+    set((s) => ({
+      tabs: s.tabs.map((t) =>
+        t.id === tabId
+          ? {
+              ...t,
+              cursorPosition: {
+                line: Math.max(1, line),
+                column: Math.max(1, column),
+              },
+            }
+          : t
+      ),
+      activeTabId: tabId,
+    }));
   },
 
   closeTab: (tabId: string) => {

@@ -1,0 +1,62 @@
+syntax = "proto3";
+
+package ai_service;
+
+// AI Service definition for gRPC communication
+service AIService {
+  // Chat endpoint
+  rpc Chat(ChatRequest) returns (ChatResponse);
+  
+  // Stream chat for incremental token responses
+  rpc StreamChat(ChatRequest) returns (stream TokenResponse);
+  
+  // Fetch available models from a provider
+  rpc FetchModels(FetchModelsRequest) returns (FetchModelsResponse);
+  
+  // Health check
+  rpc Health(HealthRequest) returns (HealthResponse);
+}
+
+message ChatRequest {
+  string model = 1;
+  string prompt = 2;
+  repeated Message history = 3;
+  string provider = 4;  // "ollama", "openai", "anthropic", "groq"
+  string api_key = 5;
+  float temperature = 6;
+  int32 max_tokens = 7;
+}
+
+message Message {
+  string role = 1;  // "user", "assistant", "system"
+  string content = 2;
+}
+
+message ChatResponse {
+  string content = 1;
+  int32 tokens_used = 2;
+  string model = 3;
+}
+
+message TokenResponse {
+  string token = 1;
+  bool done = 2;
+}
+
+message FetchModelsRequest {
+  string provider = 1;
+  string api_key = 2;
+  string base_url = 3;  // for Ollama
+}
+
+message FetchModelsResponse {
+  repeated string models = 1;
+  string error = 2;
+}
+
+message HealthRequest {}
+
+message HealthResponse {
+  string status = 1;  // "healthy", "unhealthy"
+  string version = 2;
+}
