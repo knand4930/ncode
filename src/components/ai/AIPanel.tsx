@@ -7,6 +7,12 @@ import { useEditorStore } from "../../store/editorStore";
 import { useUIStore } from "../../store/uiStore";
 import { marked } from "marked";
 
+type FileSuggestion = {
+  path: string;
+  content: string;
+  language: string;
+};
+
 function extractFirstCodeBlock(markdown: string): string | null {
   const m = markdown.match(/```(?:[\w.+-]+)?\n([\s\S]*?)```/);
   return m ? m[1].trimEnd() : null;
@@ -28,6 +34,168 @@ function extractShellCommands(markdown: string): string[] {
   return commands.slice(0, 6);
 }
 
+function cleanPath(raw: string): string {
+  return raw
+    .trim()
+    .replace(/^[-*]\s*/, "")
+    .replace(/^###\s*/i, "")
+    .replace(/^`|`$/g, "")
+    .replace(/^\*\*|\*\*$/g, "")
+    .replace(/^["']|["']$/g, "")
+    .replace(/^\.\//, "")
+    .replace(/\s+\(.*\)$/, "");
+}
+
+function inferLanguageFromPath(path: string): string {
+  const normalized = cleanPath(path).toLowerCase();
+  const ext = normalized.split(".").pop() || "";
+  const map: Record<string, string> = {
+    ts: "typescript",
+    tsx: "tsx",
+    js: "javascript",
+    jsx: "jsx",
+    py: "python",
+    rs: "rust",
+    go: "go",
+    java: "java",
+    cpp: "cpp",
+    c: "c",
+    cs: "csharp",
+    rb: "ruby",
+    php: "php",
+    swift: "swift",
+    kt: "kotlin",
+    html: "html",
+    css: "css",
+    scss: "scss",
+    less: "less",
+    json: "json",
+    yaml: "yaml",
+    yml: "yaml",
+    toml: "toml",
+    md: "markdown",
+    sh: "bash",
+    bash: "bash",
+    zsh: "zsh",
+    sql: "sql",
+    graphql: "graphql",
+    vue: "vue",
+    svelte: "svelte",
+    xml: "xml",
+  };
+  return map[ext] || "text";
+}
+
+function looksLikePath(value: string): boolean {
+  const v = cleanPath(value);
+  if (!v) return false;
+  if (v.includes(" ") && !v.includes("/")) return false;
+  return /[\\/]/.test(v) || /\.[A-Za-z0-9_-]{1,12}$/.test(v);
+}
+
+function findPathNearCodeBlock(markdown: string, startIndex: number): string | null {
+  const before = markdown.slice(Math.max(0, startIndex - 360), startIndex);
+  const patterns = [
+    /(?:^|\n)\s*(?:#{1,6}\s*)?(?:file|path)\s*:\s*`?([^\n`]+)`?\s*$/gi,
+    /(?:^|\n)\s*(?:[-*]\s*)?`([^`\n]+\.[A-Za-z0-9._/-]+)`\s*:?\s*$/gi,
+    /(?:^|\n)\s*(?:[-*]\s*)?\*\*([^*\n]+\.[A-Za-z0-9._/-]+)\*\*\s*:?\s*$/gi,
+    /(?:^|\n)\s*(?:[-*]\s*)?([A-Za-z0-9_./\\-]+\.[A-Za-z0-9_.-]+)\s*:?\s*$/gi,
+  ];
+  for (const re of patterns) {
+    let m: RegExpExecArray | null = null;
+    let last: string | null = null;
+    while ((m = re.exec(before)) !== null) {
+      last = m[1];
+    }
+    if (last && looksLikePath(last)) return cleanPath(last);
+  }
+  return null;
+}
+
+function extractFileSuggestions(markdown: string): FileSuggestion[] {
+  const out: FileSuggestion[] = [];
+  const seen = new Set<string>();
+  const push = (path: string, content: string, language?: string) => {
+    const cleaned = cleanPath(path);
+    if (!cleaned || !content.trim()) return;
+    const key = cleaned.toLowerCase();
+    if (seen.has(key)) return;
+    seen.add(key);
+    out.push({ path: cleaned, content: content.trimEnd(), language: (language || "").trim() || "text" });
+  };
+
+  const fileHeadingVariants = [
+    /(?:^|\n)(?:#{1,6}\s*)?file\s*:\s*`?([^\n`]+?)`?\s*\n```([\w.+-]*)\n([\s\S]*?)```/gi,
+    /(?:^|\n)(?:#{1,6}\s*)?path\s*:\s*`?([^\n`]+?)`?\s*\n```([\w.+-]*)\n([\s\S]*?)```/gi,
+    /(?:^|\n)#{1,6}\s*`?([^\n`]+\.[\w.-]+)`?\s*\n```([\w.+-]*)\n([\s\S]*?)```/gi,
+  ];
+  let m: RegExpExecArray | null = null;
+  for (const re of fileHeadingVariants) {
+    while ((m = re.exec(markdown)) !== null) {
+      push(m[1], m[3], m[2]);
+    }
+  }
+
+  const fileLabelBlockRe =
+    /(?:^|\n)(?:#{1,6}\s*)?(?:file|path)\s*:\s*`?([^\n`]+?)`?\s*\n```([\w.+-]*)\n([\s\S]*?)```/gi;
+  while ((m = fileLabelBlockRe.exec(markdown)) !== null) {
+    push(m[1], m[3], m[2]);
+  }
+
+  const headingBlockRe =
+    /(?:^|\n)#{1,6}\s*`?([^\n`]+\.[\w.-]+)`?\s*\n```([\w.+-]*)\n([\s\S]*?)```/gi;
+  while ((m = headingBlockRe.exec(markdown)) !== null) {
+    push(m[1], m[3], m[2]);
+  }
+
+  const infoPathBlockRe = /```([\w.+-]+)\s+([^\n`]+\.[\w.-]+)\n([\s\S]*?)```/gi;
+  while ((m = infoPathBlockRe.exec(markdown)) !== null) {
+    push(m[2], m[3], m[1]);
+  }
+
+  const infoOnlyPathRe = /```([^\n`\s]+\.[A-Za-z0-9_.-]+)\n([\s\S]*?)```/gi;
+  while ((m = infoOnlyPathRe.exec(markdown)) !== null) {
+    if (looksLikePath(m[1])) {
+      push(m[1], m[2], inferLanguageFromPath(m[1]));
+    }
+  }
+
+  const genericCodeBlockRe = /```([\w.+-]*)\n([\s\S]*?)```/gi;
+  while ((m = genericCodeBlockRe.exec(markdown)) !== null) {
+    const explicitInfo = (m[1] || "").trim();
+    let path: string | null = null;
+    let language = explicitInfo;
+
+    if (explicitInfo && looksLikePath(explicitInfo)) {
+      path = explicitInfo;
+      language = inferLanguageFromPath(explicitInfo);
+    } else {
+      path = findPathNearCodeBlock(markdown, m.index);
+      if (path && !language) language = inferLanguageFromPath(path);
+    }
+
+    if (path) {
+      push(path, m[2], language);
+    }
+  }
+
+  return out.slice(0, 12);
+}
+
+function isAbsolutePath(path: string): boolean {
+  return path.startsWith("/") || /^[A-Za-z]:[\\/]/.test(path);
+}
+
+function resolveSuggestionPath(path: string, openFolder: string | null): string | null {
+  const normalized = cleanPath(path).replace(/\\/g, "/");
+  if (!normalized) return null;
+  if (isAbsolutePath(normalized)) return normalized;
+  if (!openFolder) return null;
+  const base = openFolder.replace(/[\\/]+$/, "");
+  const rel = normalized.replace(/^\.?\//, "");
+  return `${base}/${rel}`;
+}
+
 export function AIPanel() {
   const {
     chatHistory,
@@ -40,6 +208,7 @@ export function AIPanel() {
     // api keys
     apiKeys,
     selectedProvider,
+    aiServiceMode,
     selectedApiKeyIndex,
     selectAPIKey,
     setProvider,
@@ -61,15 +230,17 @@ export function AIPanel() {
     startOllama,
     setOpenFolder,
   } = useAIStore();
-  const { openFolder, tabs, activeTabId, openFile, applyAIChangeToTab, rollbackLastAIChange, aiChangeHistory } =
+  const { openFolder, tabs, activeTabId, openFile, applyAIChangeToTab, applyAIChangeToFile, rollbackLastAIChange, aiChangeHistory } =
     useEditorStore();
   const { toggleSettingsPanel } = useUIStore();
 
   const [input, setInput] = useState("");
   const [showModelSelect, setShowModelSelect] = useState(false);
   const [rejectedSuggestionIds, setRejectedSuggestionIds] = useState<Set<string>>(new Set());
+  const [rejectedFileSuggestionKeys, setRejectedFileSuggestionKeys] = useState<Set<string>>(new Set());
   const [rejectedCommandKeys, setRejectedCommandKeys] = useState<Set<string>>(new Set());
   const [applyingMessageId, setApplyingMessageId] = useState<string | null>(null);
+  const [applyingFileSuggestionKey, setApplyingFileSuggestionKey] = useState<string | null>(null);
   const [runningCommandKey, setRunningCommandKey] = useState<string | null>(null);
   const [rollingBack, setRollingBack] = useState(false);
   const modelSelectorRef = useRef<HTMLDivElement>(null);
@@ -133,6 +304,9 @@ export function AIPanel() {
     }
   }
   const requiresLocalOllama = aiMode === "agent" || useRAG || selectedProvider === "ollama";
+  const usesLocalRagAgentPath = aiServiceMode === "grpc" && (useRAG || aiMode === "agent");
+  const showOllamaWarning = requiresLocalOllama && !isOllamaRunning;
+  const localStatusOnline = !requiresLocalOllama || isOllamaRunning;
 
   // close dropdown when clicking outside
   useEffect(() => {
@@ -180,8 +354,14 @@ export function AIPanel() {
         <div className="ai-header-left">
           <span className="ai-title">✦ AI Assistant</span>
           <div
-            className={`ai-status-dot ${isOllamaRunning ? "online" : "offline"}`}
-            title={isOllamaRunning ? "Ollama connected" : "Ollama not running"}
+            className={`ai-status-dot ${localStatusOnline ? "online" : "offline"}`}
+            title={
+              requiresLocalOllama
+                ? isOllamaRunning
+                  ? "Ollama connected"
+                  : "Ollama not running"
+                : "Cloud/API route active"
+            }
           />
         </div>
         <div className="ai-header-right">
@@ -237,8 +417,21 @@ export function AIPanel() {
         </div>
       </div>
 
+      {usesLocalRagAgentPath && (
+        <div className="ai-warning">
+          <Zap size={14} />
+          <div>
+            <strong>RAG/Agent still use local Ollama path</strong>
+            <p>
+              gRPC mode is active for standard chat/completions. RAG and Agent mode currently execute through local
+              Rust+Ollama flow.
+            </p>
+          </div>
+        </div>
+      )}
+
       {/* Not running warning */}
-      {!isOllamaRunning && (
+      {showOllamaWarning && (
         <div className="ai-warning">
           <Zap size={14} />
           <div>
@@ -383,12 +576,15 @@ export function AIPanel() {
           chatHistory.map((msg) => {
             const codeSuggestion =
               msg.role === "assistant" ? extractFirstCodeBlock(msg.content) : null;
+            const fileSuggestions =
+              msg.role === "assistant" ? extractFileSuggestions(msg.content) : [];
             const shellCommands = msg.role === "assistant" ? extractShellCommands(msg.content) : [];
             const canApproveSuggestion =
               !!codeSuggestion &&
               !!activeTabId &&
               !!activeTab &&
               msg.role === "assistant" &&
+              fileSuggestions.length === 0 &&
               !rejectedSuggestionIds.has(msg.id);
             return (
             <div key={msg.id} className={`ai-message ai-message-${msg.role}`}>
@@ -450,6 +646,63 @@ export function AIPanel() {
                     <X size={12} />
                     Reject
                   </button>
+                </div>
+              )}
+              {fileSuggestions.length > 0 && (
+                <div className="ai-command-actions">
+                  {fileSuggestions.map((s, idx) => {
+                    const key = `${msg.id}-file-${idx}-${s.path}`;
+                    if (rejectedFileSuggestionKeys.has(key)) return null;
+                    const resolvedPath = resolveSuggestionPath(s.path, openFolder ?? null);
+                    const disabled = applyingFileSuggestionKey === key || !resolvedPath;
+                    return (
+                      <div key={key} className="ai-command-row">
+                        <code>{s.path}</code>
+                        <button
+                          className="btn-sm btn-primary"
+                          disabled={disabled}
+                          onClick={async () => {
+                            if (!resolvedPath) {
+                              window.alert("Open a project folder first for relative file paths.");
+                              return;
+                            }
+                            const confirmed = window.confirm(
+                              `Apply AI suggestion to file?\n\n${resolvedPath}\n\nThis will create or update the file.`
+                            );
+                            if (!confirmed) return;
+                            setApplyingFileSuggestionKey(key);
+                            try {
+                              await applyAIChangeToFile(
+                                resolvedPath,
+                                s.content,
+                                `Accepted AI file suggestion at ${new Date(msg.timestamp).toLocaleTimeString()}`
+                              );
+                            } finally {
+                              setApplyingFileSuggestionKey(null);
+                            }
+                          }}
+                          title={resolvedPath ? `Create/Update ${resolvedPath}` : "Open folder to apply relative path"}
+                        >
+                          <Check size={12} />
+                          Accept
+                        </button>
+                        <button
+                          className="btn-sm"
+                          onClick={() =>
+                            setRejectedFileSuggestionKeys((prev) => {
+                              const next = new Set(prev);
+                              next.add(key);
+                              return next;
+                            })
+                          }
+                          title="Reject this file suggestion"
+                        >
+                          <X size={12} />
+                          Reject
+                        </button>
+                      </div>
+                    );
+                  })}
                 </div>
               )}
               {shellCommands.length > 0 && (

@@ -1,7 +1,10 @@
 // src-tauri/src/ai/mod.rs
+use futures::StreamExt;
 use std::collections::HashSet;
+use std::fs::OpenOptions;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::time::Duration;
 use std::time::{SystemTime, UNIX_EPOCH};
 use serde::{Deserialize, Serialize};
 use tauri::{command, AppHandle, Emitter};
@@ -9,6 +12,9 @@ use tauri::{command, AppHandle, Emitter};
 const OLLAMA_BASE_LOCALHOST: &str = "http://localhost:11434";
 const OLLAMA_BASE_LOOPBACK: &str = "http://127.0.0.1:11434";
 const OLLAMA_BASE: &str = OLLAMA_BASE_LOCALHOST;
+const AGENT_MAX_PLANNER_STEPS: usize = 4;
+const AGENT_EARLY_SOURCE_TARGET: usize = 8;
+const AGENT_RECON_KEYWORD_LIMIT: usize = 3;
 const LOCAL_OLLAMA_SYSTEM_PROMPT: &str =
     "You are NCode local coding assistant running on a user-selected Ollama model. \
      Never claim you are ChatGPT, OpenAI, Claude, Gemini, or any cloud-hosted provider. \
@@ -239,6 +245,7 @@ pub async fn fetch_anthropic_models(api_key: String) -> Result<Vec<String>, Stri
     let resp = client
         .get("https://api.anthropic.com/v1/models")
         .header("x-api-key", api_key)
+        .header("anthropic-version", "2023-06-01")
         .send()
         .await
         .map_err(|e| format!("Anthropic request failed: {}", e))?
@@ -459,7 +466,7 @@ pub async fn index_codebase(
     Ok(chunks.len())
 }
 
-// Generic external LLM API chat call. Currently only OpenAI is implemented.
+// Generic external LLM API chat call across supported cloud providers.
 // struct may be unused in current builds but kept for future expansion
 #[allow(dead_code)]
 #[derive(Serialize, Deserialize, Debug)]
@@ -471,6 +478,23 @@ pub struct ExternalChatRequest {
     pub context: Option<String>,
 }
 
+async fn decode_api_json(
+    response: reqwest::Response,
+    provider: &str,
+) -> Result<serde_json::Value, String> {
+    let status = response.status();
+    let body = response.text().await.map_err(|e| e.to_string())?;
+    if !status.is_success() {
+        return Err(format!(
+            "{} API error ({}): {}",
+            provider,
+            status,
+            truncate_text(body, 500)
+        ));
+    }
+    serde_json::from_str(&body).map_err(|e| format!("Invalid {} response JSON: {}", provider, e))
+}
+
 #[command]
 pub async fn api_chat(
     provider: String,
@@ -480,8 +504,7 @@ pub async fn api_chat(
     context: Option<String>,
 ) -> Result<String, String> {
     match provider.to_lowercase().as_str() {
-        "openai" => {
-            // convert to OpenAI API format
+        "openai" | "groq" => {
             #[derive(Serialize)]
             struct OpenAIMessage {
                 role: String,
@@ -507,23 +530,88 @@ pub async fn api_chat(
                 });
             }
 
+            let endpoint = if provider.eq_ignore_ascii_case("groq") {
+                "https://api.groq.com/openai/v1/chat/completions"
+            } else {
+                "https://api.openai.com/v1/chat/completions"
+            };
+
             let req_body = OpenAIRequest {
                 model,
                 messages: all_msgs,
             };
             let client = reqwest::Client::new();
             let resp = client
-                .post("https://api.openai.com/v1/chat/completions")
+                .post(endpoint)
                 .bearer_auth(&api_key)
                 .json(&req_body)
                 .send()
                 .await
                 .map_err(|e| e.to_string())?;
-            let json: serde_json::Value = resp.json().await.map_err(|e| e.to_string())?;
+            let json = decode_api_json(resp, &provider).await?;
             if let Some(content) = json["choices"][0]["message"]["content"].as_str() {
                 Ok(content.to_string())
             } else {
-                Err("OpenAI response missing content".to_string())
+                Err(format!("{} response missing message content", provider))
+            }
+        }
+        "anthropic" => {
+            let mut system_parts: Vec<String> = Vec::new();
+            if let Some(ctx) = context {
+                if !ctx.trim().is_empty() {
+                    system_parts.push(ctx);
+                }
+            }
+
+            let mut anthropic_messages: Vec<serde_json::Value> = Vec::new();
+            for m in messages {
+                match m.role.as_str() {
+                    "system" => {
+                        if !m.content.trim().is_empty() {
+                            system_parts.push(m.content);
+                        }
+                    }
+                    "assistant" => anthropic_messages.push(serde_json::json!({
+                        "role": "assistant",
+                        "content": m.content,
+                    })),
+                    _ => anthropic_messages.push(serde_json::json!({
+                        "role": "user",
+                        "content": m.content,
+                    })),
+                }
+            }
+
+            if anthropic_messages.is_empty() {
+                anthropic_messages.push(serde_json::json!({
+                    "role": "user",
+                    "content": "Hello",
+                }));
+            }
+
+            let mut req = serde_json::json!({
+                "model": model,
+                "max_tokens": 2000,
+                "messages": anthropic_messages,
+            });
+            if !system_parts.is_empty() {
+                req["system"] = serde_json::Value::String(system_parts.join("\n\n"));
+            }
+
+            let client = reqwest::Client::new();
+            let resp = client
+                .post("https://api.anthropic.com/v1/messages")
+                .header("x-api-key", api_key)
+                .header("anthropic-version", "2023-06-01")
+                .json(&req)
+                .send()
+                .await
+                .map_err(|e| e.to_string())?;
+            let json = decode_api_json(resp, "anthropic").await?;
+            if let Some(content) = json["content"][0]["text"].as_str() {
+                Ok(content.to_string())
+            } else {
+                Err("Anthropic response missing content".to_string())
             }
         }
         other => Err(format!("Provider '{}' not supported", other)),
@@ -538,32 +626,67 @@ pub async fn api_complete(
     prompt: String,
     max_tokens: Option<i32>,
 ) -> Result<String, String> {
+    let max_tokens = max_tokens.unwrap_or(100);
     match provider.to_lowercase().as_str() {
-        "openai" => {
-            #[derive(Serialize)]
-            struct OpenAIReq<'a> {
-                model: &'a str,
-                prompt: &'a str,
-                max_tokens: i32,
-            }
-            let req = OpenAIReq {
-                model: &model,
-                prompt: &prompt,
-                max_tokens: max_tokens.unwrap_or(100),
+        "openai" | "groq" => {
+            let endpoint = if provider.eq_ignore_ascii_case("groq") {
+                "https://api.groq.com/openai/v1/chat/completions"
+            } else {
+                "https://api.openai.com/v1/chat/completions"
             };
+
+            let req = serde_json::json!({
+                "model": model,
+                "messages": [
+                    {
+                        "role": "user",
+                        "content": prompt
+                    }
+                ],
+                "max_tokens": max_tokens,
+                "temperature": 0.1
+            });
             let client = reqwest::Client::new();
             let resp = client
-                .post("https://api.openai.com/v1/completions")
+                .post(endpoint)
                 .bearer_auth(&api_key)
                 .json(&req)
                 .send()
                 .await
                 .map_err(|e| e.to_string())?;
-            let json: serde_json::Value = resp.json().await.map_err(|e| e.to_string())?;
-            if let Some(text) = json["choices"][0]["text"].as_str() {
+            let json = decode_api_json(resp, &provider).await?;
+            if let Some(text) = json["choices"][0]["message"]["content"].as_str() {
                 Ok(text.to_string())
             } else {
-                Err("OpenAI completion missing text".to_string())
+                Err(format!("{} completion missing text", provider))
+            }
+        }
+        "anthropic" => {
+            let req = serde_json::json!({
+                "model": model,
+                "max_tokens": max_tokens,
+                "messages": [
+                    {
+                        "role": "user",
+                        "content": prompt
+                    }
+                ]
+            });
+
+            let client = reqwest::Client::new();
+            let resp = client
+                .post("https://api.anthropic.com/v1/messages")
+                .header("x-api-key", api_key)
+                .header("anthropic-version", "2023-06-01")
+                .json(&req)
+                .send()
+                .await
+                .map_err(|e| e.to_string())?;
+            let json = decode_api_json(resp, "anthropic").await?;
+            if let Some(text) = json["content"][0]["text"].as_str() {
+                Ok(text.to_string())
+            } else {
+                Err("Anthropic completion missing text".to_string())
             }
         }
         other => Err(format!("Provider '{}' not supported", other)),
@@ -984,7 +1107,17 @@ fn is_review_request(query: &str) -> bool {
 }
 
 fn needs_project_recon(query: &str) -> bool {
-    is_modify_request(query) || is_review_request(query)
+    let q = query.to_lowercase();
+    let deep_scan_requested = [
+        "deep scan",
+        "full scan",
+        "exhaustive",
+        "comprehensive scan",
+        "scan all files",
+    ]
+    .iter()
+    .any(|k| q.contains(k));
+    is_modify_request(query) || (is_review_request(query) && deep_scan_requested)
 }
 
 fn extract_query_keywords(query: &str) -> Vec<String> {
@@ -1159,7 +1292,10 @@ fn run_recon_with_unix_commands(
         ));
     }
 
-    for keyword in extract_query_keywords(query).into_iter().take(5) {
+    for keyword in extract_query_keywords(query)
+        .into_iter()
+        .take(AGENT_RECON_KEYWORD_LIMIT)
+    {
         let _ = emit_agent_event(
             app,
             run_id,
@@ -1182,7 +1318,7 @@ fn run_recon_with_unix_commands(
                     ),
                     6000,
                 ));
-                for hit in lines.iter().take(12) {
+                for hit in lines.iter().take(6) {
                     if let Some((rel, line_no)) = parse_search_hit(hit) {
                         if let Some(chunk) = chunk_from_hit(root_path, &rel, line_no) {
                             merge_sources(&mut sources, vec![chunk], 14);
@@ -1259,7 +1395,7 @@ fn read_file_preview(
     let content = std::fs::read_to_string(&resolved)
         .map_err(|e| format!("Failed reading file '{}': {}", requested, e))?;
     let lines: Vec<&str> = content.lines().collect();
-    let max_lines = 220usize;
+    let max_lines = 120usize;
     let shown = lines.iter().take(max_lines).copied().collect::<Vec<_>>();
     let numbered = shown
         .iter()
@@ -1396,12 +1532,14 @@ async fn run_agent_planner_loop(
     root_path: Option<&str>,
     chunks: &[CodeChunk],
 ) -> Result<(Vec<CodeChunk>, Vec<String>), String> {
-    let max_steps = 6usize;
+    let max_steps = AGENT_MAX_PLANNER_STEPS;
     let mut observations: Vec<String> = Vec::new();
     let mut collected_sources: Vec<CodeChunk> = Vec::new();
     let mut read_paths: HashSet<String> = HashSet::new();
+    let mut stagnant_steps = 0usize;
 
     for step in 1..=max_steps {
+        let sources_before = collected_sources.len();
         let _ = emit_agent_event(
             app,
             run_id,
@@ -1461,10 +1599,10 @@ async fn run_agent_planner_loop(
                         step, search_query, reason_suffix
                     ),
                 );
-                let hits = select_relevant_chunks(chunks, &search_query, 5);
+                let hits = select_relevant_chunks(chunks, &search_query, 4);
                 let obs = summarize_hits_for_observation(root_path, &search_query, &hits);
                 observations.push(obs);
-                merge_sources(&mut collected_sources, hits, 12);
+                merge_sources(&mut collected_sources, hits, AGENT_EARLY_SOURCE_TARGET);
             }
             "list_dir" => {
                 let req = action.path.as_deref().unwrap_or(".");
@@ -1494,7 +1632,7 @@ async fn run_agent_planner_loop(
                     read_file_preview(root, req)
                         .map(|(preview, chunk)| {
                             read_paths.insert(chunk.file_path.clone());
-                            merge_sources(&mut collected_sources, vec![chunk], 12);
+                            merge_sources(&mut collected_sources, vec![chunk], AGENT_EARLY_SOURCE_TARGET);
                             preview
                         })
                 } else {
@@ -1523,13 +1661,106 @@ async fn run_agent_planner_loop(
             }
         }
 
-        if observations.len() > 10 {
-            let drain_count = observations.len() - 10;
+        if observations.len() > 8 {
+            let drain_count = observations.len() - 8;
             observations.drain(0..drain_count);
+        }
+
+        if collected_sources.len() > sources_before {
+            stagnant_steps = 0;
+        } else {
+            stagnant_steps += 1;
+        }
+
+        if step >= 2 && collected_sources.len() >= AGENT_EARLY_SOURCE_TARGET {
+            let _ = emit_agent_event(
+                app,
+                run_id,
+                "stage",
+                format!(
+                    "Planner: enough evidence collected ({} source chunks). Moving to answer generation.",
+                    collected_sources.len()
+                ),
+            );
+            break;
+        }
+
+        if step >= 2 && stagnant_steps >= 2 {
+            let _ = emit_agent_event(
+                app,
+                run_id,
+                "stage",
+                "Planner: no new evidence in recent steps. Finishing early for faster response.",
+            );
+            break;
         }
     }
 
     Ok((collected_sources, observations))
+}
+
+async fn stream_ollama_chat_direct(
+    app: &AppHandle,
+    run_id: &str,
+    model: &str,
+    messages: Vec<OllamaChatMessage>,
+) -> Result<String, String> {
+    let client = reqwest::Client::new();
+    let request = OllamaChatRequest {
+        model: model.to_string(),
+        messages,
+        stream: true,
+    };
+    let resp = client
+        .post(format!("{}/api/chat", OLLAMA_BASE))
+        .json(&request)
+        .send()
+        .await
+        .map_err(|e| e.to_string())?
+        .error_for_status()
+        .map_err(|e| e.to_string())?;
+
+    let mut stream = resp.bytes_stream();
+    let mut buf = String::new();
+    let mut full = String::new();
+
+    while let Some(item) = stream.next().await {
+        let bytes = item.map_err(|e| e.to_string())?;
+        buf.push_str(&String::from_utf8_lossy(&bytes));
+
+        while let Some(pos) = buf.find('\n') {
+            let line = buf[..pos].trim().to_string();
+            buf.drain(..=pos);
+            if line.is_empty() {
+                continue;
+            }
+            if let Ok(chunk) = serde_json::from_str::<OllamaResponse>(&line) {
+                let token = chunk
+                    .message
+                    .as_ref()
+                    .map(|m| m.content.clone())
+                    .or_else(|| chunk.response.clone())
+                    .unwrap_or_default();
+                if !token.is_empty() {
+                    full.push_str(&token);
+                    let _ = emit_agent_event(app, run_id, "token", token);
+                }
+                if chunk.done {
+                    return if full.trim().is_empty() {
+                        Err("Agent stream returned empty response".to_string())
+                    } else {
+                        Ok(full)
+                    };
+                }
+            }
+        }
+    }
+
+    if full.trim().is_empty() {
+        Err("Agent stream returned empty response".to_string())
+    } else {
+        Ok(full)
+    }
 }
 
 fn looks_like_generic_agent_answer(answer: &str, sources: &[CodeChunk]) -> bool {
@@ -1687,7 +1918,14 @@ async fn stream_ollama_agent_response(
          ## Validation\n\
          ## Final Answer\n\
          In File Changes, list concrete paths and what to modify.\n\
-         Never output generic boilerplate. Always anchor findings to real project files.",
+         For each proposed file change, use this exact format so UI can map it:\n\
+         ### File: relative/path/from/project-root\n\
+         ```language\n\
+         full file content or patch content\n\
+         ```\n\
+         If terminal commands are needed, add a bash block in Validation.\n\
+         Never output generic boilerplate. Always anchor findings to real project files.\n\
+         Never claim edits were already applied; provide proposals and wait for user approval.",
         LOCAL_OLLAMA_SYSTEM_PROMPT
     );
     if let Some(ctx) = rag_context {
@@ -1710,7 +1948,20 @@ async fn stream_ollama_agent_response(
             content: user_prompt,
         },
     ];
-    let mut full = ollama_chat_direct(model, base_messages.clone()).await?;
+    let mut streamed_live = true;
+    let mut full = match stream_ollama_chat_direct(app, run_id, model, base_messages.clone()).await {
+        Ok(text) => text,
+        Err(_) => {
+            streamed_live = false;
+            let _ = emit_agent_event(
+                app,
+                run_id,
+                "stage",
+                "Live token stream unavailable, using fast fallback response mode.",
+            );
+            ollama_chat_direct(model, base_messages.clone()).await?
+        }
+    };
     if looks_like_nonlocal_identity_refusal(&full) {
         if let Ok(rewritten) = rewrite_nonlocal_identity_response(model, &base_messages, &full).await {
             full = rewritten;
@@ -1720,44 +1971,12 @@ async fn stream_ollama_agent_response(
     }
 
     if looks_like_generic_agent_answer(&full, sources) {
-        let file_list = sources
-            .iter()
-            .take(8)
-            .map(|s| {
-                if let Some(root) = root_path {
-                    display_rel_path(Some(root), &s.file_path)
-                } else {
-                    s.file_path.clone()
-                }
-            })
-            .collect::<Vec<_>>()
-            .join(", ");
-        let mut retry_messages = base_messages.clone();
-        retry_messages.push(OllamaChatMessage {
-            role: "assistant".to_string(),
-            content: full.clone(),
-        });
-        retry_messages.push(OllamaChatMessage {
-            role: "user".to_string(),
-            content: format!(
-                "Your previous answer was too generic. Rewrite it as a concrete code review.\n\
-                 Requirements:\n\
-                 - Mention at least 3 exact files from this set when relevant: {}\n\
-                 - Include line-level or snippet-level rationale when possible\n\
-                 - Include actionable fixes and validation commands\n\
-                 - Do not include any generic AI disclaimers.",
-                if file_list.is_empty() { "(no indexed sources)" } else { &file_list }
-            ),
-        });
-        if let Ok(retry) = ollama_chat_direct(model, retry_messages).await {
-            full = retry;
-            if looks_like_nonlocal_identity_refusal(&full) {
-                full = sanitize_nonlocal_identity_terms(&full);
-            }
-        }
-    }
-
-    if looks_like_generic_agent_answer(&full, sources) {
+        let _ = emit_agent_event(
+            app,
+            run_id,
+            "stage",
+            "Model answer was generic. Switching to grounded fallback summary.",
+        );
         full = build_grounded_fallback_answer(query, root_path, sources);
     }
 
@@ -1765,8 +1984,10 @@ async fn stream_ollama_agent_response(
         return Err("Agent produced an empty response".to_string());
     }
 
-    for chunk in stream_chunks(&full, 72) {
-        let _ = emit_agent_event(app, run_id, "token", chunk);
+    if !streamed_live {
+        for chunk in stream_chunks(&full, 72) {
+            let _ = emit_agent_event(app, run_id, "token", chunk);
+        }
     }
     Ok(full)
 }
@@ -1850,7 +2071,7 @@ pub async fn agentic_rag_chat(
     let mut sources: Vec<CodeChunk> = Vec::new();
     let mut investigation_notes: Vec<String> = Vec::new();
 
-    let _ = emit_agent_event(&app, &run_id, "stage", "Starting agent run");
+    let _ = emit_agent_event(&app, &run_id, "stage", "Starting advanced agentic run");
 
     if let Some(root) = normalized_root.as_deref() {
         let index_path = format!("{}/.NCode/index.json", root);
@@ -1861,18 +2082,24 @@ pub async fn agentic_rag_chat(
                 &app,
                 &run_id,
                 "stage",
-                format!("Indexed {} chunks", count),
+                format!("Indexed {} chunks for retrieval", count),
             );
         }
 
         indexed_chunks = load_indexed_chunks(root)?;
+        let _ = emit_agent_event(
+            &app,
+            &run_id,
+            "stage",
+            format!("Loaded {} code chunks from index", indexed_chunks.len()),
+        );
 
         if needs_project_recon(&query) {
             let _ = emit_agent_event(
                 &app,
                 &run_id,
                 "stage",
-                "Recon mode enabled: scanning project and searching related files with Linux commands",
+                "🔍 Reconnaissance mode: Scanning project structure and dependencies",
             );
             let (recon_sources, recon_notes) =
                 run_recon_with_unix_commands(&app, &run_id, root, &query);
@@ -1883,10 +2110,17 @@ pub async fn agentic_rag_chat(
                 &run_id,
                 "stage",
                 format!(
-                    "Recon finished: {} source chunk(s), {} note(s)",
+                    "✅ Recon complete: {} source chunk(s) found, {} observation(s) recorded",
                     sources.len(),
                     investigation_notes.len()
                 ),
+            );
+        } else {
+            let _ = emit_agent_event(
+                &app,
+                &run_id,
+                "stage",
+                "📚 Using RAG retrieval for targeted analysis",
             );
         }
     } else {
@@ -1894,10 +2128,11 @@ pub async fn agentic_rag_chat(
             &app,
             &run_id,
             "stage",
-            "No open folder selected, running without RAG context",
+            "⚠️ No folder open - proceeding with memory-only context",
         );
     }
 
+    // Run the agent planner with improved error handling
     match run_agent_planner_loop(
         &app,
         &run_id,
@@ -1916,7 +2151,7 @@ pub async fn agentic_rag_chat(
                 &run_id,
                 "stage",
                 format!(
-                    "Planner completed with {} source chunk(s) and {} observation(s)",
+                    "🎯 Agent planner: Found {} sources and {} observations",
                     sources.len(),
                     investigation_notes.len()
                 ),
@@ -1927,30 +2162,33 @@ pub async fn agentic_rag_chat(
                 &app,
                 &run_id,
                 "stage",
-                format!("Planner loop failed, continuing with direct generation: {}", err),
+                format!("⚠️ Planner encountered limit, using collected sources: {}", err),
             );
         }
     }
 
+    // Build comprehensive context
     let mut context_parts: Vec<String> = Vec::new();
     if let Some(root) = normalized_root.as_deref() {
         if !sources.is_empty() {
-            context_parts.push(build_rag_context(root, &sources));
+            let rag_context = build_rag_context(root, &sources);
+            context_parts.push(format!("=== CODE CONTEXT ===\n{}", rag_context));
         }
     }
     if !investigation_notes.is_empty() {
         context_parts.push(format!(
-            "Agent investigation log:\n{}",
+            "=== INVESTIGATION LOG ===\nAgent observations:\n{}",
             investigation_notes.join("\n\n")
         ));
     }
     let rag_context = if context_parts.is_empty() {
         None
     } else {
-        Some(context_parts.join("\n\n"))
+        Some(context_parts.join("\n\n=== END SECTION ===\n\n"))
     };
 
-    let _ = emit_agent_event(&app, &run_id, "stage", "Generating agent response");
+    // Generate final response with full context
+    let _ = emit_agent_event(&app, &run_id, "stage", "🤖 Advanced reasoning and response generation");
     match stream_ollama_agent_response(
         &app,
         &run_id,
@@ -1963,12 +2201,607 @@ pub async fn agentic_rag_chat(
     .await
     {
         Ok(answer) => {
-            let _ = emit_agent_event(&app, &run_id, "done", "Agent run completed");
+            let _ = emit_agent_event(&app, &run_id, "done", "✅ Agent analysis complete");
             Ok(RAGResult { answer, sources })
         }
         Err(err) => {
-            let _ = emit_agent_event(&app, &run_id, "error", format!("Agent failed: {}", err));
+            let _ = emit_agent_event(&app, &run_id, "error", format!("❌ Agent error: {}", err));
             Err(err)
+        }
+    }
+}
+
+/// Robust issue detection and analysis
+///
+/// Analyzes code for bugs, performance issues, security vulnerabilities
+#[command]
+pub async fn analyze_issues(
+    file_path: String,
+    code: String,
+    language: Option<String>,
+) -> Result<serde_json::Value, String> {
+    let lang = language.unwrap_or_else(|| detect_language(&file_path));
+    
+    // Run multiple analysis passes
+    let mut issues: Vec<serde_json::Value> = Vec::new();
+    
+    // 1. Syntax analysis
+    issues.extend(analyze_syntax(&code, &lang));
+    
+    // 2. Error handling check
+    issues.extend(analyze_error_handling(&code, &lang));
+    
+    // 3. Resource management check
+    issues.extend(analyze_resource_management(&code, &lang));
+    
+    // 4. Performance check
+    issues.extend(analyze_performance(&code, &lang));
+    
+    // 5. Security check
+    issues.extend(analyze_security(&code, &lang));
+    
+    Ok(serde_json::json!({
+        "file": file_path,
+        "language": lang,
+        "total_issues": issues.len(),
+        "issues": issues
+    }))
+}
+
+/// Analyze code for errors
+fn analyze_error_handling(code: &str, language: &str) -> Vec<serde_json::Value> {
+    let mut issues = Vec::new();
+    let lines: Vec<&str> = code.lines().collect();
+    
+    for (idx, line) in lines.iter().enumerate() {
+        let line_no = idx + 1;
+        
+        // Check for try blocks without catch
+        if (language == "typescript" || language == "javascript") && line.contains("try") {
+            if !lines[idx + 1..].iter().take(5).any(|l| l.contains("catch")) {
+                issues.push(serde_json::json!({
+                    "type": "error_handling",
+                    "severity": "high",
+                    "line": line_no,
+                    "message": "Try block without catch clause",
+                    "suggestion": "Add catch block or use .catch() handler"
+                }));
+            }
+        }
+        
+        // Check for unhandled async calls
+        if (language == "typescript" || language == "javascript" || language == "python")
+            && line.contains("async") && line.contains("await")
+        {
+            if !code[..code.find(line).unwrap_or(0)].contains("try") {
+                issues.push(serde_json::json!({
+                    "type": "error_handling",
+                    "severity": "medium",
+                    "line": line_no,
+                    "message": "Await without try-catch",
+                    "suggestion": "Wrap in try-catch for error handling"
+                }));
+            }
+        }
+    }
+    
+    issues
+}
+
+/// Analyze code for resource management issues
+fn analyze_resource_management(code: &str, language: &str) -> Vec<serde_json::Value> {
+    let mut issues = Vec::new();
+    let lines: Vec<&str> = code.lines().collect();
+    
+    for (idx, line) in lines.iter().enumerate() {
+        let line_no = idx + 1;
+        
+        // Check for unclosed file handles
+        if line.contains(".open(") || line.contains("open(") {
+            let slice = &lines[idx..].join("\n");
+            if !slice.contains(".close()") && !slice.contains("with ") {
+                issues.push(serde_json::json!({
+                    "type": "resource_leak",
+                    "severity": "high",
+                    "line": line_no,
+                    "message": "Potential file descriptor leak",
+                    "suggestion": "Use 'with' statement or ensure .close() is called"
+                }));
+            }
+        }
+        
+        // Check for unclosed connections
+        if line.contains("connect") && !line.contains("disconnect") {
+            issues.push(serde_json::json!({
+                "type": "resource_leak",
+                "severity": "medium",
+                "line": line_no,
+                "message": "Connection opened but not explicitly closed",
+                "suggestion": "Add disconnect/close call in cleanup"
+            }));
+        }
+    }
+    
+    issues
+}
+
+/// Analyze code for performance issues
+fn analyze_performance(code: &str, language: &str) -> Vec<serde_json::Value> {
+    let mut issues = Vec::new();
+    let lines: Vec<&str> = code.lines().collect();
+    
+    for (idx, line) in lines.iter().enumerate() {
+        let line_no = idx + 1;
+        
+        // Check for nested loops
+        let open_parens = line.matches('(').count();
+        let close_parens = line.matches(')').count();
+        if open_parens > 2 && close_parens > 2 {
+            issues.push(serde_json::json!({
+                "type": "performance",
+                "severity": "low",
+                "line": line_no,
+                "message": "High nesting level detected",
+                "suggestion": "Consider extracting complex expressions"
+            }));
+        }
+        
+        // Check for quadratic algorithms
+        if line.contains("for") && line.contains("for") {
+            issues.push(serde_json::json!({
+                "type": "performance",
+                "severity": "medium",
+                "line": line_no,
+                "message": "Nested loop detected - O(n²) complexity",
+                "suggestion": "Check if this can be optimized with a hash table or better algorithm"
+            }));
+        }
+        
+        // Check for inefficient string operations
+        if language == "python" && (line.contains("+ \"") || line.contains("+ '")) {
+            issues.push(serde_json::json!({
+                "type": "performance",
+                "severity": "low",
+                "line": line_no,
+                "message": "String concatenation in loop",
+                "suggestion": "Use ''.join() or StringBuilder for better performance"
+            }));
+        }
+    }
+    
+    issues
+}
+
+/// Analyze code for security issues
+fn analyze_security(code: &str, language: &str) -> Vec<serde_json::Value> {
+    let mut issues = Vec::new();
+    let lines: Vec<&str> = code.lines().collect();
+    
+    for (idx, line) in lines.iter().enumerate() {
+        let line_no = idx + 1;
+        
+        // Check for SQL injection patterns
+        if line.contains("SQL") || line.contains("query") {
+            if line.contains("format(") || line.contains("f\"") || line.contains("concat") {
+                issues.push(serde_json::json!({
+                    "type": "security",
+                    "severity": "critical",
+                    "line": line_no,
+                    "message": "Potential SQL injection - string concatenation used",
+                    "suggestion": "Use parameterized queries or prepared statements"
+                }));
+            }
+        }
+        
+        // Check for hardcoded secrets
+        if line.contains("password") || line.contains("api_key") || line.contains("secret") {
+            if line.contains("=") && !line.trim().starts_with("//") {
+                let value = line.split('=').nth(1).unwrap_or("");
+                if value.contains("\"") || value.contains("'") {
+                    issues.push(serde_json::json!({
+                        "type": "security",
+                        "severity": "critical",
+                        "line": line_no,
+                        "message": "Hardcoded secret detected",
+                        "suggestion": "Use environment variables or secure vaults"
+                    }));
+                }
+            }
+        }
+    }
+    
+    issues
+}
+
+/// Analyze code for syntax issues
+fn analyze_syntax(code: &str, language: &str) -> Vec<serde_json::Value> {
+    let mut issues = Vec::new();
+    
+    // Basic bracket matching
+    let mut stack = Vec::new();
+    for (idx, ch) in code.chars().enumerate() {
+        match ch {
+            '{' | '[' | '(' => stack.push((ch, idx)),
+            '}' => {
+                if stack.is_empty() || stack.pop().unwrap().0 != '{' {
+                    issues.push(serde_json::json!({
+                        "type": "syntax",
+                        "severity": "high",
+                        "position": idx,
+                        "message": "Mismatched braces",
+                    }));
+                }
+            }
+            ']' => {
+                if stack.is_empty() || stack.pop().unwrap().0 != '[' {
+                    issues.push(serde_json::json!({
+                        "type": "syntax",
+                        "severity": "high",
+                        "position": idx,
+                        "message": "Mismatched brackets",
+                    }));
+                }
+            }
+            ')' => {
+                if stack.is_empty() || stack.pop().unwrap().0 != '(' {
+                    issues.push(serde_json::json!({
+                        "type": "syntax",
+                        "severity": "high",
+                        "position": idx,
+                        "message": "Mismatched parentheses",
+                    }));
+                }
+            }
+            _ => {}
+        }
+    }
+    
+    issues
+}
+
+fn detect_language(file_path: &str) -> String {
+    if file_path.ends_with(".py") {
+        "python".to_string()
+    } else if file_path.ends_with(".rs") {
+        "rust".to_string()
+    } else if file_path.ends_with(".ts") || file_path.ends_with(".tsx") {
+        "typescript".to_string()
+    } else if file_path.ends_with(".js") || file_path.ends_with(".jsx") {
+        "javascript".to_string()
+    } else {
+        "unknown".to_string()
+    }
+}
+
+/// Send a chat message through the Python gRPC AI Service
+///
+/// This is the recommended way to send AI requests. The Python service handles:
+/// - Model selection and routing
+/// - Ollama (local) or API (cloud) provider decisions
+/// - Token management and streaming
+///
+/// Flow:
+/// 1. React UI sends message via invoke()
+/// 2. Rust gRPC client sends to Python service
+/// 3. Python service decides model/provider and calls Ollama or APIs
+/// 4. Response flows back through gRPC to React UI
+#[command]
+pub async fn grpc_ai_chat(
+    model: String,
+    messages: Vec<OllamaChatMessage>,
+    provider: String,
+    api_key: Option<String>,
+    temperature: Option<f32>,
+    max_tokens: Option<i32>,
+) -> Result<String, String> {
+    use crate::grpc_client::{GrpcAiClient, ChatMessage};
+
+    let client = GrpcAiClient::default_client();
+    
+    // Check if we can connect
+    match client.connect().await {
+        Ok(_) => {},
+        Err(e) => {
+            return Err(format!("Failed to connect to gRPC AI service on port 50051: {}. Make sure the Python AI service is running (python3 python-ai-service/server.py)", e));
+        }
+    }
+
+    // Extract latest user prompt and keep prior messages as history to avoid duplicating the same prompt.
+    let latest_user_idx = messages.iter().rposition(|m| m.role == "user");
+    let prompt = latest_user_idx
+        .and_then(|idx| messages.get(idx).map(|m| m.content.clone()))
+        .or_else(|| messages.last().map(|m| m.content.clone()))
+        .unwrap_or_else(|| "Hello".to_string());
+
+    let chat_messages: Vec<ChatMessage> = messages
+        .iter()
+        .enumerate()
+        .filter(|(idx, _)| latest_user_idx.map(|u| u != *idx).unwrap_or(true))
+        .map(|(_, m)| ChatMessage {
+            role: m.role.clone(),
+            content: m.content.clone(),
+        })
+        .collect();
+
+    // Send chat request through gRPC
+    match client.chat(
+        model,
+        prompt,
+        chat_messages,
+        provider,
+        api_key,
+        temperature,
+        max_tokens,
+    )
+    .await
+    {
+        Ok(response) => {
+            client.disconnect().await;
+            Ok(response.content)
+        }
+        Err(e) => {
+            client.disconnect().await;
+            Err(format!("gRPC AI chat error: {}", e))
+        }
+    }
+}
+
+/// Check if the Python gRPC AI Service is healthy and accessible
+#[command]
+pub async fn grpc_health_check() -> Result<bool, String> {
+    use crate::grpc_client::GrpcAiClient;
+
+    let client = GrpcAiClient::default_client();
+    match client.health_check().await {
+        Ok(healthy) => {
+            client.disconnect().await;
+            Ok(healthy)
+        }
+        Err(e) => {
+            client.disconnect().await;
+            Err(format!("gRPC health check failed: {}", e))
+        }
+    }
+}
+
+fn find_python_service_dir() -> Option<PathBuf> {
+    let mut candidates: Vec<PathBuf> = Vec::new();
+
+    if let Ok(custom_dir) = std::env::var("NCODE_PY_SERVICE_DIR") {
+        if !custom_dir.trim().is_empty() {
+            candidates.push(PathBuf::from(custom_dir));
+        }
+    }
+    if let Ok(cwd) = std::env::current_dir() {
+        candidates.push(cwd.join("python-ai-service"));
+        candidates.push(cwd.join("../python-ai-service"));
+    }
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(dir) = exe.parent() {
+            candidates.push(dir.join("python-ai-service"));
+            candidates.push(dir.join("../python-ai-service"));
+            candidates.push(dir.join("../../python-ai-service"));
+            candidates.push(dir.join("../../../python-ai-service"));
+        }
+    }
+
+    for candidate in candidates {
+        if candidate.join("server.py").exists() {
+            return Some(candidate);
+        }
+    }
+    None
+}
+
+fn check_python_import(service_dir: &Path, python: &str, module: &str) -> Result<(), String> {
+    let check = Command::new(python)
+        .arg("-c")
+        .arg(format!("import {}", module))
+        .current_dir(service_dir)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .output()
+        .map_err(|e| format!("Failed to run python import check for '{}': {}", module, e))?;
+    if check.status.success() {
+        return Ok(());
+    }
+
+    let detail = String::from_utf8_lossy(&check.stderr).trim().to_string();
+    Err(format!(
+        "Missing Python module '{}'. Run: cd {} && {} -m pip install -r requirements.txt{}",
+        module,
+        service_dir.to_string_lossy(),
+        python,
+        if detail.is_empty() {
+            "".to_string()
+        } else {
+            format!(" (detail: {})", detail)
+        }
+    ))
+}
+
+fn ensure_python_grpc_preflight(service_dir: &Path, python: &str) -> Result<(), String> {
+    let required_files = ["server.py", "ai_service.proto"];
+    for rel in required_files {
+        let path = service_dir.join(rel);
+        if !path.exists() {
+            return Err(format!(
+                "Missing required file for gRPC service: {}",
+                path.to_string_lossy()
+            ));
+        }
+    }
+
+    for module in ["grpc", "grpc_tools", "aiohttp", "pydantic", "pydantic_settings"] {
+        check_python_import(service_dir, python, module)?;
+    }
+
+    let pb2 = service_dir.join("ai_service_pb2.py");
+    let pb2_grpc = service_dir.join("ai_service_pb2_grpc.py");
+    if !pb2.exists() || !pb2_grpc.exists() {
+        let gen = Command::new(python)
+            .args([
+                "-m",
+                "grpc_tools.protoc",
+                "-I.",
+                "--python_out=.",
+                "--grpc_python_out=.",
+                "ai_service.proto",
+            ])
+            .current_dir(service_dir)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .output()
+            .map_err(|e| format!("Failed to run grpc_tools.protoc: {}", e))?;
+        if !gen.status.success() {
+            let out = String::from_utf8_lossy(&gen.stdout).trim().to_string();
+            let err = String::from_utf8_lossy(&gen.stderr).trim().to_string();
+            return Err(format!(
+                "Failed to generate protobuf Python stubs. Run manually:\ncd {}\n{} -m grpc_tools.protoc -I. --python_out=. --grpc_python_out=. ai_service.proto\nstdout: {}\nstderr: {}",
+                service_dir.to_string_lossy(),
+                python,
+                if out.is_empty() { "(empty)".to_string() } else { out },
+                if err.is_empty() { "(empty)".to_string() } else { err },
+            ));
+        }
+    }
+
+    Ok(())
+}
+
+fn read_log_tail(path: &Path, max_lines: usize) -> String {
+    let content = std::fs::read_to_string(path).unwrap_or_default();
+    if content.trim().is_empty() {
+        return "(no log output captured)".to_string();
+    }
+    let lines: Vec<&str> = content.lines().collect();
+    let start = lines.len().saturating_sub(max_lines);
+    lines[start..].join("\n")
+}
+
+fn find_python_executable(service_dir: &Path) -> Option<String> {
+    let mut candidates: Vec<String> = Vec::new();
+
+    if let Ok(custom) = std::env::var("NCODE_PYTHON") {
+        if !custom.trim().is_empty() {
+            candidates.push(custom);
+        }
+    }
+    if let Ok(custom) = std::env::var("PYTHON") {
+        if !custom.trim().is_empty() {
+            candidates.push(custom);
+        }
+    }
+
+    candidates.push(
+        service_dir
+            .join(".venv/bin/python3")
+            .to_string_lossy()
+            .to_string(),
+    );
+    candidates.push(
+        service_dir
+            .join(".venv/bin/python")
+            .to_string_lossy()
+            .to_string(),
+    );
+    candidates.push("python3".to_string());
+    candidates.push("python".to_string());
+
+    for bin in candidates {
+        let check = Command::new(&bin)
+            .arg("--version")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+        if check.map(|s| s.success()).unwrap_or(false) {
+            return Some(bin);
+        }
+    }
+    None
+}
+
+#[command]
+pub async fn start_grpc_service() -> Result<String, String> {
+    if let Ok(true) = grpc_health_check().await {
+        return Ok("gRPC service is already running on 127.0.0.1:50051".to_string());
+    }
+
+    let service_dir = find_python_service_dir()
+        .ok_or_else(|| "Could not find python-ai-service directory".to_string())?;
+    let python = find_python_executable(&service_dir)
+        .ok_or_else(|| "Could not find a usable Python interpreter".to_string())?;
+    ensure_python_grpc_preflight(&service_dir, &python)?;
+
+    let log_path = service_dir.join(".ncode-grpc.log");
+    let stdout_log = OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(true)
+        .open(&log_path)
+        .map_err(|e| format!("Failed to open gRPC log file {}: {}", log_path.to_string_lossy(), e))?;
+    let stderr_log = stdout_log
+        .try_clone()
+        .map_err(|e| format!("Failed to clone gRPC log handle: {}", e))?;
+
+    Command::new(&python)
+        .arg("server.py")
+        .current_dir(&service_dir)
+        .env("PYTHONUNBUFFERED", "1")
+        .stdin(Stdio::null())
+        .stdout(Stdio::from(stdout_log))
+        .stderr(Stdio::from(stderr_log))
+        .spawn()
+        .map_err(|e| format!("Failed to start gRPC service: {}", e))?;
+
+    for _ in 0..20 {
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        if let Ok(true) = grpc_health_check().await {
+            return Ok(format!(
+                "Started gRPC service from {}",
+                service_dir.to_string_lossy()
+            ));
+        }
+    }
+
+    let log_tail = read_log_tail(&log_path, 60);
+    Err(format!(
+        "Started python process but gRPC is still unreachable. Service dir: {}. Python: {}. Log: {}\nRecent log output:\n{}",
+        service_dir.to_string_lossy(),
+        python,
+        log_path.to_string_lossy(),
+        log_tail
+    ))
+}
+
+/// Fetch available models from a provider via gRPC
+#[command]
+pub async fn grpc_fetch_models(
+    provider: String,
+    api_key: Option<String>,
+    base_url: Option<String>,
+) -> Result<Vec<String>, String> {
+    use crate::grpc_client::GrpcAiClient;
+
+    let client = GrpcAiClient::default_client();
+    match client.connect().await {
+        Ok(_) => {},
+        Err(e) => {
+            return Err(format!("Failed to connect to gRPC AI service: {}", e));
+        }
+    }
+
+    match client.fetch_models(provider, api_key, base_url).await {
+        Ok(models) => {
+            client.disconnect().await;
+            Ok(models)
+        }
+        Err(e) => {
+            client.disconnect().await;
+            Err(format!("gRPC fetch models error: {}", e))
         }
     }
 }

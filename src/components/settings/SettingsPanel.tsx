@@ -33,9 +33,13 @@ export function SettingsPanel() {
     addAPIKey,
     removeAPIKey,
     selectedProvider,
+    aiServiceMode,
     selectedApiKeyIndex,
     selectAPIKey,
     setProvider,
+    setAIServiceMode,
+    checkGrpcService,
+    startGrpcService,
     ollamaBaseUrl,
     setOllamaBaseUrl,
     ollamaModelsLoading,
@@ -49,6 +53,9 @@ export function SettingsPanel() {
     apiProviderLoading,
     apiProviderErrors,
     apiProviderModels,
+    isGrpcHealthy,
+    grpcStatusError,
+    grpcStarting,
   } = useAIStore();
 
   const [newApi, setNewApi] = useState({ provider: "", model: "", apiKey: "" });
@@ -56,9 +63,12 @@ export function SettingsPanel() {
   // trigger status check when ai tab is shown
   useEffect(() => {
     if (selectedTab === "ai") {
+      if (aiServiceMode === "grpc") {
+        checkGrpcService();
+      }
       checkOllama();
     }
-  }, [selectedTab, checkOllama]);
+  }, [selectedTab, aiServiceMode, checkOllama, checkGrpcService]);
 
   return (
     <div className="settings-panel">
@@ -215,6 +225,46 @@ export function SettingsPanel() {
             <h3>AI / LLM Configuration</h3>
 
             {/* Provider Selector */}
+            <div className="setting-item">
+              <label>Service Route</label>
+              <select
+                value={aiServiceMode}
+                onChange={(e) => {
+                  const mode = e.target.value as "direct" | "grpc";
+                  setAIServiceMode(mode);
+                  if (mode === "grpc") {
+                    startGrpcService();
+                  } else {
+                    checkGrpcService();
+                  }
+                  checkOllama();
+                }}
+                className="setting-select"
+                style={{ marginBottom: 12, width: "100%" }}
+              >
+                <option value="direct">Direct (Rust → provider)</option>
+                <option value="grpc">gRPC (Rust → Python service)</option>
+              </select>
+              {aiServiceMode === "grpc" && (
+                <>
+                  <div style={{ fontSize: 12, marginBottom: 8, color: isGrpcHealthy ? "#4ec9b0" : "#ce9178" }}>
+                    gRPC Service: {isGrpcHealthy ? "✓ Healthy" : "✗ Unreachable"}
+                    {grpcStatusError ? ` (${grpcStatusError})` : ""}
+                  </div>
+                  {!isGrpcHealthy && (
+                    <button
+                      className="btn-primary btn-sm"
+                      onClick={startGrpcService}
+                      disabled={grpcStarting}
+                      style={{ marginBottom: 8 }}
+                    >
+                      {grpcStarting ? "Starting gRPC..." : "Start gRPC Service"}
+                    </button>
+                  )}
+                </>
+              )}
+            </div>
+
             <div className="setting-item">
               <label>Provider</label>
               <select
@@ -374,14 +424,15 @@ export function SettingsPanel() {
                           </span>
                           <button
                             className="btn-sm"
-                            onClick={(e) => {
+                            onClick={async (e) => {
                               e.stopPropagation();
+                              selectAPIKey(i);
                               if (k.provider === "openai") {
-                                fetchOpenAIModels();
+                                await fetchOpenAIModels(i);
                               } else if (k.provider === "anthropic") {
-                                fetchAnthropicModels();
+                                await fetchAnthropicModels(i);
                               } else if (k.provider === "groq") {
-                                fetchGroqModels();
+                                await fetchGroqModels(i);
                               }
                             }}
                             disabled={apiProviderLoading[k.provider]}
@@ -418,6 +469,7 @@ export function SettingsPanel() {
 
             <hr style={{ margin: "16px 0" }} />
             <div style={{ fontSize: 11, color: "var(--text-muted)" }}>
+              <p><strong>Service Route:</strong> {aiServiceMode === "grpc" ? "gRPC Python Service" : "Direct Rust Calls"}</p>
               <p><strong>Current Provider:</strong> {selectedProvider === "ollama" ? "Ollama (Local)" : `API (${apiKeys[selectedApiKeyIndex || 0]?.provider.toUpperCase() || "None"})`}</p>
               {selectedProvider === "ollama" && selectedOllamaModels.length > 0 && (
                 <p><strong>Selected Model:</strong> {selectedOllamaModels[0]}</p>

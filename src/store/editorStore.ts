@@ -19,6 +19,7 @@ interface AIChangeEntry {
   fileName: string;
   previousContent: string;
   newContent: string;
+  existedBefore: boolean;
   summary: string;
   timestamp: number;
 }
@@ -40,6 +41,7 @@ interface EditorStore {
   setCursorPosition: (tabId: string, line: number, column: number) => void;
   setOpenFolder: (path: string) => void;
   applyAIChangeToTab: (tabId: string, newContent: string, summary?: string) => Promise<boolean>;
+  applyAIChangeToFile: (filePath: string, newContent: string, summary?: string) => Promise<boolean>;
   rollbackLastAIChange: () => Promise<boolean>;
 }
 
@@ -186,6 +188,7 @@ export const useEditorStore = create<EditorStore>((set, get) => ({
       fileName: tab.fileName,
       previousContent: tab.content,
       newContent,
+      existedBefore: true,
       summary,
       timestamp: Date.now(),
     };
@@ -199,19 +202,75 @@ export const useEditorStore = create<EditorStore>((set, get) => ({
     return true;
   },
 
+  applyAIChangeToFile: async (filePath, newContent, summary = "AI suggested file update") => {
+    const existingTab = get().tabs.find((t) => t.filePath === filePath);
+    let previousContent = "";
+    let existedBefore = true;
+
+    if (existingTab) {
+      previousContent = existingTab.content;
+    } else {
+      try {
+        previousContent = await invoke<string>("read_file", { path: filePath });
+      } catch {
+        existedBefore = false;
+      }
+    }
+
+    if (existedBefore && previousContent === newContent) return false;
+
+    await invoke("write_file", { path: filePath, content: newContent });
+    useAIStore.getState().markCodebaseChanged(filePath);
+
+    if (!existingTab) {
+      await get().openFile(filePath);
+    }
+
+    const fileName = filePath.split(/[\\/]/).pop() || filePath;
+    const entry: AIChangeEntry = {
+      id: `ai-change-${Date.now()}`,
+      filePath,
+      fileName,
+      previousContent,
+      newContent,
+      existedBefore,
+      summary,
+      timestamp: Date.now(),
+    };
+
+    set((s) => ({
+      aiChangeHistory: [entry, ...s.aiChangeHistory].slice(0, 100),
+      tabs: s.tabs.map((t) =>
+        t.filePath === filePath ? { ...t, content: newContent, isDirty: false } : t
+      ),
+    }));
+    return true;
+  },
+
   rollbackLastAIChange: async () => {
     const last = get().aiChangeHistory[0];
     if (!last) return false;
 
-    await invoke("write_file", { path: last.filePath, content: last.previousContent });
+    if (last.existedBefore) {
+      await invoke("write_file", { path: last.filePath, content: last.previousContent });
+    } else {
+      await invoke("delete_file", { path: last.filePath });
+    }
     useAIStore.getState().markCodebaseChanged(last.filePath);
 
-    set((s) => ({
-      aiChangeHistory: s.aiChangeHistory.slice(1),
-      tabs: s.tabs.map((t) =>
-        t.filePath === last.filePath ? { ...t, content: last.previousContent, isDirty: false } : t
-      ),
-    }));
+    set((s) => {
+      const remainingTabs = last.existedBefore
+        ? s.tabs.map((t) =>
+            t.filePath === last.filePath ? { ...t, content: last.previousContent, isDirty: false } : t
+          )
+        : s.tabs.filter((t) => t.filePath !== last.filePath);
+      const activeTabStillExists = remainingTabs.some((t) => t.id === s.activeTabId);
+      return {
+        aiChangeHistory: s.aiChangeHistory.slice(1),
+        tabs: remainingTabs,
+        activeTabId: activeTabStillExists ? s.activeTabId : (remainingTabs[0]?.id || null),
+      };
+    });
     return true;
   },
 }));

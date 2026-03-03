@@ -26,6 +26,15 @@ src-tauri/target/
 src-tauri/.cargo/
 **/*.rs.bk
 
+# Python AI service artifacts
+python-ai-service/.venv/
+python-ai-service/__pycache__/
+python-ai-service/*.py[cod]
+python-ai-service/.pytest_cache/
+python-ai-service/.mypy_cache/
+python-ai-service/.ruff_cache/
+python-ai-service/.ncode-grpc.log
+
 # Editor and OS artifacts
 .vscode/
 .idea/

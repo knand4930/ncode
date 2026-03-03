@@ -16,6 +16,7 @@ export interface ChatMessage {
 }
 
 export type AIMode = "chat" | "think" | "agent";
+export type AIServiceMode = "direct" | "grpc";
 
 export type AgentEvent = {
   kind: "stage" | "token" | "done" | "error";
@@ -48,6 +49,7 @@ export interface ApiKeyEntry {
 
 type PersistedAISettings = {
   selectedProvider: "ollama" | "api";
+  aiServiceMode: AIServiceMode;
   selectedOllamaModel: string | null;
   selectedApiKeyIndex: number | null;
   useRAG: boolean;
@@ -66,6 +68,9 @@ function loadAISettings(): PersistedAISettings | null {
     const parsed = JSON.parse(raw) as PersistedAISettings;
     if (!parsed || (parsed.selectedProvider !== "ollama" && parsed.selectedProvider !== "api")) {
       return null;
+    }
+    if (parsed.aiServiceMode !== "direct" && parsed.aiServiceMode !== "grpc") {
+      parsed.aiServiceMode = "direct";
     }
     return parsed;
   } catch {
@@ -118,10 +123,14 @@ interface AIStore {
 
   apiKeys: ApiKeyEntry[];
   selectedProvider: "ollama" | "api";
+  aiServiceMode: AIServiceMode;
   selectedApiKeyIndex: number | null;
   apiProviderModels: Record<string, string[]>; // cache of models per provider
   apiProviderLoading: Record<string, boolean>; // loading state per provider
   apiProviderErrors: Record<string, string>; // error messages per provider
+  isGrpcHealthy: boolean | null;
+  grpcStatusError: string | null;
+  grpcStarting: boolean;
 
   chatHistory: ChatMessage[];
   isThinking: boolean;
@@ -144,11 +153,14 @@ interface AIStore {
   removeAPIKey: (index: number) => void;
   selectAPIKey: (index: number) => void;
   setProvider: (provider: "ollama" | "api") => void;
+  setAIServiceMode: (mode: AIServiceMode) => void;
+  checkGrpcService: () => Promise<void>;
+  startGrpcService: () => Promise<void>;
   setOllamaBaseUrl: (url: string) => void;
   fetchOllamaModels: () => Promise<void>;
-  fetchOpenAIModels: () => Promise<void>;
-  fetchAnthropicModels: () => Promise<void>;
-  fetchGroqModels: () => Promise<void>;
+  fetchOpenAIModels: (index?: number) => Promise<void>;
+  fetchAnthropicModels: (index?: number) => Promise<void>;
+  fetchGroqModels: (index?: number) => Promise<void>;
   sendMessage: (content: string) => Promise<void>;
   clearChat: () => void;
   addStreamToken: (messageId: string, token: string) => void;
@@ -173,10 +185,14 @@ export const useAIStore = create<AIStore>((set, get) => ({
 
   apiKeys: [],
   selectedProvider: persisted?.selectedProvider || "ollama",
+  aiServiceMode: persisted?.aiServiceMode || "direct",
   selectedApiKeyIndex: persisted?.selectedApiKeyIndex ?? null,
   apiProviderModels: {},
   apiProviderLoading: {},
   apiProviderErrors: {},
+  isGrpcHealthy: null,
+  grpcStatusError: null,
+  grpcStarting: false,
 
   chatHistory: loadChatHistory(),
   isThinking: false,
@@ -197,29 +213,66 @@ export const useAIStore = create<AIStore>((set, get) => ({
   },
 
   fetchOllamaModels: async () => {
-    const { ollamaBaseUrl } = get();
+    const { ollamaBaseUrl, aiServiceMode } = get();
     set({ ollamaModelsLoading: true, ollamaModelsError: null });
     try {
-      const models = await invoke<string[]>("fetch_ollama_models", { baseUrl: ollamaBaseUrl });
-      set({ availableModels: models, isOllamaRunning: true, ollamaModelsError: null });
+      if (aiServiceMode === "grpc") {
+        const healthy = await invoke<boolean>("grpc_health_check");
+        const models = await invoke<string[]>("grpc_fetch_models", {
+          provider: "ollama",
+          baseUrl: ollamaBaseUrl,
+        });
+        set({
+          availableModels: models,
+          isOllamaRunning: models.length > 0,
+          isGrpcHealthy: healthy,
+          grpcStatusError: null,
+          ollamaModelsError: null,
+        });
+      } else {
+        const models = await invoke<string[]>("fetch_ollama_models", { baseUrl: ollamaBaseUrl });
+        set({ availableModels: models, isOllamaRunning: true, ollamaModelsError: null });
+      }
     } catch (e) {
       const errorMsg = String(e);
       console.error("Failed to fetch Ollama models:", e);
-      set({ isOllamaRunning: false, ollamaModelsError: errorMsg });
+      let localModels: string[] = [];
+      try {
+        localModels = await invoke<string[]>("check_ollama_status");
+      } catch {
+        try {
+          localModels = await invoke<string[]>("ollama_list_local");
+        } catch {
+          localModels = [];
+        }
+      }
+      set({
+        isOllamaRunning: localModels.length > 0,
+        availableModels: localModels,
+        ollamaModelsError: errorMsg,
+        ...(aiServiceMode === "grpc" ? { isGrpcHealthy: false, grpcStatusError: errorMsg } : {}),
+      });
     } finally {
       set({ ollamaModelsLoading: false });
     }
   },
 
-  fetchOpenAIModels: async () => {
-    const { apiKeys, selectedApiKeyIndex } = get();
-    if (selectedApiKeyIndex === null || !apiKeys[selectedApiKeyIndex]) return;
-    const key = apiKeys[selectedApiKeyIndex];
+  fetchOpenAIModels: async (index) => {
+    const { apiKeys, selectedApiKeyIndex, aiServiceMode } = get();
+    const targetIndex = typeof index === "number" ? index : selectedApiKeyIndex;
+    if (targetIndex === null || !apiKeys[targetIndex]) return;
+    const key = apiKeys[targetIndex];
     if (key.provider !== "openai") return;
     
     set((s) => ({ apiProviderLoading: { ...s.apiProviderLoading, openai: true }, apiProviderErrors: { ...s.apiProviderErrors, openai: "" } }));
     try {
-      const models = await invoke<string[]>("fetch_openai_models", { apiKey: key.apiKey });
+      const models =
+        aiServiceMode === "grpc"
+          ? await invoke<string[]>("grpc_fetch_models", {
+              provider: "openai",
+              apiKey: key.apiKey,
+            })
+          : await invoke<string[]>("fetch_openai_models", { apiKey: key.apiKey });
       set((s) => ({ apiProviderModels: { ...s.apiProviderModels, openai: models }, apiProviderErrors: { ...s.apiProviderErrors, openai: "" } }));
     } catch (e) {
       const errorMsg = String(e);
@@ -230,15 +283,22 @@ export const useAIStore = create<AIStore>((set, get) => ({
     }
   },
 
-  fetchAnthropicModels: async () => {
-    const { apiKeys, selectedApiKeyIndex } = get();
-    if (selectedApiKeyIndex === null || !apiKeys[selectedApiKeyIndex]) return;
-    const key = apiKeys[selectedApiKeyIndex];
+  fetchAnthropicModels: async (index) => {
+    const { apiKeys, selectedApiKeyIndex, aiServiceMode } = get();
+    const targetIndex = typeof index === "number" ? index : selectedApiKeyIndex;
+    if (targetIndex === null || !apiKeys[targetIndex]) return;
+    const key = apiKeys[targetIndex];
     if (key.provider !== "anthropic") return;
     
     set((s) => ({ apiProviderLoading: { ...s.apiProviderLoading, anthropic: true }, apiProviderErrors: { ...s.apiProviderErrors, anthropic: "" } }));
     try {
-      const models = await invoke<string[]>("fetch_anthropic_models", { apiKey: key.apiKey });
+      const models =
+        aiServiceMode === "grpc"
+          ? await invoke<string[]>("grpc_fetch_models", {
+              provider: "anthropic",
+              apiKey: key.apiKey,
+            })
+          : await invoke<string[]>("fetch_anthropic_models", { apiKey: key.apiKey });
       set((s) => ({ apiProviderModels: { ...s.apiProviderModels, anthropic: models }, apiProviderErrors: { ...s.apiProviderErrors, anthropic: "" } }));
     } catch (e) {
       const errorMsg = String(e);
@@ -249,15 +309,22 @@ export const useAIStore = create<AIStore>((set, get) => ({
     }
   },
 
-  fetchGroqModels: async () => {
-    const { apiKeys, selectedApiKeyIndex } = get();
-    if (selectedApiKeyIndex === null || !apiKeys[selectedApiKeyIndex]) return;
-    const key = apiKeys[selectedApiKeyIndex];
+  fetchGroqModels: async (index) => {
+    const { apiKeys, selectedApiKeyIndex, aiServiceMode } = get();
+    const targetIndex = typeof index === "number" ? index : selectedApiKeyIndex;
+    if (targetIndex === null || !apiKeys[targetIndex]) return;
+    const key = apiKeys[targetIndex];
     if (key.provider !== "groq") return;
     
     set((s) => ({ apiProviderLoading: { ...s.apiProviderLoading, groq: true }, apiProviderErrors: { ...s.apiProviderErrors, groq: "" } }));
     try {
-      const models = await invoke<string[]>("fetch_groq_models", { apiKey: key.apiKey });
+      const models =
+        aiServiceMode === "grpc"
+          ? await invoke<string[]>("grpc_fetch_models", {
+              provider: "groq",
+              apiKey: key.apiKey,
+            })
+          : await invoke<string[]>("fetch_groq_models", { apiKey: key.apiKey });
       set((s) => ({ apiProviderModels: { ...s.apiProviderModels, groq: models }, apiProviderErrors: { ...s.apiProviderErrors, groq: "" } }));
     } catch (e) {
       const errorMsg = String(e);
@@ -269,9 +336,49 @@ export const useAIStore = create<AIStore>((set, get) => ({
   },
 
   checkOllama: async () => {
+    const { aiServiceMode, ollamaBaseUrl } = get();
+    if (aiServiceMode === "grpc") {
+      try {
+        const healthy = await invoke<boolean>("grpc_health_check");
+        const models = await invoke<string[]>("grpc_fetch_models", {
+          provider: "ollama",
+          baseUrl: ollamaBaseUrl,
+        });
+        set({
+          isGrpcHealthy: healthy,
+          grpcStatusError: null,
+          isOllamaRunning: models.length > 0,
+          availableModels: models,
+        });
+        if (models.length > 0 && get().selectedOllamaModels.length === 0) {
+          set({ selectedOllamaModels: [models[0]] });
+          get().persistSettings();
+        }
+      } catch (e) {
+        const errorMsg = String(e);
+        let localModels: string[] = [];
+        try {
+          localModels = await invoke<string[]>("check_ollama_status");
+        } catch {
+          try {
+            localModels = await invoke<string[]>("ollama_list_local");
+          } catch {
+            localModels = [];
+          }
+        }
+        set({
+          isGrpcHealthy: false,
+          grpcStatusError: errorMsg,
+          isOllamaRunning: localModels.length > 0,
+          availableModels: localModels,
+        });
+      }
+      return;
+    }
+
     try {
       const models = await invoke<string[]>("check_ollama_status");
-      set({ isOllamaRunning: true, availableModels: models });
+      set({ isOllamaRunning: true, availableModels: models, grpcStatusError: null });
       // auto-select default if nothing chosen yet
       const state = get();
       if (state.selectedOllamaModels.length === 0 && models.length > 0) {
@@ -351,10 +458,38 @@ export const useAIStore = create<AIStore>((set, get) => ({
     get().persistSettings();
   },
 
+  setAIServiceMode: (mode) => {
+    set({ aiServiceMode: mode });
+    get().persistSettings();
+  },
+
+  checkGrpcService: async () => {
+    try {
+      const healthy = await invoke<boolean>("grpc_health_check");
+      set({ isGrpcHealthy: healthy, grpcStatusError: null });
+    } catch (e) {
+      set({ isGrpcHealthy: false, grpcStatusError: String(e) });
+    }
+  },
+
+  startGrpcService: async () => {
+    set({ grpcStarting: true });
+    try {
+      await invoke<string>("start_grpc_service");
+      await get().checkGrpcService();
+      await get().checkOllama();
+    } catch (e) {
+      set({ isGrpcHealthy: false, grpcStatusError: String(e) });
+    } finally {
+      set({ grpcStarting: false });
+    }
+  },
+
   persistSettings: () => {
     const s = get();
     saveAISettings({
       selectedProvider: s.selectedProvider,
+      aiServiceMode: s.aiServiceMode,
       selectedOllamaModel: s.selectedOllamaModels[0] || null,
       selectedApiKeyIndex: s.selectedApiKeyIndex,
       useRAG: s.useRAG,
@@ -367,6 +502,7 @@ export const useAIStore = create<AIStore>((set, get) => ({
     const {
       chatHistory,
       selectedProvider,
+      aiServiceMode,
       selectedOllamaModels,
       selectedApiKeyIndex,
       apiKeys,
@@ -388,7 +524,11 @@ export const useAIStore = create<AIStore>((set, get) => ({
       selectedProvider === "ollama" &&
       !!openFolder &&
       /\b(project|projects|codebase|repo|repository|review|analy[sz]e|audit|architecture|one by one|each file|all files)\b/i.test(content);
-    const shouldUseAgenticReview = aiMode === "agent" || autoProjectReviewIntent;
+    const autoProjectActionIntent =
+      selectedProvider === "ollama" &&
+      !!openFolder &&
+      /\b(generate|create|add|update|implement|build|scaffold)\b/i.test(content);
+    const shouldUseAgenticReview = aiMode === "agent" || autoProjectReviewIntent || autoProjectActionIntent;
 
     set((s) => {
       const updated = [...s.chatHistory, userMsg];
@@ -438,6 +578,14 @@ export const useAIStore = create<AIStore>((set, get) => ({
           const agentQuery =
             autoProjectReviewIntent && aiMode !== "agent"
               ? `PROJECT REVIEW MODE: Review the codebase one by one. Identify bugs, risky patterns, missing dependencies, and concrete fixes. Prefer file-level findings with clear reasoning.\n\nUser request:\n${content}`
+              : autoProjectActionIntent && aiMode !== "agent"
+              ? `PROJECT CHANGE PROPOSAL MODE: Analyze the whole project and propose exact create/update actions.\n\
+                 Requirements:\n\
+                 - Provide concrete file paths for each change.\n\
+                 - Include terminal commands if needed.\n\
+                 - Do NOT claim files are already changed; this is proposal-only until user approval.\n\
+                 - Include validation commands.\n\n\
+                 User request:\n${content}`
               : content;
           const result = await invoke<{ answer: string; sources: any[] }>("agentic_rag_chat", {
             runId,
@@ -494,24 +642,51 @@ export const useAIStore = create<AIStore>((set, get) => ({
           .filter((m) => m.role !== "system")
           .map((m) => ({ role: m.role, content: m.content }));
         messages.push({ role: "user", content });
-        response = await invoke<string>("ollama_chat", {
-          model,
-          messages,
-          context: modeContext,
-        });
+        if (aiServiceMode === "grpc") {
+          if (modeContext) {
+            messages.unshift({ role: "system", content: modeContext });
+          }
+          response = await invoke<string>("grpc_ai_chat", {
+            model,
+            messages,
+            provider: "ollama",
+            temperature: 0.7,
+            maxTokens: 2000,
+          });
+        } else {
+          response = await invoke<string>("ollama_chat", {
+            model,
+            messages,
+            context: modeContext,
+          });
+        }
       } else if (selectedProvider === "api" && selectedApiKeyIndex !== null) {
         const keyEntry = apiKeys[selectedApiKeyIndex];
         const messages = chatHistory
           .filter((m) => m.role !== "system")
           .map((m) => ({ role: m.role, content: m.content }));
         messages.push({ role: "user", content });
-        response = await invoke<string>("api_chat", {
-          provider: keyEntry.provider,
-          apiKey: keyEntry.apiKey,
-          model: keyEntry.model,
-          messages,
-          context: modeContext,
-        });
+        if (aiServiceMode === "grpc") {
+          if (modeContext) {
+            messages.unshift({ role: "system", content: modeContext });
+          }
+          response = await invoke<string>("grpc_ai_chat", {
+            provider: keyEntry.provider,
+            apiKey: keyEntry.apiKey,
+            model: keyEntry.model,
+            messages,
+            temperature: 0.7,
+            maxTokens: 2000,
+          });
+        } else {
+          response = await invoke<string>("api_chat", {
+            provider: keyEntry.provider,
+            apiKey: keyEntry.apiKey,
+            model: keyEntry.model,
+            messages,
+            context: modeContext,
+          });
+        }
       } else {
         response = "Error: no model/provider selected";
       }
@@ -607,28 +782,47 @@ export const useAIStore = create<AIStore>((set, get) => ({
   },
 
   getInlineCompletion: async (code: string, language: string): Promise<string> => {
-    const { selectedProvider, selectedOllamaModels, selectedApiKeyIndex, apiKeys, isOllamaRunning } = get();
+    const { selectedProvider, aiServiceMode, selectedOllamaModels, selectedApiKeyIndex, apiKeys, isOllamaRunning } = get();
     if (selectedProvider === "ollama" && !isOllamaRunning) return "";
 
     try {
       const prompt = `Complete this ${language} code (output only the completion, no explanation):\n\`\`\`${language}\n${code}`;
       if (selectedProvider === "ollama") {
         const model = selectedOllamaModels[0] || "";
-        const result = await invoke<string>("ollama_complete", {
-          model,
-          prompt,
-          maxTokens: 100,
-        });
+        const result =
+          aiServiceMode === "grpc"
+            ? await invoke<string>("grpc_ai_chat", {
+                model,
+                provider: "ollama",
+                messages: [{ role: "user", content: prompt }],
+                temperature: 0.1,
+                maxTokens: 120,
+              })
+            : await invoke<string>("ollama_complete", {
+                model,
+                prompt,
+                maxTokens: 100,
+              });
         return result.trim();
       } else if (selectedProvider === "api" && selectedApiKeyIndex !== null) {
         const keyEntry = apiKeys[selectedApiKeyIndex];
-        const result = await invoke<string>("api_complete", {
-          provider: keyEntry.provider,
-          apiKey: keyEntry.apiKey,
-          model: keyEntry.model,
-          prompt,
-          maxTokens: 100,
-        });
+        const result =
+          aiServiceMode === "grpc"
+            ? await invoke<string>("grpc_ai_chat", {
+                provider: keyEntry.provider,
+                apiKey: keyEntry.apiKey,
+                model: keyEntry.model,
+                messages: [{ role: "user", content: prompt }],
+                temperature: 0.1,
+                maxTokens: 120,
+              })
+            : await invoke<string>("api_complete", {
+                provider: keyEntry.provider,
+                apiKey: keyEntry.apiKey,
+                model: keyEntry.model,
+                prompt,
+                maxTokens: 100,
+              });
         return result.trim();
       }
       return "";

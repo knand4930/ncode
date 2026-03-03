@@ -1,6 +1,7 @@
 mod commands;
 mod lsp;
 mod ai;
+mod grpc_client;
 
 use commands::{fs_commands, process_commands, terminal_commands};
 
@@ -40,6 +41,11 @@ pub fn run() {
             ai::fetch_openai_models,
             ai::fetch_anthropic_models,
             ai::fetch_groq_models,
+            // gRPC AI Service
+            ai::grpc_ai_chat,
+            ai::grpc_health_check,
+            ai::grpc_fetch_models,
+            ai::start_grpc_service,
             // LSP
             lsp::start_lsp,
             lsp::lsp_request,

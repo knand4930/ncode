@@ -331,13 +331,13 @@ For advanced features like caching and monitoring:
 ```bash
 # Install Python service
 cd python-ai-service
-pip install -r requirements.txt
+python3 -m pip install -r requirements.txt
 
 # Generate protobuf code
-python -m grpc_tools.protoc -I. --python_out=. --grpc_python_out=. ai_service.proto
+python3 -m grpc_tools.protoc -I. --python_out=. --grpc_python_out=. ai_service.proto
 
 # Start service (runs on localhost:50051)
-python main.py
+python3 main.py
 ```
 
 See [python-ai-service/README.md](./python-ai-service/README.md) for details.
