@@ -37,6 +37,34 @@ class Settings(BaseSettings):
     enable_caching: bool = os.getenv("ENABLE_CACHING", "true").lower() == "true"
     enable_streaming: bool = os.getenv("ENABLE_STREAMING", "true").lower() == "true"
     
+    # RAG Configuration
+    rag_chunk_size: int = int(os.getenv("RAG_CHUNK_SIZE", "50"))      # Lines per chunk
+    rag_overlap: int = int(os.getenv("RAG_OVERLAP", "10"))            # Lines overlap between chunks
+    rag_max_chunks: int = int(os.getenv("RAG_MAX_CHUNKS", "20"))      # Max chunks to retrieve
+    rag_similarity_threshold: float = float(os.getenv("RAG_SIMILARITY_THRESHOLD", "0.3"))
+    
+    # Agent Configuration
+    agent_max_iterations: int = int(os.getenv("AGENT_MAX_ITERATIONS", "10"))
+    agent_reasoning_depth: str = os.getenv("AGENT_REASONING_DEPTH", "detailed")  # "quick", "balanced", "detailed"
+    agent_timeout: int = int(os.getenv("AGENT_TIMEOUT", "60"))
+    agent_multi_step: bool = os.getenv("AGENT_MULTI_STEP", "true").lower() == "true"
+    
+    # Model Selection
+    default_model_ollama: str = os.getenv("DEFAULT_MODEL_OLLAMA", "mistral")
+    default_model_openai: str = os.getenv("DEFAULT_MODEL_OPENAI", "gpt-4")
+    default_model_anthropic: str = os.getenv("DEFAULT_MODEL_ANTHROPIC", "claude-3-sonnet-20240229")
+    default_model_groq: str = os.getenv("DEFAULT_MODEL_GROQ", "mixtral-8x7b-32768")
+    
+    # Advanced Features
+    enable_code_analysis: bool = os.getenv("ENABLE_CODE_ANALYSIS", "true").lower() == "true"
+    enable_issue_detection: bool = os.getenv("ENABLE_ISSUE_DETECTION", "true").lower() == "true"
+    enable_reasoning_display: bool = os.getenv("ENABLE_REASONING_DISPLAY", "false").lower() == "true"
+    max_reasoning_length: int = int(os.getenv("MAX_REASONING_LENGTH", "2000"))
+    
+    # Quality Control
+    require_sources: bool = os.getenv("REQUIRE_SOURCES", "false").lower() == "true"
+    min_confidence: float = float(os.getenv("MIN_CONFIDENCE", "0.5"))
+    
     class Config:
         env_file = ".env"
         case_sensitive = False

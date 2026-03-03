@@ -32,13 +32,13 @@ The Python gRPC service provides:
 
 ```bash
 cd python-ai-service
-python -m pip install -r requirements.txt
+python3 -m pip install -r requirements.txt
 ```
 
 ### 2. Generate Protobuf Code
 
 ```bash
-python -m grpc_tools.protoc -I. --python_out=. --grpc_python_out=. ai_service.proto
+python3 -m grpc_tools.protoc -I. --python_out=. --grpc_python_out=. ai_service.proto
 ```
 
 This creates:
@@ -48,7 +48,7 @@ This creates:
 ### 3. Run the Server
 
 ```bash
-python server.py
+python3 server.py
 ```
 
 Server listens on `localhost:50051`
@@ -107,12 +107,9 @@ The app supports both direct HTTP and gRPC:
 - **Direct HTTP**: Default, uses Tauri commands to call Ollama/OpenAI/Anthropic/Groq directly
 - **gRPC**: Optional, routes through Python service for preprocessing, caching, monitoring
 
-Users can choose via environment variable:
-
-```bash
-NCODE_AI_SERVICE=grpc  # Use gRPC
-NCODE_AI_SERVICE=direct  # Use direct HTTP (default)
-```
+Users can choose the route in the app settings:
+- `Direct` mode: React -> Rust -> provider APIs
+- `gRPC` mode: React -> Rust -> Python gRPC service -> provider APIs
 
 ## Features
 
@@ -176,7 +173,7 @@ Benchmarks (on M1 Mac):
 lsof -i :50051
 
 # Check Python version (3.8+)
-python --version
+python3 --version
 ```
 
 ### Connection timeout
@@ -203,7 +200,7 @@ ps aux | grep server.py
 ### Running tests
 
 ```bash
-pytest tests/
+python3 -m py_compile *.py
 ```
 
 ## License
@@ -212,6 +209,6 @@ Same as NCode editor
 
 ## See Also
 
-- [Tauri gRPC Integration](../src-tauri/src/grpc.rs)
+- [Tauri gRPC Integration](../src-tauri/src/grpc_client.rs)
 - [AI Settings Panel](../src/components/settings/SettingsPanel.tsx)
 - [Chat Store](../src/store/aiStore.ts)
