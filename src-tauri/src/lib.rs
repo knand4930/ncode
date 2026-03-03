@@ -36,6 +36,10 @@ pub fn run() {
             ai::check_ollama_status,
             ai::ollama_list_local,
             ai::start_ollama,
+            ai::fetch_ollama_models,
+            ai::fetch_openai_models,
+            ai::fetch_anthropic_models,
+            ai::fetch_groq_models,
             // LSP
             lsp::start_lsp,
             lsp::lsp_request,

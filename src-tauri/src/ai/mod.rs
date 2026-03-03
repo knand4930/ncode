@@ -192,6 +192,87 @@ pub async fn start_ollama() -> Result<(), String> {
         .map_err(|e| format!("failed to launch ollama: {}", e))
 }
 
+/// Fetch available models from Ollama with custom base URL
+#[command]
+pub async fn fetch_ollama_models(base_url: String) -> Result<Vec<String>, String> {
+    fetch_ollama_tags(&base_url).await
+}
+
+/// Fetch available models from OpenAI API
+#[command]
+pub async fn fetch_openai_models(api_key: String) -> Result<Vec<String>, String> {
+    #[derive(Deserialize)]
+    struct OpenAIModel {
+        id: String,
+    }
+    #[derive(Deserialize)]
+    struct OpenAIModelsResponse {
+        data: Vec<OpenAIModel>,
+    }
+
+    let client = reqwest::Client::new();
+    let resp = client
+        .get("https://api.openai.com/v1/models")
+        .header("Authorization", format!("Bearer {}", api_key))
+        .send()
+        .await
+        .map_err(|e| format!("OpenAI request failed: {}", e))?
+        .error_for_status()
+        .map_err(|e| format!("OpenAI error: {}", e))?;
+    let data: OpenAIModelsResponse = resp.json().await.map_err(|e| e.to_string())?;
+    Ok(data.data.into_iter().map(|m| m.id).collect())
+}
+
+/// Fetch available models from Anthropic API
+#[command]
+pub async fn fetch_anthropic_models(api_key: String) -> Result<Vec<String>, String> {
+    #[derive(Deserialize)]
+    struct AnthropicModel {
+        id: String,
+    }
+    #[derive(Deserialize)]
+    struct AnthropicModelsResponse {
+        data: Vec<AnthropicModel>,
+    }
+
+    let client = reqwest::Client::new();
+    let resp = client
+        .get("https://api.anthropic.com/v1/models")
+        .header("x-api-key", api_key)
+        .send()
+        .await
+        .map_err(|e| format!("Anthropic request failed: {}", e))?
+        .error_for_status()
+        .map_err(|e| format!("Anthropic error: {}", e))?;
+    let data: AnthropicModelsResponse = resp.json().await.map_err(|e| e.to_string())?;
+    Ok(data.data.into_iter().map(|m| m.id).collect())
+}
+
+/// Fetch available models from Groq API
+#[command]
+pub async fn fetch_groq_models(api_key: String) -> Result<Vec<String>, String> {
+    #[derive(Deserialize)]
+    struct GroqModel {
+        id: String,
+    }
+    #[derive(Deserialize)]
+    struct GroqModelsResponse {
+        data: Vec<GroqModel>,
+    }
+
+    let client = reqwest::Client::new();
+    let resp = client
+        .get("https://api.groq.com/openai/v1/models")
+        .header("Authorization", format!("Bearer {}", api_key))
+        .send()
+        .await
+        .map_err(|e| format!("Groq request failed: {}", e))?
+        .error_for_status()
+        .map_err(|e| format!("Groq error: {}", e))?;
+    let data: GroqModelsResponse = resp.json().await.map_err(|e| e.to_string())?;
+    Ok(data.data.into_iter().map(|m| m.id).collect())
+}
+
 /// Basic completion for inline code suggestions
 #[command]
 pub async fn ollama_complete(
@@ -379,6 +460,8 @@ pub async fn index_codebase(
 }
 
 // Generic external LLM API chat call. Currently only OpenAI is implemented.
+// struct may be unused in current builds but kept for future expansion
+#[allow(dead_code)]
 #[derive(Serialize, Deserialize, Debug)]
 pub struct ExternalChatRequest {
     pub provider: String,

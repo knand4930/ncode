@@ -22,7 +22,7 @@ pub async fn create_terminal(
     let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/bash".to_string());
     
     let term_id = id.clone();
-    let app_handle = app.clone();
+    let _app_handle = app.clone();
     
     // Spawn shell
     let mut cmd = std::process::Command::new(&shell);
@@ -37,15 +37,15 @@ pub async fn create_terminal(
             TERMINALS.lock().unwrap().insert(id.clone(), pid);
             
             // Bridge stdout to frontend
-            let stdout = child.stdout;
-            let err_id = term_id.clone();
+            let _stdout = child.stdout;
+            let _err_id = term_id.clone();
             
             // In real impl: spawn thread to read stdout and emit events
             // app_handle.emit(&format!("terminal-output-{}", term_id), output)?;
             
             Ok(())
         }
-        Err(e) => {
+        Err(_e) => {
             // Fallback: emit a welcome message so terminal isn't blank
             app.emit(&format!("terminal-output-{}", id), 
                 "\x1b[32mNCode Terminal\x1b[0m\r\n$ ".to_string())
@@ -56,8 +56,8 @@ pub async fn create_terminal(
 }
 
 #[command]
-pub async fn write_to_terminal(id: String, data: String) -> Result<(), String> {
-    // Write to PTY stdin
+pub async fn write_to_terminal(_id: String, _data: String) -> Result<(), String> {
+    // Write to PTY stdin (no-op placeholder)
     // In production: look up PTY by ID and write to it
     Ok(())
 }

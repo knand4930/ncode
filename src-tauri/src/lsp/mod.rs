@@ -3,11 +3,12 @@
 // Connects to language servers for advanced code intelligence
 
 use std::collections::HashMap;
-use std::process::{Child, Command, Stdio};
+use std::process::Command;
 use std::sync::{LazyLock, Mutex};
 use serde::{Deserialize, Serialize};
 use tauri::command;
 
+// LSP_PROCESSES is prepared for future tracking of language servers
 static LSP_PROCESSES: LazyLock<Mutex<HashMap<String, u32>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 
@@ -56,7 +57,7 @@ pub fn get_lsp_config(language: &str) -> Option<LSPConfig> {
 }
 
 #[command]
-pub fn start_lsp(language: String, workspace_root: String) -> Result<String, String> {
+pub fn start_lsp(language: String, _workspace_root: String) -> Result<String, String> {
     let config = get_lsp_config(&language)
         .ok_or_else(|| format!("No LSP configured for {}", language))?;
 
