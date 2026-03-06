@@ -5,8 +5,10 @@ import { FitAddon } from "@xterm/addon-fit";
 import { WebLinksAddon } from "@xterm/addon-web-links";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
-import { Plus, X } from "lucide-react";
+import { Plus, X, Bug } from "lucide-react";
 import { useEditorStore } from "../../store/editorStore";
+import { useUIStore } from "../../store/uiStore";
+import { useAIStore } from "../../store/aiStore";
 import "@xterm/xterm/css/xterm.css";
 
 interface TerminalSession {
@@ -14,6 +16,7 @@ interface TerminalSession {
   title: string;
   xterm: XTerm;
   fitAddon: FitAddon;
+  lastError?: string | null;
 }
 
 export function Terminal() {
@@ -22,7 +25,9 @@ export function Terminal() {
   const containerRef = useRef<HTMLDivElement>(null);
   const unlistenMap = useRef<Record<string, () => void>>({});
   const sessionsRef = useRef<TerminalSession[]>([]);
-  const { openFolder } = useEditorStore();
+  const { openFolder, tabs, activeTabId } = useEditorStore();
+  const { setActiveView, toggleAIPanel, showAIPanel } = useUIStore();
+  const { setAIMode, sendMessage } = useAIStore();
 
   useEffect(() => {
     sessionsRef.current = sessions;
@@ -82,8 +87,38 @@ export function Terminal() {
         cwd: openFolder || process.env.HOME || "/",
       });
 
+      const buffer: string[] = [];
+      let currentLine = "";
+
       const unlisten = await listen<string>(`terminal-output-${id}`, (event) => {
         xterm.write(event.payload);
+
+        // Strip ANSI escape codes for cleaner error detection
+        const raw = event.payload.replace(/\x1b\[[0-9;]*m/g, "");
+        for (let i = 0; i < raw.length; i++) {
+          if (raw[i] === '\n' || raw[i] === '\r') {
+            if (currentLine.trim()) {
+              buffer.push(currentLine);
+              if (buffer.length > 50) buffer.shift(); // Keep last 50 lines for context
+
+              // Basic heuristic for common error patterns
+              const isError = /error[ :]|exception|traceback|fail|panic/i.test(currentLine);
+              const isIgnored = /debug|info|warn|notice/i.test(currentLine);
+
+              if (isError && !isIgnored) {
+                // Throttle updates to avoid state thrashing on giant error dumps
+                setTimeout(() => {
+                  setSessions((prev) => prev.map(s =>
+                    s.id === id ? { ...s, lastError: buffer.join("\n") } : s
+                  ));
+                }, 100);
+              }
+            }
+            currentLine = "";
+          } else {
+            currentLine += raw[i];
+          }
+        }
       });
       unlistenMap.current[id] = unlisten;
     } catch (e) {
@@ -108,10 +143,21 @@ export function Terminal() {
     session.xterm.open(el as HTMLElement);
     session.fitAddon.fit();
 
-    const observer = new ResizeObserver(() => session.fitAddon.fit());
+    // Throttle resize with rAF to prevent layout thrashing
+    let rafId: number | null = null;
+    const observer = new ResizeObserver(() => {
+      if (rafId !== null) cancelAnimationFrame(rafId);
+      rafId = requestAnimationFrame(() => {
+        session.fitAddon.fit();
+        rafId = null;
+      });
+    });
     observer.observe(el as Element);
 
-    return () => observer.disconnect();
+    return () => {
+      observer.disconnect();
+      if (rafId !== null) cancelAnimationFrame(rafId);
+    };
   }, [activeSessionId, sessions]);
 
   // Start with one session
@@ -125,7 +171,7 @@ export function Terminal() {
   }, []);
 
   const closeSession = (id: string) => {
-    invoke("kill_terminal", { id }).catch(() => {});
+    invoke("kill_terminal", { id }).catch(() => { });
 
     if (unlistenMap.current[id]) {
       unlistenMap.current[id]();
@@ -143,6 +189,24 @@ export function Terminal() {
       return remaining;
     });
   };
+
+  const handleDebugClick = (errorStr: string) => {
+    setActiveView("ai");
+    if (!showAIPanel) toggleAIPanel();
+    setAIMode("bug_hunt");
+
+    const activeTab = tabs.find(t => t.id === activeTabId);
+    const fileContext = activeTab ? `\n\n\`\`\`${activeTab.language}\n// ${activeTab.fileName}\n${activeTab.content.slice(0, 3000)}\n\`\`\`` : "";
+
+    // Clear the error so the button disappears after clicking
+    setSessions(s => s.map(session => session.id === activeSessionId ? { ...session, lastError: null } : session));
+
+    setTimeout(() => {
+      sendMessage(`I encountered the following error in the terminal. Please help me fix it:${fileContext}\n\nTerminal Output:\n\`\`\`\n${errorStr.slice(-2000)}\n\`\`\``);
+    }, 100);
+  };
+
+  const activeSession = sessions.find(s => s.id === activeSessionId);
 
   return (
     <div className="terminal-container">
@@ -165,7 +229,38 @@ export function Terminal() {
           </button>
         </div>
       </div>
-      <div className="terminal-body" ref={containerRef as any} />
+      <div className="terminal-body-container" style={{ position: "relative", flex: 1, height: "100%", overflow: "hidden" }}>
+        <div className="terminal-body" ref={containerRef as any} style={{ height: "100%" }} />
+
+        {activeSession?.lastError && (
+          <div style={{
+            position: "absolute",
+            bottom: "20px",
+            right: "20px",
+            zIndex: 10,
+            animation: "slideInRight 0.3s cubic-bezier(0.16, 1, 0.3, 1)"
+          }}>
+            <button
+              className="btn-primary"
+              style={{ display: "flex", alignItems: "center", gap: "6px", boxShadow: "0 4px 12px rgba(0,0,0,0.5)" }}
+              onClick={() => handleDebugClick(activeSession.lastError!)}
+            >
+              <Bug size={14} />
+              Debug with AI
+            </button>
+            <button
+              style={{
+                position: "absolute", top: "-8px", right: "-8px", background: "var(--bg-panel)",
+                border: "1px solid var(--border)", borderRadius: "50%", padding: "2px",
+                color: "var(--text-muted)", cursor: "pointer"
+              }}
+              onClick={() => setSessions(s => s.map(session => session.id === activeSessionId ? { ...session, lastError: null } : session))}
+            >
+              <X size={10} />
+            </button>
+          </div>
+        )}
+      </div>
     </div>
   );
 }

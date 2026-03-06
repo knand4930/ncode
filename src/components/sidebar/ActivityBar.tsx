@@ -1,17 +1,19 @@
 // src/components/sidebar/ActivityBar.tsx
-import { Files, Search, GitBranch, Puzzle, Bot, Settings } from "lucide-react";
+import { memo } from "react";
+import { Files, Search, Hash, GitBranch, Puzzle, Bot, Settings, ListTodo } from "lucide-react";
 import { useUIStore } from "../../store/uiStore";
 import { useAIStore } from "../../store/aiStore";
 
 const items = [
   { id: "explorer", icon: Files, label: "Explorer (Ctrl+Shift+E)" },
   { id: "search", icon: Search, label: "Search (Ctrl+Shift+F)" },
-  { id: "symbols", icon: Search, label: "Symbols (Ctrl+T)" },
+  { id: "symbols", icon: Hash, label: "Symbols (Ctrl+T)" },
   { id: "git", icon: GitBranch, label: "Source Control (Ctrl+Shift+G)" },
   { id: "extensions", icon: Puzzle, label: "Extensions (Ctrl+Shift+X)" },
+  { id: "tasks", icon: ListTodo, label: "Tasks" },
 ];
 
-export function ActivityBar() {
+export const ActivityBar = memo(function ActivityBar() {
   const { activeView, setActiveView, toggleAIPanel, showAIPanel, toggleSettingsPanel } = useUIStore();
   const { isOllamaRunning } = useAIStore();
 
@@ -48,4 +50,4 @@ export function ActivityBar() {
       </div>
     </div>
   );
-}
+});

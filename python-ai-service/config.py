@@ -65,6 +65,17 @@ class Settings(BaseSettings):
     require_sources: bool = os.getenv("REQUIRE_SOURCES", "false").lower() == "true"
     min_confidence: float = float(os.getenv("MIN_CONFIDENCE", "0.5"))
     
+    # AirLLM settings (split-model inference for limited RAM)
+    airllm_base_url: str = os.getenv("AIRLLM_BASE_URL", "http://localhost:8000")
+    airllm_model_path: Optional[str] = os.getenv("AIRLLM_MODEL_PATH")  # e.g., "meta-llama/Llama-2-7b-hf"
+    airllm_timeout: int = int(os.getenv("AIRLLM_TIMEOUT", "120"))  # Longer timeout for split-model loading
+    
+    # vLLM settings (high-throughput batched inference)
+    vllm_base_url: str = os.getenv("VLLM_BASE_URL", "http://localhost:8000")
+    vllm_api_key: Optional[str] = os.getenv("VLLM_API_KEY")
+    vllm_timeout: int = int(os.getenv("VLLM_TIMEOUT", "60"))
+    vllm_default_model: Optional[str] = os.getenv("VLLM_DEFAULT_MODEL")  # e.g., "meta-llama/Meta-Llama-3-8B-Instruct"
+    
     class Config:
         env_file = ".env"
         case_sensitive = False

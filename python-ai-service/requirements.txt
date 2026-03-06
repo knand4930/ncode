@@ -5,3 +5,9 @@ aiohttp==3.10.5
 pydantic==2.7.1
 python-dotenv==1.0.1
 pydantic-settings==2.2.1
+
+# Optional: AirLLM for split-model inference (limited RAM)
+# airllm>=2.8.0
+
+# Optional: vLLM for high-throughput batched inference
+# vllm>=0.4.0

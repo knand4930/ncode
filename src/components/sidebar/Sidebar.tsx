@@ -15,6 +15,7 @@ import { SymbolSearchPanel } from "./SymbolSearchPanel";
 import { KeyBindingsPanel } from "./KeyBindingsPanel";
 import { ExtensionsPanel } from "../extensions/ExtensionsPanel";
 import { GitPanel } from "./GitPanel";
+import { TaskPanel } from "./TaskPanel";
 
 interface FileEntry {
   name: string;
@@ -197,6 +198,7 @@ export function Sidebar() {
   if (activeView === "keybindings") return <KeyBindingsPanel />;
   if (activeView === "git") return <GitPanel />;
   if (activeView === "extensions") return <ExtensionsPanel />;
+  if (activeView === "tasks") return <TaskPanel />;
 
   return (
     <div className="sidebar">

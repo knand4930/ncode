@@ -1,11 +1,21 @@
 // src/components/ai/AIPanel.tsx
-import { useState, useRef, useEffect } from "react";
+import { useState, useRef, useEffect, useMemo } from "react";
 import { Send, Trash2, Database, Zap, ChevronDown, ExternalLink, Eye, EyeOff, Undo2, Check, X } from "lucide-react";
 import { invoke } from "@tauri-apps/api/core";
 import { useAIStore, RECOMMENDED_MODELS } from "../../store/aiStore";
 import { useEditorStore } from "../../store/editorStore";
 import { useUIStore } from "../../store/uiStore";
 import { marked } from "marked";
+
+// Basic HTML sanitizer to prevent XSS from AI-generated markdown
+function sanitizeHtml(html: string): string {
+  return html
+    .replace(/<script\b[^<]*(?:(?!<\/script>)<[^<]*)*<\/script>/gi, '')
+    .replace(/\son\w+\s*=\s*["'][^"']*["']/gi, '')
+    .replace(/\son\w+\s*=\s*[^\s>]+/gi, '')
+    .replace(/javascript\s*:/gi, 'blocked:')
+    .replace(/data\s*:\s*text\/html/gi, 'blocked:');
+}
 
 type FileSuggestion = {
   path: string;
@@ -380,6 +390,20 @@ export function AIPanel() {
             Agent
           </button>
           <button
+            className={`ai-mode-btn ${aiMode === "bug_hunt" ? "active" : ""}`}
+            onClick={() => setAIMode("bug_hunt")}
+            title="Bug Hunt: find bugs, vulnerabilities, flaws"
+          >
+            🐛 Bugs
+          </button>
+          <button
+            className={`ai-mode-btn ${aiMode === "architect" ? "active" : ""}`}
+            onClick={() => setAIMode("architect")}
+            title="Architect: design review & improvements"
+          >
+            🏗️ Arch
+          </button>
+          <button
             className={`ai-mode-btn ${aiMode === "chat" ? "active" : ""}`}
             onClick={() => setAIMode("chat")}
             title="Chat mode: direct answers"
@@ -515,9 +539,8 @@ export function AIPanel() {
                 {apiKeys.map((k, i) => (
                   <button
                     key={i}
-                    className={`ai-model-option ${
-                      selectedProvider === "api" && selectedApiKeyIndex === i ? "selected" : ""
-                    }`}
+                    className={`ai-model-option ${selectedProvider === "api" && selectedApiKeyIndex === i ? "selected" : ""
+                      }`}
                     onClick={() => {
                       setProvider("api");
                       selectAPIKey(i);
@@ -587,202 +610,203 @@ export function AIPanel() {
               fileSuggestions.length === 0 &&
               !rejectedSuggestionIds.has(msg.id);
             return (
-            <div key={msg.id} className={`ai-message ai-message-${msg.role}`}>
-              <div className="ai-message-header">
-                <span>
-                  {msg.role === "user" ? "You" : "AI"}
-                  {msg.role === "assistant" && msg.model && (
-                    <span style={{ fontSize: "0.85em", color: "var(--text-secondary)", marginLeft: "6px" }}>
-                      ({msg.provider === "ollama" ? "Local" : "API"}: {msg.model})
-                    </span>
-                  )}
-                </span>
-                <span className="ai-message-time">
-                  {new Date(msg.timestamp).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}
-                </span>
-              </div>
-              <div
-                className="ai-message-content"
-                dangerouslySetInnerHTML={{ __html: marked(msg.content) as string }}
-              />
-              {canApproveSuggestion && (
-                <div className="ai-change-actions">
-                  <button
-                    className="btn-sm btn-primary"
-                    disabled={applyingMessageId === msg.id}
-                    onClick={async () => {
-                      if (!activeTabId || !codeSuggestion || !activeTab) return;
-                      const confirmed = window.confirm(
-                        `Apply AI suggestion to ${activeTab.fileName}? You can rollback later.`
-                      );
-                      if (!confirmed) return;
-                      setApplyingMessageId(msg.id);
-                      try {
-                        await applyAIChangeToTab(
-                          activeTabId,
-                          codeSuggestion,
-                          `Accepted from AI message at ${new Date(msg.timestamp).toLocaleTimeString()}`
-                        );
-                      } finally {
-                        setApplyingMessageId(null);
-                      }
-                    }}
-                    title="Apply suggestion to active file"
-                  >
-                    <Check size={12} />
-                    Accept
-                  </button>
-                  <button
-                    className="btn-sm"
-                    onClick={() =>
-                      setRejectedSuggestionIds((s) => {
-                        const n = new Set(s);
-                        n.add(msg.id);
-                        return n;
-                      })
-                    }
-                    title="Reject this suggestion"
-                  >
-                    <X size={12} />
-                    Reject
-                  </button>
+              <div key={msg.id} className={`ai-message ai-message-${msg.role}`}>
+                <div className="ai-message-header">
+                  <span>
+                    {msg.role === "user" ? "You" : "AI"}
+                    {msg.role === "assistant" && msg.model && (
+                      <span style={{ fontSize: "0.85em", color: "var(--text-secondary)", marginLeft: "6px" }}>
+                        ({msg.provider === "ollama" ? "Local" : "API"}: {msg.model})
+                      </span>
+                    )}
+                  </span>
+                  <span className="ai-message-time">
+                    {new Date(msg.timestamp).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}
+                  </span>
                 </div>
-              )}
-              {fileSuggestions.length > 0 && (
-                <div className="ai-command-actions">
-                  {fileSuggestions.map((s, idx) => {
-                    const key = `${msg.id}-file-${idx}-${s.path}`;
-                    if (rejectedFileSuggestionKeys.has(key)) return null;
-                    const resolvedPath = resolveSuggestionPath(s.path, openFolder ?? null);
-                    const disabled = applyingFileSuggestionKey === key || !resolvedPath;
-                    return (
-                      <div key={key} className="ai-command-row">
-                        <code>{s.path}</code>
-                        <button
-                          className="btn-sm btn-primary"
-                          disabled={disabled}
-                          onClick={async () => {
-                            if (!resolvedPath) {
-                              window.alert("Open a project folder first for relative file paths.");
-                              return;
-                            }
-                            const confirmed = window.confirm(
-                              `Apply AI suggestion to file?\n\n${resolvedPath}\n\nThis will create or update the file.`
-                            );
-                            if (!confirmed) return;
-                            setApplyingFileSuggestionKey(key);
-                            try {
-                              await applyAIChangeToFile(
-                                resolvedPath,
-                                s.content,
-                                `Accepted AI file suggestion at ${new Date(msg.timestamp).toLocaleTimeString()}`
-                              );
-                            } finally {
-                              setApplyingFileSuggestionKey(null);
-                            }
-                          }}
-                          title={resolvedPath ? `Create/Update ${resolvedPath}` : "Open folder to apply relative path"}
-                        >
-                          <Check size={12} />
-                          Accept
-                        </button>
-                        <button
-                          className="btn-sm"
-                          onClick={() =>
-                            setRejectedFileSuggestionKeys((prev) => {
-                              const next = new Set(prev);
-                              next.add(key);
-                              return next;
-                            })
-                          }
-                          title="Reject this file suggestion"
-                        >
-                          <X size={12} />
-                          Reject
-                        </button>
-                      </div>
-                    );
-                  })}
-                </div>
-              )}
-              {shellCommands.length > 0 && (
-                <div className="ai-command-actions">
-                  {shellCommands.map((cmd, idx) => {
-                    const key = `${msg.id}-${idx}`;
-                    if (rejectedCommandKeys.has(key)) return null;
-                    return (
-                      <div key={key} className="ai-command-row">
-                        <code>{cmd}</code>
-                        <button
-                          className="btn-sm btn-primary"
-                          disabled={runningCommandKey === key}
-                          onClick={async () => {
-                            if (!openFolder) {
-                              window.alert("Open a project folder before running commands.");
-                              return;
-                            }
-                            const confirmed = window.confirm(
-                              `Run this command in ${openFolder}?\n\n${cmd}`
-                            );
-                            if (!confirmed) return;
-                            setRunningCommandKey(key);
-                            try {
-                              const out = await invoke<string>("run_command", {
-                                cmd,
-                                cwd: openFolder,
-                              });
-                              const preview = out.length > 1500 ? `${out.slice(0, 1500)}\n...[truncated]` : out;
-                              window.alert(`Command succeeded:\n\n${preview || "(no output)"}`);
-                            } catch (e) {
-                              window.alert(`Command failed:\n\n${String(e)}`);
-                            } finally {
-                              setRunningCommandKey(null);
-                            }
-                          }}
-                          title="Run this command"
-                        >
-                          <Check size={12} />
-                          Run
-                        </button>
-                        <button
-                          className="btn-sm"
-                          onClick={() =>
-                            setRejectedCommandKeys((s) => {
-                              const n = new Set(s);
-                              n.add(key);
-                              return n;
-                            })
-                          }
-                          title="Reject this command"
-                        >
-                          <X size={12} />
-                          Skip
-                        </button>
-                      </div>
-                    );
-                  })}
-                </div>
-              )}
-              {msg.sources && msg.sources.length > 0 && (
-                <div className="ai-sources">
-                  <span>Sources:</span>
-                  {msg.sources.map((src, i) => (
+                <div
+                  className="ai-message-content"
+                  dangerouslySetInnerHTML={{ __html: sanitizeHtml(marked(msg.content) as string) }}
+                />
+                {canApproveSuggestion && (
+                  <div className="ai-change-actions">
                     <button
-                      key={i}
-                      className="ai-source-btn"
-                      onClick={() => {
-                        openFile(src.filePath);
+                      className="btn-sm btn-primary"
+                      disabled={applyingMessageId === msg.id}
+                      onClick={async () => {
+                        if (!activeTabId || !codeSuggestion || !activeTab) return;
+                        const confirmed = window.confirm(
+                          `Apply AI suggestion to ${activeTab.fileName}? You can rollback later.`
+                        );
+                        if (!confirmed) return;
+                        setApplyingMessageId(msg.id);
+                        try {
+                          await applyAIChangeToTab(
+                            activeTabId,
+                            codeSuggestion,
+                            `Accepted from AI message at ${new Date(msg.timestamp).toLocaleTimeString()}`
+                          );
+                        } finally {
+                          setApplyingMessageId(null);
+                        }
                       }}
-                      title={`${src.filePath}:${src.startLine}`}
+                      title="Apply suggestion to active file"
                     >
-                      <ExternalLink size={10} />
-                      {src.filePath.split(/[\\/]/).pop()}:{src.startLine}
+                      <Check size={12} />
+                      Accept
                     </button>
-                  ))}
-                </div>
-              )}
-            </div>
-          )})
+                    <button
+                      className="btn-sm"
+                      onClick={() =>
+                        setRejectedSuggestionIds((s) => {
+                          const n = new Set(s);
+                          n.add(msg.id);
+                          return n;
+                        })
+                      }
+                      title="Reject this suggestion"
+                    >
+                      <X size={12} />
+                      Reject
+                    </button>
+                  </div>
+                )}
+                {fileSuggestions.length > 0 && (
+                  <div className="ai-command-actions">
+                    {fileSuggestions.map((s, idx) => {
+                      const key = `${msg.id}-file-${idx}-${s.path}`;
+                      if (rejectedFileSuggestionKeys.has(key)) return null;
+                      const resolvedPath = resolveSuggestionPath(s.path, openFolder ?? null);
+                      const disabled = applyingFileSuggestionKey === key || !resolvedPath;
+                      return (
+                        <div key={key} className="ai-command-row">
+                          <code>{s.path}</code>
+                          <button
+                            className="btn-sm btn-primary"
+                            disabled={disabled}
+                            onClick={async () => {
+                              if (!resolvedPath) {
+                                window.alert("Open a project folder first for relative file paths.");
+                                return;
+                              }
+                              const confirmed = window.confirm(
+                                `Apply AI suggestion to file?\n\n${resolvedPath}\n\nThis will create or update the file.`
+                              );
+                              if (!confirmed) return;
+                              setApplyingFileSuggestionKey(key);
+                              try {
+                                await applyAIChangeToFile(
+                                  resolvedPath,
+                                  s.content,
+                                  `Accepted AI file suggestion at ${new Date(msg.timestamp).toLocaleTimeString()}`
+                                );
+                              } finally {
+                                setApplyingFileSuggestionKey(null);
+                              }
+                            }}
+                            title={resolvedPath ? `Create/Update ${resolvedPath}` : "Open folder to apply relative path"}
+                          >
+                            <Check size={12} />
+                            Accept
+                          </button>
+                          <button
+                            className="btn-sm"
+                            onClick={() =>
+                              setRejectedFileSuggestionKeys((prev) => {
+                                const next = new Set(prev);
+                                next.add(key);
+                                return next;
+                              })
+                            }
+                            title="Reject this file suggestion"
+                          >
+                            <X size={12} />
+                            Reject
+                          </button>
+                        </div>
+                      );
+                    })}
+                  </div>
+                )}
+                {shellCommands.length > 0 && (
+                  <div className="ai-command-actions">
+                    {shellCommands.map((cmd, idx) => {
+                      const key = `${msg.id}-${idx}`;
+                      if (rejectedCommandKeys.has(key)) return null;
+                      return (
+                        <div key={key} className="ai-command-row">
+                          <code>{cmd}</code>
+                          <button
+                            className="btn-sm btn-primary"
+                            disabled={runningCommandKey === key}
+                            onClick={async () => {
+                              if (!openFolder) {
+                                window.alert("Open a project folder before running commands.");
+                                return;
+                              }
+                              const confirmed = window.confirm(
+                                `Run this command in ${openFolder}?\n\n${cmd}`
+                              );
+                              if (!confirmed) return;
+                              setRunningCommandKey(key);
+                              try {
+                                const out = await invoke<string>("run_command", {
+                                  cmd,
+                                  cwd: openFolder,
+                                });
+                                const preview = out.length > 1500 ? `${out.slice(0, 1500)}\n...[truncated]` : out;
+                                window.alert(`Command succeeded:\n\n${preview || "(no output)"}`);
+                              } catch (e) {
+                                window.alert(`Command failed:\n\n${String(e)}`);
+                              } finally {
+                                setRunningCommandKey(null);
+                              }
+                            }}
+                            title="Run this command"
+                          >
+                            <Check size={12} />
+                            Run
+                          </button>
+                          <button
+                            className="btn-sm"
+                            onClick={() =>
+                              setRejectedCommandKeys((s) => {
+                                const n = new Set(s);
+                                n.add(key);
+                                return n;
+                              })
+                            }
+                            title="Reject this command"
+                          >
+                            <X size={12} />
+                            Skip
+                          </button>
+                        </div>
+                      );
+                    })}
+                  </div>
+                )}
+                {msg.sources && msg.sources.length > 0 && (
+                  <div className="ai-sources">
+                    <span>Sources:</span>
+                    {msg.sources.map((src, i) => (
+                      <button
+                        key={i}
+                        className="ai-source-btn"
+                        onClick={() => {
+                          openFile(src.filePath);
+                        }}
+                        title={`${src.filePath}:${src.startLine}`}
+                      >
+                        <ExternalLink size={10} />
+                        {src.filePath.split(/[\\/]/).pop()}:{src.startLine}
+                      </button>
+                    ))}
+                  </div>
+                )}
+              </div>
+            )
+          })
         )}
         {(aiMode === "agent" || agentLiveOutput || agentEvents.length > 0) && (isThinking || agentLiveOutput || agentEvents.length > 0) && (
           <div className="ai-agent-stream">

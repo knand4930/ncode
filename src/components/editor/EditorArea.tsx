@@ -106,10 +106,10 @@ export function EditorArea() {
               } else {
                 resolve({ items: [] });
               }
-            }, 800);
+            }, 1200);
           });
         },
-        freeInlineCompletions: () => {},
+        freeInlineCompletions: () => { },
       });
     }
 

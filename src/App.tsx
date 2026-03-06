@@ -12,6 +12,7 @@ import { StatusBar } from "./components/statusbar/StatusBar";
 import { SettingsPanel } from "./components/settings/SettingsPanel";
 import { CommandPalette } from "./components/editor/CommandPalette";
 import { QuickOpenPanel } from "./components/editor/QuickOpenPanel";
+import { ErrorBoundary } from "./components/ErrorBoundary";
 import { useEditorStore } from "./store/editorStore";
 import { useUIStore } from "./store/uiStore";
 import { useAIStore } from "./store/aiStore";
@@ -174,7 +175,9 @@ export default function App() {
                 <div className="editor-container">
                   <EditorTabs />
                   <EditorBreadcrumbs />
-                  <EditorArea />
+                  <ErrorBoundary fallbackLabel="Editor">
+                    <EditorArea />
+                  </ErrorBoundary>
                 </div>
               </Panel>
 
@@ -183,7 +186,9 @@ export default function App() {
                 <>
                   <PanelResizeHandle className="resize-handle-horizontal" />
                   <Panel defaultSize={25} minSize={15} maxSize={50} id="terminal">
-                    <Terminal />
+                    <ErrorBoundary fallbackLabel="Terminal">
+                      <Terminal />
+                    </ErrorBoundary>
                   </Panel>
                 </>
               )}
@@ -195,7 +200,9 @@ export default function App() {
             <>
               <PanelResizeHandle className="resize-handle-vertical" />
               <Panel defaultSize={28} minSize={20} maxSize={50} id="ai">
-                <AIPanel />
+                <ErrorBoundary fallbackLabel="AI Panel">
+                  <AIPanel />
+                </ErrorBoundary>
               </Panel>
             </>
           )}

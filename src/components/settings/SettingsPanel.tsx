@@ -370,6 +370,8 @@ export function SettingsPanel() {
                     <option value="openai">OpenAI</option>
                     <option value="anthropic">Anthropic</option>
                     <option value="groq">Groq</option>
+                    <option value="airllm">AirLLM (local split-model)</option>
+                    <option value="vllm">vLLM (high-throughput)</option>
                   </select>
 
                   <input

@@ -1,7 +1,7 @@
-// src/store/editorStore.ts
 import { create } from "zustand";
 import { invoke } from "@tauri-apps/api/core";
 import { useAIStore } from "./aiStore";
+import { detectProjectContext } from "../utils/projectScanner";
 
 export interface EditorTab {
   id: string;
@@ -30,7 +30,7 @@ interface EditorStore {
   openFolder: string | null;
   recentFiles: string[];
   aiChangeHistory: AIChangeEntry[];
-  
+
   openFile: (filePath: string) => Promise<string | null>;
   openFileAt: (filePath: string, line: number, column?: number) => Promise<void>;
   closeTab: (tabId: string) => void;
@@ -70,7 +70,7 @@ export const useEditorStore = create<EditorStore>((set, get) => ({
 
   openFile: async (filePath: string) => {
     const { tabs } = get();
-    
+
     // Check if already open
     const existing = tabs.find((t) => t.filePath === filePath);
     if (existing) {
@@ -111,12 +111,12 @@ export const useEditorStore = create<EditorStore>((set, get) => ({
       tabs: s.tabs.map((t) =>
         t.id === tabId
           ? {
-              ...t,
-              cursorPosition: {
-                line: Math.max(1, line),
-                column: Math.max(1, column),
-              },
-            }
+            ...t,
+            cursorPosition: {
+              line: Math.max(1, line),
+              column: Math.max(1, column),
+            },
+          }
           : t
       ),
       activeTabId: tabId,
@@ -127,12 +127,12 @@ export const useEditorStore = create<EditorStore>((set, get) => ({
     const { tabs, activeTabId } = get();
     const idx = tabs.findIndex((t) => t.id === tabId);
     const newTabs = tabs.filter((t) => t.id !== tabId);
-    
+
     let newActive = activeTabId;
     if (activeTabId === tabId) {
       newActive = newTabs[idx]?.id || newTabs[idx - 1]?.id || null;
     }
-    
+
     set({ tabs: newTabs, activeTabId: newActive });
   },
 
@@ -172,7 +172,13 @@ export const useEditorStore = create<EditorStore>((set, get) => ({
     }));
   },
 
-  setOpenFolder: (path: string) => set({ openFolder: path }),
+  setOpenFolder: async (path: string) => {
+    set({ openFolder: path });
+    // Run background project scan to detect frameworks for AI context
+    detectProjectContext(path).then((ctx) => {
+      useAIStore.getState().setProjectContext(ctx);
+    });
+  },
 
   applyAIChangeToTab: async (tabId, newContent, summary = "AI suggested update") => {
     const tab = get().tabs.find((t) => t.id === tabId);
@@ -261,8 +267,8 @@ export const useEditorStore = create<EditorStore>((set, get) => ({
     set((s) => {
       const remainingTabs = last.existedBefore
         ? s.tabs.map((t) =>
-            t.filePath === last.filePath ? { ...t, content: last.previousContent, isDirty: false } : t
-          )
+          t.filePath === last.filePath ? { ...t, content: last.previousContent, isDirty: false } : t
+        )
         : s.tabs.filter((t) => t.filePath !== last.filePath);
       const activeTabStillExists = remainingTabs.some((t) => t.id === s.activeTabId);
       return {

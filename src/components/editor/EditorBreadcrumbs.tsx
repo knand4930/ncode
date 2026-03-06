@@ -1,6 +1,7 @@
+import { memo } from "react";
 import { useEditorStore } from "../../store/editorStore";
 
-export function EditorBreadcrumbs() {
+export const EditorBreadcrumbs = memo(function EditorBreadcrumbs() {
   const { tabs, activeTabId, openFolder } = useEditorStore();
   const activeTab = tabs.find((t) => t.id === activeTabId);
 
@@ -26,4 +27,4 @@ export function EditorBreadcrumbs() {
       )}
     </div>
   );
-}
+});

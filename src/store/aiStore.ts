@@ -2,6 +2,7 @@
 import { create } from "zustand";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
+import { type ProjectContext } from "../utils/projectScanner";
 
 export interface ChatMessage {
   id: string;
@@ -10,12 +11,12 @@ export interface ChatMessage {
   sources?: Array<{ filePath: string; startLine: number; endLine: number }>;
   timestamp: number;
   model?: string;
-  provider?: "ollama" | "openai" | "anthropic" | "groq";
+  provider?: "ollama" | "openai" | "anthropic" | "groq" | "airllm" | "vllm";
   isStreaming?: boolean;
   tokens?: number;
 }
 
-export type AIMode = "chat" | "think" | "agent";
+export type AIMode = "chat" | "think" | "agent" | "bug_hunt" | "architect";
 export type AIServiceMode = "direct" | "grpc";
 
 export type AgentEvent = {
@@ -109,6 +110,16 @@ function saveChatHistory(messages: ChatMessage[]) {
   }
 }
 
+// Debounced version to avoid excessive localStorage writes during streaming
+let _saveChatHistoryTimer: ReturnType<typeof setTimeout> | null = null;
+function debouncedSaveChatHistory(messages: ChatMessage[]) {
+  if (_saveChatHistoryTimer) clearTimeout(_saveChatHistoryTimer);
+  _saveChatHistoryTimer = setTimeout(() => {
+    saveChatHistory(messages);
+    _saveChatHistoryTimer = null;
+  }, 300);
+}
+
 const persisted = loadAISettings();
 
 interface AIStore {
@@ -117,7 +128,7 @@ interface AIStore {
   ollamaBaseUrl: string;
   ollamaModelsLoading: boolean;
   ollamaModelsError: string | null;
-  
+
   // single active Ollama model selected by user
   selectedOllamaModels: string[];
 
@@ -173,6 +184,8 @@ interface AIStore {
   getInlineCompletion: (code: string, language: string) => Promise<string>;
   setOpenFolder: (path: string | null) => void;
   markCodebaseChanged: (filePath?: string) => void;
+  projectContext: ProjectContext | null;
+  setProjectContext: (ctx: ProjectContext | null) => void;
 }
 
 export const useAIStore = create<AIStore>((set, get) => ({
@@ -207,6 +220,9 @@ export const useAIStore = create<AIStore>((set, get) => ({
   agentLiveOutput: "",
   agentEvents: [],
   showThinking: persisted?.showThinking ?? true,
+  projectContext: null,
+
+  setProjectContext: (ctx) => set({ projectContext: ctx }),
 
   setOllamaBaseUrl: (url) => {
     set({ ollamaBaseUrl: url });
@@ -263,15 +279,15 @@ export const useAIStore = create<AIStore>((set, get) => ({
     if (targetIndex === null || !apiKeys[targetIndex]) return;
     const key = apiKeys[targetIndex];
     if (key.provider !== "openai") return;
-    
+
     set((s) => ({ apiProviderLoading: { ...s.apiProviderLoading, openai: true }, apiProviderErrors: { ...s.apiProviderErrors, openai: "" } }));
     try {
       const models =
         aiServiceMode === "grpc"
           ? await invoke<string[]>("grpc_fetch_models", {
-              provider: "openai",
-              apiKey: key.apiKey,
-            })
+            provider: "openai",
+            apiKey: key.apiKey,
+          })
           : await invoke<string[]>("fetch_openai_models", { apiKey: key.apiKey });
       set((s) => ({ apiProviderModels: { ...s.apiProviderModels, openai: models }, apiProviderErrors: { ...s.apiProviderErrors, openai: "" } }));
     } catch (e) {
@@ -289,15 +305,15 @@ export const useAIStore = create<AIStore>((set, get) => ({
     if (targetIndex === null || !apiKeys[targetIndex]) return;
     const key = apiKeys[targetIndex];
     if (key.provider !== "anthropic") return;
-    
+
     set((s) => ({ apiProviderLoading: { ...s.apiProviderLoading, anthropic: true }, apiProviderErrors: { ...s.apiProviderErrors, anthropic: "" } }));
     try {
       const models =
         aiServiceMode === "grpc"
           ? await invoke<string[]>("grpc_fetch_models", {
-              provider: "anthropic",
-              apiKey: key.apiKey,
-            })
+            provider: "anthropic",
+            apiKey: key.apiKey,
+          })
           : await invoke<string[]>("fetch_anthropic_models", { apiKey: key.apiKey });
       set((s) => ({ apiProviderModels: { ...s.apiProviderModels, anthropic: models }, apiProviderErrors: { ...s.apiProviderErrors, anthropic: "" } }));
     } catch (e) {
@@ -315,15 +331,15 @@ export const useAIStore = create<AIStore>((set, get) => ({
     if (targetIndex === null || !apiKeys[targetIndex]) return;
     const key = apiKeys[targetIndex];
     if (key.provider !== "groq") return;
-    
+
     set((s) => ({ apiProviderLoading: { ...s.apiProviderLoading, groq: true }, apiProviderErrors: { ...s.apiProviderErrors, groq: "" } }));
     try {
       const models =
         aiServiceMode === "grpc"
           ? await invoke<string[]>("grpc_fetch_models", {
-              provider: "groq",
-              apiKey: key.apiKey,
-            })
+            provider: "groq",
+            apiKey: key.apiKey,
+          })
           : await invoke<string[]>("fetch_groq_models", { apiKey: key.apiKey });
       set((s) => ({ apiProviderModels: { ...s.apiProviderModels, groq: models }, apiProviderErrors: { ...s.apiProviderErrors, groq: "" } }));
     } catch (e) {
@@ -539,12 +555,23 @@ export const useAIStore = create<AIStore>((set, get) => ({
     try {
       let response: string;
       let sources: ChatMessage["sources"] = undefined;
+      const { projectContext } = get();
+      const ctxString = projectContext
+        ? `\n[PROJECT CONTEXT]\nLanguages: ${projectContext.languages.join(", ")}\nFrameworks: ${projectContext.frameworks.join(", ")}\nManager: ${projectContext.packageManager || "N/A"}\nEnsure code aligns with these frameworks.`
+        : "";
+
       const modeContext =
         aiMode === "think"
           ? "THINK MODE: reason through the task first, then provide a concise practical answer with steps."
           : aiMode === "agent"
-          ? "AGENT MODE: provide a structured execution plan, exact file-level changes, and validation commands."
-          : null;
+            ? "AGENT MODE: provide a structured execution plan, exact file-level changes, and validation commands."
+            : aiMode === "bug_hunt"
+              ? "BUG HUNT MODE: act as senior QA engineer. Systematically analyze the code for bugs, edge cases, race conditions, security vulnerabilities, memory leaks, type errors, and logic flaws. For each bug found, explain: (1) the bug and its root cause, (2) severity (critical/high/medium/low), (3) exact fix with code diff."
+              : aiMode === "architect"
+                ? "ARCHITECT MODE: act as senior software architect. Analyze the codebase architecture, identify design patterns used, suggest improvements for scalability/maintainability/testability, propose refactoring strategies, and recommend best practices. Provide actionable architectural diagrams or descriptions."
+                : null;
+
+      const fullContextStr = modeContext ? `${modeContext}\n${ctxString}` : ctxString;
 
       if (shouldUseAgenticReview) {
         if (!isOllamaRunning) {
@@ -577,16 +604,17 @@ export const useAIStore = create<AIStore>((set, get) => ({
         try {
           const agentQuery =
             autoProjectReviewIntent && aiMode !== "agent"
-              ? `PROJECT REVIEW MODE: Review the codebase one by one. Identify bugs, risky patterns, missing dependencies, and concrete fixes. Prefer file-level findings with clear reasoning.\n\nUser request:\n${content}`
+              ? `PROJECT REVIEW MODE: Review the codebase one by one. Identify bugs, risky patterns, missing dependencies, and concrete fixes. Prefer file-level findings with clear reasoning.\n${fullContextStr}\n\nUser request:\n${content}`
               : autoProjectActionIntent && aiMode !== "agent"
-              ? `PROJECT CHANGE PROPOSAL MODE: Analyze the whole project and propose exact create/update actions.\n\
+                ? `PROJECT CHANGE PROPOSAL MODE: Analyze the whole project and propose exact create/update actions.\n\
                  Requirements:\n\
                  - Provide concrete file paths for each change.\n\
-                 - Include terminal commands if needed.\n\
-                 - Do NOT claim files are already changed; this is proposal-only until user approval.\n\
-                 - Include validation commands.\n\n\
+                 - Output terminal commands using the exact syntax: '<execute>command here</execute>'.\n\
+                 - The system will run your '<execute>' block and reply with the output automatically.\n\
+                 - When your entire overall objective is finished, you MUST output exactly: '<task_complete>'.\n\
+                 - Do NOT claim files are already changed; this is proposal-only until user approval.\n${fullContextStr}\n\n\
                  User request:\n${content}`
-              : content;
+                : `${content}\n${fullContextStr}`;
           const result = await invoke<{ answer: string; sources: any[] }>("agentic_rag_chat", {
             runId,
             rootPath: openFolder,
@@ -616,15 +644,15 @@ export const useAIStore = create<AIStore>((set, get) => ({
             set({ indexedChunks: count, isIndexing: false, openFolder, indexDirty: false });
           } catch (e) {
             set({ isIndexing: false });
-            throw new Error(`RAG index failed: ${String(e)}`);
+            throw new Error(`RAG index failed: ${String(e)} `);
           }
         }
 
         // RAG currently uses local Ollama chat for grounded answers.
         const ragQuery =
           aiMode === "chat"
-            ? content
-            : `${content}\n\n[${aiMode.toUpperCase()} MODE]\n${modeContext}`;
+            ? `${content} \n${ctxString} `
+            : `${content} \n\n[${aiMode.toUpperCase()} MODE]\n${fullContextStr} `;
         const result = await invoke<{ answer: string; sources: any[] }>("rag_query", {
           rootPath: openFolder,
           query: ragQuery,
@@ -692,13 +720,13 @@ export const useAIStore = create<AIStore>((set, get) => ({
       }
 
       const assistantMsg: ChatMessage = {
-        id: `msg-${Date.now()}`,
+        id: `msg - ${Date.now()} `,
         role: "assistant",
         content: response,
         sources,
         timestamp: Date.now(),
         model: selectedProvider === "ollama" ? selectedOllamaModels[0] : apiKeys[selectedApiKeyIndex!]?.model,
-        provider: selectedProvider === "ollama" ? "ollama" : (apiKeys[selectedApiKeyIndex!]?.provider as "openai" | "anthropic" | "groq" | undefined) || "openai",
+        provider: selectedProvider === "ollama" ? "ollama" : (apiKeys[selectedApiKeyIndex!]?.provider as "openai" | "anthropic" | "groq" | "airllm" | "vllm" | undefined) || "openai",
         isStreaming: false,
       };
 
@@ -707,6 +735,48 @@ export const useAIStore = create<AIStore>((set, get) => ({
         saveChatHistory(updated);
         return { chatHistory: updated, isThinking: false };
       });
+
+      // Autonomous Agent Loop logic
+      if (aiMode === "agent" && openFolder && !response.includes("<task_complete>")) {
+        const executeMatches = Array.from(response.matchAll(/<execute>([\s\S]*?)<\/execute>/g));
+        if (executeMatches.length > 0) {
+          const firstCmd = executeMatches[0][1].trim();
+          if (firstCmd) {
+            // Delay slightly to let the UI settle, then run it
+            setTimeout(async () => {
+              try {
+                // Let the UI system know agent is busy executing
+                set((s) => ({
+                  agentEvents: [
+                    ...s.agentEvents,
+                    { kind: "stage", message: `Executing command: ${firstCmd} `, ts: Date.now() },
+                  ],
+                }));
+
+                const out = await invoke<string>("run_command", { cmd: firstCmd, cwd: openFolder });
+
+                set((s) => ({
+                  agentEvents: [
+                    ...s.agentEvents,
+                    { kind: "done", message: `Command finished`, ts: Date.now() },
+                  ],
+                }));
+
+                const preview = out.length > 2000 ? `${out.slice(0, 2000)} \n…[truncated]` : out;
+                const nextPrompt = `[SYSTEM] Command execution result for \`${firstCmd}\`:\n\`\`\`\n${preview || "(no output)"}\n\`\`\`\nAnalyze this output. If the command failed, fix the code and rerun. If it succeeded, continue with your plan. If your entire overarching task is completely finished, you MUST output exactly \`<task_complete>\`.`;
+
+                // Recursively send the next prompt to continue the agent loop
+                get().sendMessage(nextPrompt);
+
+              } catch (err) {
+                const nextPrompt = `[SYSTEM] Command execution failed for \`${firstCmd}\`:\n\`\`\`\n${String(err)}\n\`\`\`\nAnalyze the error, fix the underlying issue in the code, and try again. If you are stuck, output \`<task_complete>\`.`;
+                get().sendMessage(nextPrompt);
+              }
+            }, 500);
+          }
+        }
+      }
+
     } catch (e: any) {
       if (shouldUseAgenticReview) {
         set((s) => ({
@@ -721,7 +791,7 @@ export const useAIStore = create<AIStore>((set, get) => ({
         role: "assistant",
         content: `Error: ${e.toString()}. Make sure your LLM service is configured correctly.`,
         timestamp: Date.now(),
-        provider: selectedProvider === "ollama" ? "ollama" : (apiKeys[selectedApiKeyIndex!]?.provider as "openai" | "anthropic" | "groq" | undefined) || "openai",
+        provider: selectedProvider === "ollama" ? "ollama" : (apiKeys[selectedApiKeyIndex!]?.provider as "openai" | "anthropic" | "groq" | "airllm" | "vllm" | undefined) || "openai",
         model: selectedProvider === "ollama" ? selectedOllamaModels[0] : apiKeys[selectedApiKeyIndex!]?.model,
       };
       set((s) => {
@@ -737,7 +807,7 @@ export const useAIStore = create<AIStore>((set, get) => ({
       const updated = s.chatHistory.map((m) =>
         m.id === messageId ? { ...m, content: m.content + token } : m
       );
-      saveChatHistory(updated);
+      debouncedSaveChatHistory(updated);
       return { chatHistory: updated };
     });
   },
@@ -792,37 +862,37 @@ export const useAIStore = create<AIStore>((set, get) => ({
         const result =
           aiServiceMode === "grpc"
             ? await invoke<string>("grpc_ai_chat", {
-                model,
-                provider: "ollama",
-                messages: [{ role: "user", content: prompt }],
-                temperature: 0.1,
-                maxTokens: 120,
-              })
+              model,
+              provider: "ollama",
+              messages: [{ role: "user", content: prompt }],
+              temperature: 0.1,
+              maxTokens: 120,
+            })
             : await invoke<string>("ollama_complete", {
-                model,
-                prompt,
-                maxTokens: 100,
-              });
+              model,
+              prompt,
+              maxTokens: 100,
+            });
         return result.trim();
       } else if (selectedProvider === "api" && selectedApiKeyIndex !== null) {
         const keyEntry = apiKeys[selectedApiKeyIndex];
         const result =
           aiServiceMode === "grpc"
             ? await invoke<string>("grpc_ai_chat", {
-                provider: keyEntry.provider,
-                apiKey: keyEntry.apiKey,
-                model: keyEntry.model,
-                messages: [{ role: "user", content: prompt }],
-                temperature: 0.1,
-                maxTokens: 120,
-              })
+              provider: keyEntry.provider,
+              apiKey: keyEntry.apiKey,
+              model: keyEntry.model,
+              messages: [{ role: "user", content: prompt }],
+              temperature: 0.1,
+              maxTokens: 120,
+            })
             : await invoke<string>("api_complete", {
-                provider: keyEntry.provider,
-                apiKey: keyEntry.apiKey,
-                model: keyEntry.model,
-                prompt,
-                maxTokens: 100,
-              });
+              provider: keyEntry.provider,
+              apiKey: keyEntry.apiKey,
+              model: keyEntry.model,
+              prompt,
+              maxTokens: 100,
+            });
         return result.trim();
       }
       return "";

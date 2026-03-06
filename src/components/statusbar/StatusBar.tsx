@@ -1,12 +1,12 @@
 // src/components/statusbar/StatusBar.tsx
-import { useEffect, useState } from "react";
+import { memo, useEffect, useState, useMemo } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { useEditorStore } from "../../store/editorStore";
 import { useUIStore } from "../../store/uiStore";
 import { useAIStore } from "../../store/aiStore";
 import { GitBranch, Terminal, Bot, Settings } from "lucide-react";
 
-export function StatusBar() {
+export const StatusBar = memo(function StatusBar() {
   const { tabs, activeTabId, openFolder } = useEditorStore();
   const { toggleTerminal, toggleAIPanel, toggleSettingsPanel, setActiveView } = useUIStore();
   const {
@@ -63,6 +63,19 @@ export function StatusBar() {
     loadGitInfo();
   }, [openFolder, activeTabId]);
 
+  // Memoize AI label to avoid recomputation on every render
+  const aiLabel = useMemo(() => {
+    if (isOllamaRunning || selectedProvider === "api") {
+      if (selectedProvider === "ollama") {
+        return selectedOllamaModels.length === 1
+          ? selectedOllamaModels[0].split(":")[0]
+          : `${selectedOllamaModels.length} models`;
+      }
+      return apiKeys[selectedApiKeyIndex ?? 0]?.provider || "API";
+    }
+    return "AI Offline";
+  }, [isOllamaRunning, selectedProvider, selectedOllamaModels, selectedApiKeyIndex, apiKeys]);
+
   return (
     <div className="status-bar">
       <div className="status-left">
@@ -97,21 +110,7 @@ export function StatusBar() {
           title="AI Assistant"
         >
           <Bot size={13} />
-          <span>
-            {isOllamaRunning || selectedProvider === "api" ? (
-              selectedProvider === "ollama" ? (
-                selectedOllamaModels.length === 1 ? (
-                  selectedOllamaModels[0].split(":")[0]
-                ) : (
-                  `${selectedOllamaModels.length} models`
-                )
-              ) : (
-                apiKeys[selectedApiKeyIndex ?? 0]?.provider || "API"
-              )
-            ) : (
-              "AI Offline"
-            )}
-          </span>
+          <span>{aiLabel}</span>
         </button>
 
         <button className="status-item" onClick={toggleTerminal} title="Terminal">
@@ -128,4 +127,4 @@ export function StatusBar() {
       </div>
     </div>
   );
-}
+});

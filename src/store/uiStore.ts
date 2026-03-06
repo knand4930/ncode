@@ -1,7 +1,7 @@
 // src/store/uiStore.ts
 import { create } from "zustand";
 
-type SidebarView = "explorer" | "search" | "search-replace" | "symbols" | "keybindings" | "git" | "extensions" | "ai";
+type SidebarView = "explorer" | "search" | "search-replace" | "symbols" | "keybindings" | "git" | "extensions" | "ai" | "tasks";
 
 interface UIStore {
   activeView: SidebarView;

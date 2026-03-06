@@ -1,13 +1,38 @@
 // src/components/editor/CommandPalette.tsx
 import { useState, useEffect, useRef } from "react";
+import { invoke } from "@tauri-apps/api/core";
 import { useEditorStore } from "../../store/editorStore";
 import { useUIStore } from "../../store/uiStore";
+import { useAIStore } from "../../store/aiStore";
+import {
+  getRunCommand,
+  getTestCommand,
+  getLintCommand,
+  getFormatCommand,
+  getInitCommand,
+  getBuildCommand,
+} from "../../utils/languageRunner";
 
 interface Command {
   id: string;
   label: string;
+  category: string;
   keybind?: string;
   action: () => void;
+}
+
+async function runInTerminal(cmd: string, cwd: string | null) {
+  if (!cwd) {
+    window.alert("Open a project folder first.");
+    return;
+  }
+  try {
+    const out = await invoke<string>("run_command", { cmd, cwd });
+    const preview = out.length > 2000 ? `${out.slice(0, 2000)}\n…[truncated]` : out;
+    window.alert(`✓ Command succeeded:\n\n$ ${cmd}\n\n${preview || "(no output)"}`);
+  } catch (e) {
+    window.alert(`✗ Command failed:\n\n$ ${cmd}\n\n${String(e)}`);
+  }
 }
 
 export function CommandPalette() {
@@ -20,26 +45,180 @@ export function CommandPalette() {
     setActiveView,
     toggleQuickOpen,
   } = useUIStore();
-  const { saveAllFiles } = useEditorStore();
+  const { saveAllFiles, activeTabId, tabs, openFolder } = useEditorStore();
+  const { setAIMode, toggleRAG, sendMessage } = useAIStore();
   const [query, setQuery] = useState("");
   const inputRef = useRef<HTMLInputElement>(null);
 
+  const activeTab = tabs.find((t) => t.id === activeTabId);
+  const lang = activeTab?.language || "";
+  const filePath = activeTab?.filePath || "";
+  const fileName = activeTab?.fileName || "";
+
   const commands: Command[] = [
-    { id: "save-all", label: "File: Save All", keybind: "Ctrl+Shift+S", action: saveAllFiles },
-    { id: "quick-open", label: "File: Quick Open", keybind: "Ctrl+P", action: toggleQuickOpen },
-    { id: "view-explorer", label: "View: Explorer", keybind: "Ctrl+Shift+E", action: () => setActiveView("explorer") },
-    { id: "view-search", label: "View: Search", keybind: "Ctrl+Shift+F", action: () => setActiveView("search") },
-    { id: "view-git", label: "View: Source Control", keybind: "Ctrl+Shift+G", action: () => setActiveView("git") },
-    { id: "view-ext", label: "View: Extensions", keybind: "Ctrl+Shift+X", action: () => setActiveView("extensions") },
-    { id: "toggle-terminal", label: "View: Toggle Terminal", keybind: "Ctrl+`", action: toggleTerminal },
-    { id: "toggle-ai", label: "View: Toggle AI Panel", keybind: "Ctrl+Shift+A", action: toggleAIPanel },
-    { id: "open-settings", label: "Preferences: Settings", keybind: "Ctrl+,", action: toggleSettingsPanel },
-    { id: "theme-dark", label: "Preferences: Dark Theme", action: () => setTheme("dark") },
-    { id: "theme-light", label: "Preferences: Light Theme", action: () => setTheme("light") },
+    // ── File ──
+    { id: "save-all", category: "File", label: "File: Save All", keybind: "Ctrl+Shift+S", action: saveAllFiles },
+    { id: "quick-open", category: "File", label: "File: Quick Open", keybind: "Ctrl+P", action: toggleQuickOpen },
+
+    // ── View ──
+    { id: "view-explorer", category: "View", label: "View: Explorer", keybind: "Ctrl+Shift+E", action: () => setActiveView("explorer") },
+    { id: "view-search", category: "View", label: "View: Search", keybind: "Ctrl+Shift+F", action: () => setActiveView("search") },
+    { id: "view-search-replace", category: "View", label: "View: Search & Replace", keybind: "Ctrl+H", action: () => setActiveView("search-replace") },
+    { id: "view-git", category: "View", label: "View: Source Control", keybind: "Ctrl+Shift+G", action: () => setActiveView("git") },
+    { id: "view-ext", category: "View", label: "View: Extensions", keybind: "Ctrl+Shift+X", action: () => setActiveView("extensions") },
+    { id: "view-keybindings", category: "View", label: "View: Keybindings", action: () => setActiveView("keybindings") },
+    { id: "toggle-terminal", category: "View", label: "View: Toggle Terminal", keybind: "Ctrl+`", action: toggleTerminal },
+    { id: "toggle-ai", category: "View", label: "View: Toggle AI Panel", keybind: "Ctrl+Shift+A", action: toggleAIPanel },
+
+    // ── Preferences ──
+    { id: "open-settings", category: "Preferences", label: "Preferences: Settings", keybind: "Ctrl+,", action: toggleSettingsPanel },
+    { id: "theme-dark", category: "Preferences", label: "Preferences: Dark Theme", action: () => setTheme("dark") },
+    { id: "theme-light", category: "Preferences", label: "Preferences: Light Theme", action: () => setTheme("light") },
+
+    // ── Run ──
+    ...(getRunCommand(lang, filePath, fileName)
+      ? [{
+        id: "run-file",
+        category: "Run",
+        label: `Run: Run ${fileName || "File"} (${lang})`,
+        keybind: "F5",
+        action: () => runInTerminal(getRunCommand(lang, filePath, fileName)!, openFolder),
+      }]
+      : []),
+    ...(getBuildCommand(lang, filePath, fileName)
+      ? [{
+        id: "run-build",
+        category: "Run",
+        label: `Run: Build (${lang})`,
+        keybind: "Ctrl+Shift+B",
+        action: () => runInTerminal(getBuildCommand(lang, filePath, fileName)!, openFolder),
+      }]
+      : []),
+
+    // ── Test ──
+    ...(getTestCommand(lang, filePath, fileName)
+      ? [{
+        id: "test-run",
+        category: "Test",
+        label: `Test: Run Tests (${lang})`,
+        action: () => runInTerminal(getTestCommand(lang, filePath, fileName)!, openFolder),
+      }]
+      : []),
+
+    // ── Lint / Format ──
+    ...(getLintCommand(lang, filePath, fileName)
+      ? [{
+        id: "lint-file",
+        category: "Lint",
+        label: `Lint: Check ${fileName || "File"} (${lang})`,
+        action: () => runInTerminal(getLintCommand(lang, filePath, fileName)!, openFolder),
+      }]
+      : []),
+    ...(getFormatCommand(lang, filePath, fileName)
+      ? [{
+        id: "format-file",
+        category: "Format",
+        label: `Format: Format ${fileName || "File"} (${lang})`,
+        action: () => runInTerminal(getFormatCommand(lang, filePath, fileName)!, openFolder),
+      }]
+      : []),
+
+    // ── Project ──
+    ...(getInitCommand(lang, filePath, fileName)
+      ? [{
+        id: "project-init",
+        category: "Project",
+        label: `Project: Install Dependencies (${lang})`,
+        action: () => runInTerminal(getInitCommand(lang, filePath, fileName)!, openFolder),
+      }]
+      : []),
+
+    // ── Git ──
+    {
+      id: "git-commit",
+      category: "Git",
+      label: "Git: Commit All Changes",
+      action: async () => {
+        const msg = prompt("Commit message:");
+        if (msg && openFolder) {
+          await runInTerminal(`git add -A && git commit -m "${msg.replace(/"/g, '\\"')}"`, openFolder);
+        }
+      },
+    },
+    {
+      id: "git-push",
+      category: "Git",
+      label: "Git: Push",
+      action: () => runInTerminal("git push", openFolder),
+    },
+    {
+      id: "git-pull",
+      category: "Git",
+      label: "Git: Pull",
+      action: () => runInTerminal("git pull", openFolder),
+    },
+    {
+      id: "git-status",
+      category: "Git",
+      label: "Git: Status",
+      action: () => runInTerminal("git status", openFolder),
+    },
+
+    // ── AI Modes ──
+    { id: "ai-chat", category: "AI", label: "AI: Chat Mode", action: () => setAIMode("chat") },
+    { id: "ai-think", category: "AI", label: "AI: Think Mode (step-by-step reasoning)", action: () => setAIMode("think") },
+    { id: "ai-agent", category: "AI", label: "AI: Agent Mode (autonomous)", action: () => setAIMode("agent") },
+    { id: "ai-bughunt", category: "AI", label: "AI: Bug Hunt Mode 🐛", action: () => setAIMode("bug_hunt") },
+    { id: "ai-architect", category: "AI", label: "AI: Architect Mode 🏗️", action: () => setAIMode("architect") },
+    { id: "ai-rag-toggle", category: "AI", label: "AI: Toggle RAG", action: toggleRAG },
+    {
+      id: "ai-review-file",
+      category: "AI",
+      label: "AI: Review Current File",
+      action: () => {
+        if (activeTab) {
+          sendMessage(`Review this code for bugs, performance, and best practices:\n\n\`\`\`${activeTab.language}\n// ${activeTab.fileName}\n${activeTab.content.slice(0, 4000)}\n\`\`\``);
+        }
+      },
+    },
+    {
+      id: "ai-debug-file",
+      category: "AI",
+      label: "AI: Debug Current File 🐛",
+      action: () => {
+        if (activeTab) {
+          setAIMode("bug_hunt");
+          sendMessage(`Find all bugs in this file:\n\n\`\`\`${activeTab.language}\n// ${activeTab.fileName}\n${activeTab.content.slice(0, 4000)}\n\`\`\``);
+        }
+      },
+    },
+    {
+      id: "ai-explain-file",
+      category: "AI",
+      label: "AI: Explain Current File",
+      action: () => {
+        if (activeTab) {
+          sendMessage(`Explain this code in detail:\n\n\`\`\`${activeTab.language}\n// ${activeTab.fileName}\n${activeTab.content.slice(0, 4000)}\n\`\`\``);
+        }
+      },
+    },
+    {
+      id: "ai-write-tests",
+      category: "AI",
+      label: "AI: Write Tests for Current File",
+      action: () => {
+        if (activeTab) {
+          sendMessage(`Write comprehensive unit tests for this code:\n\n\`\`\`${activeTab.language}\n// ${activeTab.fileName}\n${activeTab.content.slice(0, 4000)}\n\`\`\``);
+        }
+      },
+    },
   ];
 
   const filtered = query
-    ? commands.filter((c) => c.label.toLowerCase().includes(query.toLowerCase()))
+    ? commands.filter((c) =>
+      c.label.toLowerCase().includes(query.toLowerCase()) ||
+      c.category.toLowerCase().includes(query.toLowerCase())
+    )
     : commands;
 
   useEffect(() => {
@@ -62,6 +241,11 @@ export function CommandPalette() {
           className="command-input"
         />
         <div className="command-list">
+          {filtered.length === 0 && (
+            <div style={{ padding: "12px 16px", color: "#6b6b6b", fontSize: 12 }}>
+              No matching commands
+            </div>
+          )}
           {filtered.map((cmd) => (
             <button
               key={cmd.id}
@@ -71,7 +255,10 @@ export function CommandPalette() {
                 toggleCommandPalette();
               }}
             >
-              <span>{cmd.label}</span>
+              <span>
+                <span style={{ color: "#6b6b6b", fontSize: 11, marginRight: 8 }}>{cmd.category}</span>
+                {cmd.label.replace(`${cmd.category}: `, "")}
+              </span>
               {cmd.keybind && <kbd>{cmd.keybind}</kbd>}
             </button>
           ))}

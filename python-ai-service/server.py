@@ -440,6 +440,196 @@ class GroqProvider(LLMProvider):
             yield text
 
 
+class AirLLMProvider(LLMProvider):
+    """AirLLM provider for split-model loading with limited RAM.
+    
+    AirLLM enables running large models by splitting them across
+    limited GPU/CPU memory. It exposes an OpenAI-compatible HTTP API.
+    
+    Default endpoint: http://localhost:8000
+    Start with: airllm serve --model <model_path>
+    """
+    
+    def __init__(self, base_url: str = "http://localhost:8000", model_path: Optional[str] = None):
+        super().__init__(base_url=base_url)
+        self.model_path = model_path or os.getenv("AIRLLM_MODEL_PATH", "")
+    
+    async def fetch_models(self) -> List[str]:
+        """Fetch available models from AirLLM server"""
+        try:
+            if not self.session:
+                await self.init()
+            
+            async with self.session.get(f"{self.base_url}/v1/models") as resp:
+                if resp.status == 200:
+                    data = await resp.json()
+                    return [m["id"] for m in data.get("data", [])]
+                # AirLLM may not have /models endpoint; return configured model
+                if self.model_path:
+                    return [self.model_path]
+                return []
+        except Exception as e:
+            logger.warning(f"AirLLM model fetch failed: {e}")
+            if self.model_path:
+                return [self.model_path]
+            return []
+    
+    async def chat(self, model: str, messages: List[Dict], **kwargs) -> str:
+        """Send chat request to AirLLM (OpenAI-compatible format)"""
+        try:
+            if not self.session:
+                await self.init()
+            
+            payload = {
+                "model": model or self.model_path,
+                "messages": messages,
+                "temperature": kwargs.get("temperature", 0.7),
+                "max_tokens": kwargs.get("max_tokens", 2000),
+                "stream": False,
+            }
+            
+            timeout = aiohttp.ClientTimeout(total=int(os.getenv("AIRLLM_TIMEOUT", "120")))
+            async with self.session.post(
+                f"{self.base_url}/v1/chat/completions",
+                json=payload,
+                timeout=timeout,
+            ) as resp:
+                if resp.status == 200:
+                    data = await resp.json()
+                    return data.get("choices", [{}])[0].get("message", {}).get("content", "")
+                body = await resp.text()
+                raise RuntimeError(f"AirLLM chat error {resp.status}: {body[:300]}")
+        except Exception as e:
+            logger.error(f"AirLLM chat failed: {e}")
+            raise
+
+    async def stream_chat(self, model: str, messages: List[Dict], **kwargs) -> AsyncIterator[str]:
+        """AirLLM streaming (falls back to full response)"""
+        text = await self.chat(model, messages, **kwargs)
+        if text:
+            yield text
+
+
+class VLLMProvider(LLMProvider):
+    """vLLM provider for high-throughput batched inference.
+    
+    vLLM uses PagedAttention for efficient memory management and
+    provides an OpenAI-compatible API with native streaming support.
+    
+    Default endpoint: http://localhost:8000
+    Start with: python -m vllm.entrypoints.openai.api_server --model <model_name>
+    """
+    
+    def __init__(self, api_key: Optional[str] = None, base_url: str = "http://localhost:8000"):
+        super().__init__(
+            api_key=api_key or os.getenv("VLLM_API_KEY", ""),
+            base_url=base_url or os.getenv("VLLM_BASE_URL", "http://localhost:8000")
+        )
+    
+    async def fetch_models(self) -> List[str]:
+        """Fetch available models from vLLM server"""
+        try:
+            if not self.session:
+                await self.init()
+            
+            headers = {}
+            if self.api_key:
+                headers["Authorization"] = f"Bearer {self.api_key}"
+            
+            async with self.session.get(
+                f"{self.base_url}/v1/models",
+                headers=headers
+            ) as resp:
+                if resp.status == 200:
+                    data = await resp.json()
+                    return [m["id"] for m in data.get("data", [])]
+                body = await resp.text()
+                raise RuntimeError(f"vLLM API error {resp.status}: {body[:300]}")
+        except Exception as e:
+            logger.error(f"Failed to fetch vLLM models: {e}")
+            raise
+    
+    async def chat(self, model: str, messages: List[Dict], **kwargs) -> str:
+        """Send chat request to vLLM (OpenAI-compatible format)"""
+        try:
+            if not self.session:
+                await self.init()
+            
+            headers = {}
+            if self.api_key:
+                headers["Authorization"] = f"Bearer {self.api_key}"
+            
+            payload = {
+                "model": model,
+                "messages": messages,
+                "temperature": kwargs.get("temperature", 0.7),
+                "max_tokens": kwargs.get("max_tokens", 2000),
+                "stream": False,
+            }
+            
+            timeout = aiohttp.ClientTimeout(total=int(os.getenv("VLLM_TIMEOUT", "60")))
+            async with self.session.post(
+                f"{self.base_url}/v1/chat/completions",
+                headers=headers,
+                json=payload,
+                timeout=timeout,
+            ) as resp:
+                if resp.status == 200:
+                    data = await resp.json()
+                    return data.get("choices", [{}])[0].get("message", {}).get("content", "")
+                body = await resp.text()
+                raise RuntimeError(f"vLLM chat error {resp.status}: {body[:300]}")
+        except Exception as e:
+            logger.error(f"vLLM chat failed: {e}")
+            raise
+    
+    async def stream_chat(self, model: str, messages: List[Dict], **kwargs) -> AsyncIterator[str]:
+        """Stream chat tokens from vLLM (SSE streaming)"""
+        try:
+            if not self.session:
+                await self.init()
+            
+            headers = {}
+            if self.api_key:
+                headers["Authorization"] = f"Bearer {self.api_key}"
+            
+            payload = {
+                "model": model,
+                "messages": messages,
+                "temperature": kwargs.get("temperature", 0.7),
+                "max_tokens": kwargs.get("max_tokens", 2000),
+                "stream": True,
+            }
+            
+            timeout = aiohttp.ClientTimeout(total=int(os.getenv("VLLM_TIMEOUT", "60")))
+            async with self.session.post(
+                f"{self.base_url}/v1/chat/completions",
+                headers=headers,
+                json=payload,
+                timeout=timeout,
+            ) as resp:
+                if resp.status == 200:
+                    async for line in resp.content:
+                        decoded = line.decode("utf-8", errors="ignore").strip()
+                        if not decoded or not decoded.startswith("data: "):
+                            continue
+                        data_str = decoded[6:]  # Strip "data: " prefix
+                        if data_str == "[DONE]":
+                            break
+                        try:
+                            chunk = json.loads(data_str)
+                            delta = chunk.get("choices", [{}])[0].get("delta", {})
+                            content = delta.get("content", "")
+                            if content:
+                                yield content
+                        except json.JSONDecodeError:
+                            continue
+                else:
+                    body = await resp.text()
+                    logger.error(f"vLLM stream error {resp.status}: {body[:300]}")
+        except Exception as e:
+            logger.error(f"vLLM stream failed: {e}")
+
 class AIServicer(AIServiceServicer if PROTOBUF_AVAILABLE else object):
     """gRPC AI Service implementation"""
     
@@ -465,6 +655,16 @@ class AIServicer(AIServiceServicer if PROTOBUF_AVAILABLE else object):
             return AnthropicProvider(api_key)
         elif provider == "groq":
             return GroqProvider(api_key)
+        elif provider == "airllm":
+            return AirLLMProvider(
+                base_url=base_url or os.getenv("AIRLLM_BASE_URL", "http://localhost:8000"),
+                model_path=os.getenv("AIRLLM_MODEL_PATH", ""),
+            )
+        elif provider == "vllm":
+            return VLLMProvider(
+                api_key=api_key or os.getenv("VLLM_API_KEY", ""),
+                base_url=base_url or os.getenv("VLLM_BASE_URL", "http://localhost:8000"),
+            )
         else:
             raise ValueError(f"Unknown provider: {provider}")
     
