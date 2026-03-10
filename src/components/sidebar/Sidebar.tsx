@@ -16,6 +16,7 @@ import { KeyBindingsPanel } from "./KeyBindingsPanel";
 import { ExtensionsPanel } from "../extensions/ExtensionsPanel";
 import { GitPanel } from "./GitPanel";
 import { TaskPanel } from "./TaskPanel";
+import { AIReviewPanel } from "./AIReviewPanel";
 
 interface FileEntry {
   name: string;
@@ -199,6 +200,7 @@ export function Sidebar() {
   if (activeView === "git") return <GitPanel />;
   if (activeView === "extensions") return <ExtensionsPanel />;
   if (activeView === "tasks") return <TaskPanel />;
+  if (activeView === "review") return <AIReviewPanel />;
 
   return (
     <div className="sidebar">

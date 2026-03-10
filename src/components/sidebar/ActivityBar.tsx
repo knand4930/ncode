@@ -1,6 +1,6 @@
 // src/components/sidebar/ActivityBar.tsx
 import { memo } from "react";
-import { Files, Search, Hash, GitBranch, Puzzle, Bot, Settings, ListTodo } from "lucide-react";
+import { Files, Search, Hash, GitBranch, Puzzle, Bot, Settings, ListTodo, ShieldAlert } from "lucide-react";
 import { useUIStore } from "../../store/uiStore";
 import { useAIStore } from "../../store/aiStore";
 
@@ -11,6 +11,7 @@ const items = [
   { id: "git", icon: GitBranch, label: "Source Control (Ctrl+Shift+G)" },
   { id: "extensions", icon: Puzzle, label: "Extensions (Ctrl+Shift+X)" },
   { id: "tasks", icon: ListTodo, label: "Tasks" },
+  { id: "review", icon: ShieldAlert, label: "AI Code Review" },
 ];
 
 export const ActivityBar = memo(function ActivityBar() {

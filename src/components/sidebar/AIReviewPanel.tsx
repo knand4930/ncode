@@ -34,7 +34,7 @@ export function AIReviewPanel() {
     setError(null);
     try {
       const res = await invoke<AnalysisResult>("analyze_issues", {
-        filePath: activeTab.path || activeTab.fileName,
+        filePath: activeTab.filePath,
         code: activeTab.content,
         language: activeTab.language,
       });
