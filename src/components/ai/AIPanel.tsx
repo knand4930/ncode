@@ -5,23 +5,32 @@ import { invoke } from "@tauri-apps/api/core";
 import { useAIStore, RECOMMENDED_MODELS } from "../../store/aiStore";
 import { useEditorStore } from "../../store/editorStore";
 import { useUIStore } from "../../store/uiStore";
+import { useTerminalStore } from "../../store/terminalStore";
+import { readTextFile } from "@tauri-apps/plugin-fs";
+import { DiffModal } from "./DiffModal";
 import { marked } from "marked";
-
-// Basic HTML sanitizer to prevent XSS from AI-generated markdown
-function sanitizeHtml(html: string): string {
-  return html
-    .replace(/<script\b[^<]*(?:(?!<\/script>)<[^<]*)*<\/script>/gi, '')
-    .replace(/\son\w+\s*=\s*["'][^"']*["']/gi, '')
-    .replace(/\son\w+\s*=\s*[^\s>]+/gi, '')
-    .replace(/javascript\s*:/gi, 'blocked:')
-    .replace(/data\s*:\s*text\/html/gi, 'blocked:');
-}
+import DOMPurify from "dompurify";
 
 type FileSuggestion = {
   path: string;
   content: string;
   language: string;
 };
+
+// Simple global cache to prevent excessive Tauri invoke calls per message render
+const fileExistsCache = new Map<string, boolean>();
+
+async function checkFileExistsCached(path: string): Promise<boolean> {
+  if (!path) return false;
+  if (fileExistsCache.has(path)) return fileExistsCache.get(path)!;
+  try {
+    const exists = await invoke<boolean>("check_file_exists", { path });
+    fileExistsCache.set(path, exists);
+    return exists;
+  } catch {
+    return false;
+  }
+}
 
 function extractFirstCodeBlock(markdown: string): string | null {
   const m = markdown.match(/```(?:[\w.+-]+)?\n([\s\S]*?)```/);
@@ -33,13 +42,39 @@ function extractShellCommands(markdown: string): string[] {
   const re = /```(bash|sh|shell|zsh)\n([\s\S]*?)```/gi;
   let m: RegExpExecArray | null = null;
   while ((m = re.exec(markdown)) !== null) {
-    const block = m[2];
+    const block = m[2].trim();
+    if (!block) continue;
+
+    // Ignore obvious JSON blocks formatted as sh
+    if ((block.startsWith("{") && block.endsWith("}")) || (block.startsWith("[") && block.endsWith("]"))) {
+      continue;
+    }
+
     const lines = block
       .split("\n")
       .map((line) => line.trim())
-      .filter((line) => line && !line.startsWith("#"))
-      .map((line) => (line.startsWith("$ ") ? line.slice(2) : line));
-    commands.push(...lines);
+      .filter((line) => line && !line.startsWith("#"));
+
+    if (lines.length === 0) continue;
+
+    // If every line starts with $, extract them individually
+    const allStartWithDollar = lines.every(l => l.startsWith("$"));
+    if (allStartWithDollar) {
+      commands.push(...lines.map(l => l.replace(/^\$\s*/, "")));
+      continue;
+    }
+
+    // If it looks like a complex script (loops, if statements, multiline strings)
+    const isComplex = lines.some(l =>
+      l.endsWith("\\") || l.includes("{") || l.includes("}") || l.startsWith("if ") || l.startsWith("for ")
+    );
+
+    if (isComplex) {
+      commands.push(block);
+    } else {
+      // For simple sequences of commands, yield each line separately
+      commands.push(...lines.map(l => l.replace(/^\$\s*/, "")));
+    }
   }
   return commands.slice(0, 6);
 }
@@ -207,6 +242,12 @@ function resolveSuggestionPath(path: string, openFolder: string | null): string 
 }
 
 export function AIPanel() {
+  const [applyingMessageId, setApplyingMessageId] = useState<string | null>(null);
+  const [applyingFileSuggestionKey, setApplyingFileSuggestionKey] = useState<string | null>(null);
+  const [fileExistenceMap, setFileExistenceMap] = useState<Record<string, boolean>>({});
+
+  const aiContentRef = useRef<HTMLDivElement>(null);
+
   const {
     chatHistory,
     isThinking,
@@ -249,10 +290,26 @@ export function AIPanel() {
   const [rejectedSuggestionIds, setRejectedSuggestionIds] = useState<Set<string>>(new Set());
   const [rejectedFileSuggestionKeys, setRejectedFileSuggestionKeys] = useState<Set<string>>(new Set());
   const [rejectedCommandKeys, setRejectedCommandKeys] = useState<Set<string>>(new Set());
-  const [applyingMessageId, setApplyingMessageId] = useState<string | null>(null);
-  const [applyingFileSuggestionKey, setApplyingFileSuggestionKey] = useState<string | null>(null);
   const [runningCommandKey, setRunningCommandKey] = useState<string | null>(null);
   const [rollingBack, setRollingBack] = useState(false);
+  
+  // Diff Modal State
+  const [diffModalData, setDiffModalData] = useState<{
+    isOpen: boolean;
+    suggestionKey: string;
+    originalPath: string;
+    originalContent: string;
+    modifiedContent: string;
+    onAccept: () => void;
+  }>({
+    isOpen: false,
+    suggestionKey: "",
+    originalPath: "",
+    originalContent: "",
+    modifiedContent: "",
+    onAccept: () => {}
+  });
+
   const modelSelectorRef = useRef<HTMLDivElement>(null);
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const inputRef = useRef<HTMLTextAreaElement>(null);
@@ -626,7 +683,11 @@ export function AIPanel() {
                 </div>
                 <div
                   className="ai-message-content"
-                  dangerouslySetInnerHTML={{ __html: sanitizeHtml(marked(msg.content) as string) }}
+                  dangerouslySetInnerHTML={{
+                    __html: DOMPurify.sanitize(
+                      marked.parse(msg.content.replace(/<execute>[\s\S]*?<\/execute>/g, '<div class="ai-agent-action">⚙️ Executed Command</div>')) as string
+                    )
+                  }}
                 />
                 {canApproveSuggestion && (
                   <div className="ai-change-actions">
@@ -679,50 +740,112 @@ export function AIPanel() {
                       const resolvedPath = resolveSuggestionPath(s.path, openFolder ?? null);
                       const disabled = applyingFileSuggestionKey === key || !resolvedPath;
                       return (
-                        <div key={key} className="ai-command-row">
-                          <code>{s.path}</code>
-                          <button
-                            className="btn-sm btn-primary"
-                            disabled={disabled}
-                            onClick={async () => {
-                              if (!resolvedPath) {
-                                window.alert("Open a project folder first for relative file paths.");
-                                return;
-                              }
-                              const confirmed = window.confirm(
-                                `Apply AI suggestion to file?\n\n${resolvedPath}\n\nThis will create or update the file.`
-                              );
-                              if (!confirmed) return;
-                              setApplyingFileSuggestionKey(key);
-                              try {
-                                await applyAIChangeToFile(
-                                  resolvedPath,
-                                  s.content,
-                                  `Accepted AI file suggestion at ${new Date(msg.timestamp).toLocaleTimeString()}`
+                        <div key={key} className="ai-command-row flex-wrap gap-2">
+                          <code className="w-full mb-1">{s.path}</code>
+                          <div className="flex gap-2 w-full justify-end">
+                            <button
+                              className="btn-sm bg-gray-700 hover:bg-gray-600"
+                              disabled={disabled}
+                              onClick={async () => {
+                                if (!resolvedPath) {
+                                  window.alert("Open a project folder first to view diffs.");
+                                  return;
+                                }
+                                let originalContent = "";
+                                if (fileExistenceMap[resolvedPath]) {
+                                  try {
+                                    originalContent = await readTextFile(resolvedPath);
+                                  } catch (e) {
+                                    console.error("Failed to read original file for diff", e);
+                                  }
+                                }
+                                setDiffModalData({
+                                  isOpen: true,
+                                  suggestionKey: key,
+                                  originalPath: resolvedPath,
+                                  originalContent,
+                                  modifiedContent: s.content,
+                                  onAccept: async () => {
+                                    setApplyingFileSuggestionKey(key);
+                                    try {
+                                      await applyAIChangeToFile(
+                                        resolvedPath,
+                                        s.content,
+                                        `Accepted AI file suggestion at ${new Date(msg.timestamp).toLocaleTimeString()}`
+                                      );
+                                      setFileExistenceMap(prev => ({ ...prev, [resolvedPath]: true }));
+                                      fileExistsCache.set(resolvedPath, true);
+                                      
+                                      setTimeout(() => {
+                                        useAIStore.getState().sendMessage(
+                                          `I have reviewed and accepted the proposed modifications to \`${s.path}\`. Please proceed to the next step, or output \`<task_complete>\` if all objectives are finished.`
+                                        );
+                                      }, 500);
+                                      
+                                      setDiffModalData(prev => ({ ...prev, isOpen: false }));
+                                    } finally {
+                                      setApplyingFileSuggestionKey(null);
+                                    }
+                                  }
+                                });
+                              }}
+                              title="Preview changes in Diff Editor"
+                            >
+                              <Eye size={12} />
+                              View Diff
+                            </button>
+                            <button
+                              className="btn-sm btn-primary"
+                              disabled={disabled}
+                              onClick={async () => {
+                                if (!resolvedPath) {
+                                  window.alert("Open a project folder first for relative file paths.");
+                                  return;
+                                }
+                                const existing = fileExistenceMap[resolvedPath];
+                                const confirmed = window.confirm(
+                                  `Apply AI suggestion to file?\n\n${resolvedPath}\n\nThis will ${existing ? 'UPDATE' : 'CREATE'} the file.`
                                 );
-                              } finally {
-                                setApplyingFileSuggestionKey(null);
+                                if (!confirmed) return;
+                                setApplyingFileSuggestionKey(key);
+                                try {
+                                  await applyAIChangeToFile(
+                                    resolvedPath,
+                                    s.content,
+                                    `Accepted AI file suggestion at ${new Date(msg.timestamp).toLocaleTimeString()}`
+                                  );
+                                  setFileExistenceMap(prev => ({ ...prev, [resolvedPath]: true }));
+                                  fileExistsCache.set(resolvedPath, true);
+                                  
+                                  setTimeout(() => {
+                                    useAIStore.getState().sendMessage(
+                                      `I have reviewed and accepted the proposed modifications to \`${s.path}\`. Please proceed to the next step in your plan, or output \`<task_complete>\` if all objectives are finished.`
+                                    );
+                                  }, 500);
+                                } finally {
+                                  setApplyingFileSuggestionKey(null);
+                                }
+                              }}
+                              title={resolvedPath ? `Create/Update ${resolvedPath}` : "Open folder to apply relative path"}
+                            >
+                              <Check size={12} />
+                              {resolvedPath && fileExistenceMap[resolvedPath] ? 'Update' : 'Create'}
+                            </button>
+                            <button
+                              className="btn-sm"
+                              onClick={() =>
+                                setRejectedFileSuggestionKeys((prev) => {
+                                  const next = new Set(prev);
+                                  next.add(key);
+                                  return next;
+                                })
                               }
-                            }}
-                            title={resolvedPath ? `Create/Update ${resolvedPath}` : "Open folder to apply relative path"}
-                          >
-                            <Check size={12} />
-                            Accept
-                          </button>
-                          <button
-                            className="btn-sm"
-                            onClick={() =>
-                              setRejectedFileSuggestionKeys((prev) => {
-                                const next = new Set(prev);
-                                next.add(key);
-                                return next;
-                              })
-                            }
-                            title="Reject this file suggestion"
-                          >
-                            <X size={12} />
-                            Reject
-                          </button>
+                              title="Reject this file suggestion"
+                            >
+                              <X size={12} />
+                              Reject
+                            </button>
+                          </div>
                         </div>
                       );
                     })}
@@ -734,53 +857,40 @@ export function AIPanel() {
                       const key = `${msg.id}-${idx}`;
                       if (rejectedCommandKeys.has(key)) return null;
                       return (
-                        <div key={key} className="ai-command-row">
-                          <code>{cmd}</code>
-                          <button
-                            className="btn-sm btn-primary"
-                            disabled={runningCommandKey === key}
-                            onClick={async () => {
-                              if (!openFolder) {
-                                window.alert("Open a project folder before running commands.");
-                                return;
+                        <div key={key} className="ai-command-row" style={{ alignItems: "flex-start" }}>
+                          <code style={{ whiteSpace: "pre-wrap", wordBreak: "break-all", flex: 1, maxHeight: "150px", overflowY: "auto" }}>
+                            {cmd}
+                          </code>
+                          <div style={{ display: "flex", gap: "4px", flexShrink: 0 }}>
+                            <button
+                              className="btn-sm btn-primary"
+                              onClick={() => {
+                                const confirmed = window.confirm(
+                                  `Run this command in the terminal?\n\n${cmd}`
+                                );
+                                if (!confirmed) return;
+                                useTerminalStore.getState().runCommandInTerminal(cmd);
+                              }}
+                              title="Run this command in active terminal session"
+                            >
+                              <Check size={12} />
+                              Run in Terminal
+                            </button>
+                            <button
+                              className="btn-sm"
+                              onClick={() =>
+                                setRejectedCommandKeys((s) => {
+                                  const n = new Set(s);
+                                  n.add(key);
+                                  return n;
+                                })
                               }
-                              const confirmed = window.confirm(
-                                `Run this command in ${openFolder}?\n\n${cmd}`
-                              );
-                              if (!confirmed) return;
-                              setRunningCommandKey(key);
-                              try {
-                                const out = await invoke<string>("run_command", {
-                                  cmd,
-                                  cwd: openFolder,
-                                });
-                                const preview = out.length > 1500 ? `${out.slice(0, 1500)}\n...[truncated]` : out;
-                                window.alert(`Command succeeded:\n\n${preview || "(no output)"}`);
-                              } catch (e) {
-                                window.alert(`Command failed:\n\n${String(e)}`);
-                              } finally {
-                                setRunningCommandKey(null);
-                              }
-                            }}
-                            title="Run this command"
-                          >
-                            <Check size={12} />
-                            Run
-                          </button>
-                          <button
-                            className="btn-sm"
-                            onClick={() =>
-                              setRejectedCommandKeys((s) => {
-                                const n = new Set(s);
-                                n.add(key);
-                                return n;
-                              })
-                            }
-                            title="Reject this command"
-                          >
-                            <X size={12} />
-                            Skip
-                          </button>
+                              title="Reject this command"
+                            >
+                              <X size={12} />
+                              Skip
+                            </button>
+                          </div>
                         </div>
                       );
                     })}

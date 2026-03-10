@@ -5,6 +5,7 @@ import type * as Monaco from "monaco-editor";
 import { useEditorStore } from "../../store/editorStore";
 import { useUIStore } from "../../store/uiStore";
 import { useAIStore } from "../../store/aiStore";
+import { formatShortcut } from "../../utils/os";
 
 export function EditorArea() {
   const { tabs, activeTabId, updateContent, saveFile, setCursorPosition } = useEditorStore();
@@ -174,12 +175,12 @@ export function EditorArea() {
         <div className="editor-empty-content">
           <div className="editor-empty-logo">⌘</div>
           <h2>NCode</h2>
-          <p>Open a file from the sidebar or use <kbd>Ctrl+P</kbd> to search</p>
+          <p>Open a file from the sidebar or use <kbd>{formatShortcut("Ctrl+P")}</kbd> to search</p>
           <div className="editor-shortcuts">
-            <div><kbd>Ctrl+P</kbd> Quick Open</div>
-            <div><kbd>Ctrl+Shift+P</kbd> Command Palette</div>
-            <div><kbd>Ctrl+`</kbd> Terminal</div>
-            <div><kbd>Ctrl+Shift+A</kbd> AI Assistant</div>
+            <div><kbd>{formatShortcut("Ctrl+P")}</kbd> Quick Open</div>
+            <div><kbd>{formatShortcut("Ctrl+Shift+P")}</kbd> Command Palette</div>
+            <div><kbd>{formatShortcut("Ctrl+`")}</kbd> Terminal</div>
+            <div><kbd>{formatShortcut("Ctrl+Shift+A")}</kbd> AI Assistant</div>
           </div>
         </div>
       </div>

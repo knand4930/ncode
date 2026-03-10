@@ -111,6 +111,15 @@ export default function App() {
           e.preventDefault();
           setActiveView("search-replace");
           break;
+        case "b":
+          e.preventDefault();
+          // VS Code standard is to toggle sidebar visibility, but since we rely on views,
+          // falling back to opening 'explorer' view for Ctrl+B
+          setActiveView("explorer");
+          break;
+        case "/":
+          // The Monaco editor handles Ctrl+/ internally for Toggle Comment
+          break;
         case "`":
           e.preventDefault();
           toggleTerminal();

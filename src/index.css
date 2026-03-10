@@ -585,6 +585,8 @@ button,
   justify-content: space-between;
   padding: 10px 14px;
   border-bottom: 1px solid var(--border);
+  flex-wrap: wrap;
+  gap: 8px;
 }
 
 .ai-header-left {
@@ -612,6 +614,7 @@ button,
   display: flex;
   align-items: center;
   gap: 6px;
+  flex-wrap: wrap;
 }
 
 .ai-header-right button {

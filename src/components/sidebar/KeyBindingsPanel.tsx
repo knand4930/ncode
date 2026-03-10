@@ -2,6 +2,8 @@
 import { useState } from "react";
 import { Keyboard } from "lucide-react";
 
+import { formatShortcut } from "../../utils/os";
+
 const keybindings = [
   { category: "File", commands: [
     { name: "Save", keys: "Ctrl+S" },
@@ -13,12 +15,15 @@ const keybindings = [
     { name: "Command Palette", keys: "Ctrl+Shift+P" },
     { name: "Find & Replace", keys: "Ctrl+H" },
     { name: "Go to Symbol", keys: "Ctrl+T" },
+    { name: "Toggle Comment", keys: "Ctrl+/" },
+    { name: "Duplicate Line", keys: "Shift+Alt+Down" },
   ]},
   { category: "View", commands: [
     { name: "Explorer", keys: "Ctrl+Shift+E" },
     { name: "Search", keys: "Ctrl+Shift+F" },
     { name: "Source Control", keys: "Ctrl+Shift+G" },
     { name: "Extensions", keys: "Ctrl+Shift+X" },
+    { name: "Toggle Sidebar", keys: "Ctrl+B" },
     { name: "Toggle Terminal", keys: "Ctrl+`" },
     { name: "Toggle AI Panel", keys: "Ctrl+Shift+A" },
     { name: "Settings", keys: "Ctrl+," },
@@ -85,7 +90,7 @@ export function KeyBindingsPanel() {
                         color: "var(--text-secondary)",
                       }}
                     >
-                      {cmd.keys}
+                      {formatShortcut(cmd.keys)}
                     </kbd>
                   </div>
                 ))}

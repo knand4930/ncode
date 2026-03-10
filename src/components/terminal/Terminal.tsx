@@ -9,6 +9,7 @@ import { Plus, X, Bug } from "lucide-react";
 import { useEditorStore } from "../../store/editorStore";
 import { useUIStore } from "../../store/uiStore";
 import { useAIStore } from "../../store/aiStore";
+import { useTerminalStore } from "../../store/terminalStore";
 import "@xterm/xterm/css/xterm.css";
 
 interface TerminalSession {
@@ -159,6 +160,22 @@ export function Terminal() {
       if (rafId !== null) cancelAnimationFrame(rafId);
     };
   }, [activeSessionId, sessions]);
+
+  const { queuedCommand, clearQueuedCommand } = useTerminalStore();
+
+  // Execute external commands (from AI) if any
+  useEffect(() => {
+    if (queuedCommand && activeSessionId) {
+      invoke("write_to_terminal", { id: activeSessionId, data: queuedCommand.command + "\r" });
+      clearQueuedCommand();
+    } else if (queuedCommand && sessions.length === 0) {
+      // Create session first then execute if none exist
+      createSession().then(() => {
+        // the activeSessionId won't update synchronously inside this effect,
+        // so we wait for the next render pass where activeSessionId exists
+      });
+    }
+  }, [queuedCommand, activeSessionId, clearQueuedCommand, sessions.length]);
 
   // Start with one session
   useEffect(() => {

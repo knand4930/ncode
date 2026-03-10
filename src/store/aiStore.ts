@@ -88,13 +88,27 @@ function saveAISettings(settings: PersistedAISettings) {
   }
 }
 
+function deduplicateMessages(messages: ChatMessage[]): ChatMessage[] {
+  const seen = new Set<string>();
+  const out: ChatMessage[] = [];
+  for (let i = messages.length - 1; i >= 0; i--) {
+    const m = messages[i];
+    const key = m.role + ":" + m.content;
+    if (!seen.has(key)) {
+      seen.add(key);
+      out.unshift(m);
+    }
+  }
+  return out;
+}
+
 function loadChatHistory(): ChatMessage[] {
   try {
     if (typeof window === "undefined") return [];
     const raw = window.localStorage.getItem(AI_CHAT_HISTORY_KEY);
     if (!raw) return [];
     const messages = JSON.parse(raw) as ChatMessage[];
-    return Array.isArray(messages) ? messages : [];
+    return Array.isArray(messages) ? deduplicateMessages(messages) : [];
   } catch (e) {
     console.error("Failed to load chat history:", e);
     return [];
@@ -104,7 +118,8 @@ function loadChatHistory(): ChatMessage[] {
 function saveChatHistory(messages: ChatMessage[]) {
   try {
     if (typeof window === "undefined") return;
-    window.localStorage.setItem(AI_CHAT_HISTORY_KEY, JSON.stringify(messages));
+    const deduped = deduplicateMessages(messages);
+    window.localStorage.setItem(AI_CHAT_HISTORY_KEY, JSON.stringify(deduped));
   } catch (e) {
     console.error("Failed to save chat history:", e);
   }
@@ -547,8 +562,9 @@ export const useAIStore = create<AIStore>((set, get) => ({
     const shouldUseAgenticReview = aiMode === "agent" || autoProjectReviewIntent || autoProjectActionIntent;
 
     set((s) => {
-      const updated = [...s.chatHistory, userMsg];
-      saveChatHistory(updated);
+      const isDuplicate = s.chatHistory.some(m => m.role === userMsg.role && m.content === userMsg.content && (Date.now() - m.timestamp < 2000));
+      const updated = isDuplicate ? s.chatHistory : [...s.chatHistory, userMsg];
+      if (!isDuplicate) saveChatHistory(updated);
       return { chatHistory: updated, isThinking: true };
     });
 
@@ -604,17 +620,18 @@ export const useAIStore = create<AIStore>((set, get) => ({
         try {
           const agentQuery =
             autoProjectReviewIntent && aiMode !== "agent"
-              ? `PROJECT REVIEW MODE: Review the codebase one by one. Identify bugs, risky patterns, missing dependencies, and concrete fixes. Prefer file-level findings with clear reasoning.\n${fullContextStr}\n\nUser request:\n${content}`
+              ? `PROJECT REVIEW MODE: Review the codebase one by one. Identify bugs, risky patterns, missing dependencies, and concrete fixes. Prefer file-level findings with clear reasoning. IMPORTANT: Do not output suggestions to create a file if it already exists, instead propose modifications to the existing file path.\n${fullContextStr}\n\nUser request:\n${content}`
               : autoProjectActionIntent && aiMode !== "agent"
                 ? `PROJECT CHANGE PROPOSAL MODE: Analyze the whole project and propose exact create/update actions.\n\
                  Requirements:\n\
                  - Provide concrete file paths for each change.\n\
+                 - OUTPUT MODIFICATIONS TO EXISTING FILES if you are changing an existing component. Do NOT propose to create a file that already exists.\n\
                  - Output terminal commands using the exact syntax: '<execute>command here</execute>'.\n\
                  - The system will run your '<execute>' block and reply with the output automatically.\n\
                  - When your entire overall objective is finished, you MUST output exactly: '<task_complete>'.\n\
                  - Do NOT claim files are already changed; this is proposal-only until user approval.\n${fullContextStr}\n\n\
                  User request:\n${content}`
-                : `${content}\n${fullContextStr}`;
+                : `IMPORTANT: When suggesting code changes, if a file already exists, provide the updated code for that specific existing file path, do NOT propose creating a duplicate file.\n\n${content}\n${fullContextStr}`;
           const result = await invoke<{ answer: string; sources: any[] }>("agentic_rag_chat", {
             runId,
             rootPath: openFolder,
@@ -731,8 +748,9 @@ export const useAIStore = create<AIStore>((set, get) => ({
       };
 
       set((s) => {
-        const updated = [...s.chatHistory, assistantMsg];
-        saveChatHistory(updated);
+        const isDuplicate = s.chatHistory.some(m => m.role === assistantMsg.role && m.content === assistantMsg.content && (Date.now() - m.timestamp < 3000));
+        const updated = isDuplicate ? s.chatHistory : [...s.chatHistory, assistantMsg];
+        if (!isDuplicate) saveChatHistory(updated);
         return { chatHistory: updated, isThinking: false };
       });
 
@@ -795,8 +813,9 @@ export const useAIStore = create<AIStore>((set, get) => ({
         model: selectedProvider === "ollama" ? selectedOllamaModels[0] : apiKeys[selectedApiKeyIndex!]?.model,
       };
       set((s) => {
-        const updated = [...s.chatHistory, errMsg];
-        saveChatHistory(updated);
+        const isDuplicate = s.chatHistory.some(m => m.role === errMsg.role && m.content === errMsg.content && (Date.now() - m.timestamp < 3000));
+        const updated = isDuplicate ? s.chatHistory : [...s.chatHistory, errMsg];
+        if (!isDuplicate) saveChatHistory(updated);
         return { chatHistory: updated, isThinking: false };
       });
     }

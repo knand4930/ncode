@@ -13,7 +13,7 @@ const OLLAMA_BASE_LOCALHOST: &str = "http://localhost:11434";
 const OLLAMA_BASE_LOOPBACK: &str = "http://127.0.0.1:11434";
 const OLLAMA_BASE: &str = OLLAMA_BASE_LOCALHOST;
 const AGENT_MAX_PLANNER_STEPS: usize = 4;
-const AGENT_EARLY_SOURCE_TARGET: usize = 8;
+const AGENT_EARLY_SOURCE_TARGET: usize = 4; // Reduced to prevent local context saturation
 const AGENT_RECON_KEYWORD_LIMIT: usize = 3;
 const LOCAL_OLLAMA_SYSTEM_PROMPT: &str =
     "You are NCode local coding assistant running on a user-selected Ollama model. \
@@ -450,7 +450,7 @@ pub async fn index_codebase(
     root_path: String,
     chunk_size: Option<usize>,
 ) -> Result<usize, String> {
-    let chunk_size = chunk_size.unwrap_or(50); // lines per chunk
+    let chunk_size = chunk_size.unwrap_or(25); // Reduced from 50 to 25 for better local LLM speed
     let mut chunks = Vec::new();
     
     index_directory(&root_path, &mut chunks, chunk_size)?;
