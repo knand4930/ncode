@@ -173,6 +173,83 @@ class OllamaProvider(LLMProvider):
         except Exception as e:
             logger.error(f"Failed to fetch Ollama models: {e}")
             return []
+
+    def _messages_to_prompt(self, messages: List[Dict]) -> str:
+        """Convert role-based chat messages into a single prompt for /api/generate fallback."""
+        parts: List[str] = []
+        for msg in messages:
+            role = str(msg.get("role", "user")).lower().strip()
+            content = str(msg.get("content", "")).strip()
+            if not content:
+                continue
+            if role == "system":
+                label = "System"
+            elif role == "assistant":
+                label = "Assistant"
+            else:
+                label = "User"
+            parts.append(f"{label}:\n{content}")
+        parts.append("Assistant:")
+        return "\n\n".join(parts)
+
+    async def _chat_via_generate(self, model: str, messages: List[Dict], **kwargs) -> str:
+        """Fallback for endpoints that expose /api/generate but not /api/chat."""
+        if not self.session:
+            await self.init()
+        payload = {
+            "model": model,
+            "prompt": self._messages_to_prompt(messages),
+            "stream": False,
+            "options": {
+                "temperature": kwargs.get("temperature", 0.7),
+                "num_predict": kwargs.get("max_tokens", 2000),
+            },
+        }
+        async with self.session.post(
+            f"{self.base_url}/api/generate",
+            json=payload,
+        ) as resp:
+            if resp.status == 200:
+                data = await resp.json()
+                return data.get("response", "")
+            if resp.status == 404:
+                logger.warning(f"Ollama /api/generate returned 404 for model '{model}', trying OpenAI-compatible /v1/chat/completions")
+                return await self._chat_via_openai_compat(model, messages, **kwargs)
+            body = await resp.text()
+            if "not found" in body.lower() or "does not exist" in body.lower():
+                available = await self.fetch_models()
+                raise RuntimeError(
+                    f"Model '{model}' not found on Ollama. "
+                    f"Available models: {available or ['none']}. "
+                    f"Run: ollama pull {model}"
+                )
+            logger.error(f"Ollama generate fallback error {resp.status}: {body[:300]}")
+            return ""
+
+    async def _chat_via_openai_compat(self, model: str, messages: List[Dict], **kwargs) -> str:
+        """Fallback for local servers exposing OpenAI-compatible APIs."""
+        if not self.session:
+            await self.init()
+        payload = {
+            "model": model,
+            "messages": messages,
+            "temperature": kwargs.get("temperature", 0.7),
+            "max_tokens": kwargs.get("max_tokens", 2000),
+            "stream": False,
+        }
+        async with self.session.post(
+            f"{self.base_url}/v1/chat/completions",
+            json=payload,
+        ) as resp:
+            if resp.status == 200:
+                data = await resp.json()
+                choices = data.get("choices", [])
+                if choices:
+                    return choices[0].get("message", {}).get("content", "")
+                return ""
+            body = await resp.text()
+            logger.error(f"OpenAI-compat fallback error {resp.status}: {body[:300]}")
+            return ""
     
     async def chat(self, model: str, messages: List[Dict], **kwargs) -> str:
         """Send chat request to Ollama"""
@@ -193,9 +270,23 @@ class OllamaProvider(LLMProvider):
                 if resp.status == 200:
                     data = await resp.json()
                     return data.get("message", {}).get("content", "")
+                if resp.status == 404:
+                    logger.warning(f"Ollama /api/chat returned 404 for model '{model}', falling back to /api/generate")
+                    return await self._chat_via_generate(model, messages, **kwargs)
                 else:
-                    logger.error(f"Ollama chat error: {resp.status}")
+                    body = await resp.text()
+                    # Check if it's a model-not-found error and provide helpful message
+                    if "not found" in body.lower() or "does not exist" in body.lower():
+                        available = await self.fetch_models()
+                        raise RuntimeError(
+                            f"Model '{model}' not found on Ollama. "
+                            f"Available models: {available or ['none — run: ollama pull <model>']}. "
+                            f"Run: ollama pull {model}"
+                        )
+                    logger.error(f"Ollama chat error {resp.status}: {body[:300]}")
                     return ""
+        except RuntimeError:
+            raise
         except Exception as e:
             logger.error(f"Ollama chat failed: {e}")
             return ""
@@ -222,8 +313,14 @@ class OllamaProvider(LLMProvider):
                             data = json.loads(line)
                             if "message" in data and "content" in data["message"]:
                                 yield data["message"]["content"]
+                elif resp.status == 404:
+                    logger.warning("Ollama stream /api/chat returned 404, falling back to non-stream /api/generate")
+                    text = await self._chat_via_generate(model, messages, **kwargs)
+                    if text:
+                        yield text
                 else:
-                    logger.error(f"Ollama stream chat error: {resp.status}")
+                    body = await resp.text()
+                    logger.error(f"Ollama stream chat error {resp.status}: {body[:300]}")
         except Exception as e:
             logger.error(f"Ollama stream chat failed: {e}")
 

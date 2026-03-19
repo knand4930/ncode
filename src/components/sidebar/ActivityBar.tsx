@@ -1,6 +1,6 @@
 // src/components/sidebar/ActivityBar.tsx
 import { memo } from "react";
-import { Files, Search, Hash, GitBranch, Puzzle, Bot, Settings, ListTodo, ShieldAlert } from "lucide-react";
+import { Files, Search, Hash, GitBranch, Puzzle, Bot, Settings, ListTodo, ShieldAlert, Network } from "lucide-react";
 import { useUIStore } from "../../store/uiStore";
 import { useAIStore } from "../../store/aiStore";
 
@@ -8,6 +8,7 @@ const items = [
   { id: "explorer", icon: Files, label: "Explorer (Ctrl+Shift+E)" },
   { id: "search", icon: Search, label: "Search (Ctrl+Shift+F)" },
   { id: "symbols", icon: Hash, label: "Symbols (Ctrl+T)" },
+  { id: "code-graph", icon: Network, label: "Code Graph" },
   { id: "git", icon: GitBranch, label: "Source Control (Ctrl+Shift+G)" },
   { id: "extensions", icon: Puzzle, label: "Extensions (Ctrl+Shift+X)" },
   { id: "tasks", icon: ListTodo, label: "Tasks" },
@@ -15,7 +16,15 @@ const items = [
 ];
 
 export const ActivityBar = memo(function ActivityBar() {
-  const { activeView, setActiveView, toggleAIPanel, showAIPanel, toggleSettingsPanel } = useUIStore();
+  const {
+    activeView,
+    showSidebar,
+    openView,
+    toggleSidebar,
+    toggleAIPanel,
+    showAIPanel,
+    toggleSettingsPanel,
+  } = useUIStore();
   const { isOllamaRunning } = useAIStore();
 
   return (
@@ -24,12 +33,19 @@ export const ActivityBar = memo(function ActivityBar() {
         {items.map(({ id, icon: Icon, label }) => (
           <button
             key={id}
-            className={`activity-item ${activeView === id ? "active" : ""}`}
-            onClick={() => setActiveView(id as any)}
+            className={`activity-item ${showSidebar && activeView === id ? "active" : ""}`}
+            onClick={() => {
+              if (showSidebar && activeView === id) {
+                toggleSidebar();
+                return;
+              }
+
+              openView(id as any);
+            }}
             title={label}
           >
             <Icon size={22} />
-            {activeView === id && <div className="activity-active-bar" />}
+            {showSidebar && activeView === id && <div className="activity-active-bar" />}
           </button>
         ))}
       </div>

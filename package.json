@@ -4,10 +4,12 @@
   "private": true,
   "scripts": {
     "dev": "vite",
+    "dev:vite": "vite",
+    "dev:tauri-server": "node scripts/tauri-dev-server.mjs",
     "build": "tsc && vite build",
-    "tauri": "tauri",
-    "tauri:dev": "tauri dev",
-    "tauri:build": "tauri build"
+    "tauri": "node scripts/tauri.mjs",
+    "tauri:dev": "node scripts/tauri.mjs dev",
+    "tauri:build": "node scripts/tauri.mjs build"
   },
   "dependencies": {
     "@monaco-editor/react": "^4.6.0",

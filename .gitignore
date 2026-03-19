@@ -3,6 +3,7 @@ node_modules/
 .pnp
 .pnp.js
 
+.kiro
 # Logs
 npm-debug.log*
 yarn-debug.log*

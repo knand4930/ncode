@@ -20,9 +20,11 @@ pub fn run() {
             fs_commands::delete_file,
             fs_commands::rename_file,
             fs_commands::watch_directory,
+            fs_commands::check_file_exists,
             // Terminal
             terminal_commands::create_terminal,
             terminal_commands::write_to_terminal,
+            terminal_commands::resize_terminal,
             terminal_commands::kill_terminal,
             process_commands::run_command,
             // AI
@@ -31,6 +33,7 @@ pub fn run() {
             ai::api_chat,
             ai::api_complete,
             ai::index_codebase,
+            ai::get_rag_context,
             ai::rag_query,
             ai::rag_agent_query,
             ai::agentic_rag_chat,

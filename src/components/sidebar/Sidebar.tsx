@@ -4,7 +4,8 @@ import { invoke } from "@tauri-apps/api/core";
 import { open } from "@tauri-apps/plugin-dialog";
 import {
   ChevronRight, ChevronDown, File, Folder, FolderOpen,
-  RefreshCw, FolderPlus, Trash2
+  RefreshCw, FolderPlus, Trash2, FileType2, Image, FileJson,
+  FileCode2, FileText, Database, Settings
 } from "lucide-react";
 import { useEditorStore } from "../../store/editorStore";
 import { useUIStore } from "../../store/uiStore";
@@ -17,6 +18,7 @@ import { ExtensionsPanel } from "../extensions/ExtensionsPanel";
 import { GitPanel } from "./GitPanel";
 import { TaskPanel } from "./TaskPanel";
 import { AIReviewPanel } from "./AIReviewPanel";
+import { CodeGraphPanel } from "./CodeGraphPanel";
 
 interface FileEntry {
   name: string;
@@ -27,13 +29,85 @@ interface FileEntry {
   children?: FileEntry[];
 }
 
+function getFileIcon(name: string, iconTheme: string) {
+  const ext = name.split('.').pop()?.toLowerCase() || '';
+  const lowerName = name.toLowerCase();
+
+  const isSimple = iconTheme === 'simple';
+  const defaultColor = isSimple ? "var(--text-secondary)" : undefined;
+
+  // Special files
+  if (['package.json', 'tsconfig.json', 'biome.json'].includes(lowerName)) return <FileJson size={14} color={defaultColor || "#cb3837"} />;
+  if ( lowerName === 'dockerfile' || lowerName.startsWith('docker-compose') ) return <Settings size={14} color={defaultColor || "#2496ed"} />;
+  if ( lowerName.startsWith('.env') ) return <Settings size={14} color={defaultColor || "#f4db00"} />;
+
+  // Extensions
+  switch (ext) {
+    case 'ts':
+    case 'tsx':
+      return <FileCode2 size={14} color={defaultColor || "#3178c6"} />;
+    case 'js':
+    case 'jsx':
+      return <FileCode2 size={14} color={defaultColor || "#f7df1e"} />;
+    case 'py':
+      return <FileCode2 size={14} color={defaultColor || "#3776ab"} />;
+    case 'rs':
+      return <FileCode2 size={14} color={defaultColor || "#dea584"} />;
+    case 'go':
+      return <FileCode2 size={14} color={defaultColor || "#00add8"} />;
+    case 'html':
+      return <FileCode2 size={14} color={defaultColor || "#e34f26"} />;
+    case 'css':
+    case 'scss':
+      return <FileCode2 size={14} color={defaultColor || "#1572b6"} />;
+    case 'json':
+      return <FileJson size={14} color={defaultColor || "#cb3837"} />;
+    case 'md':
+      return <FileText size={14} color={defaultColor || "#083fa1"} />;
+    case 'png':
+    case 'jpg':
+    case 'jpeg':
+    case 'gif':
+    case 'svg':
+    case 'ico':
+      return <Image size={14} color={defaultColor || "#a074c4"} />;
+    case 'sql':
+    case 'db':
+    case 'sqlite':
+      return <Database size={14} color={defaultColor || "#e38c00"} />;
+    default:
+      return <File size={14} color="var(--text-secondary)" />;
+  }
+}
+
+function getFolderIcon(name: string, isOpen: boolean, iconTheme: string) {
+  const lowerName = name.toLowerCase();
+  
+  const isSimple = iconTheme === 'simple';
+  const defaultColor = isSimple ? "var(--text-secondary)" : undefined;
+
+  if (['node_modules', '.git', 'dist', 'build', '.idea', '.vscode'].includes(lowerName)) {
+    return isOpen ? <FolderOpen size={14} color={defaultColor || "#888"} /> : <Folder size={14} color={defaultColor || "#888"} />;
+  }
+  if (['src', 'source', 'app'].includes(lowerName)) {
+    return isOpen ? <FolderOpen size={14} color={defaultColor || "#1572b6"} /> : <Folder size={14} color={defaultColor || "#1572b6"} />;
+  }
+  if (['components', 'views', 'pages', 'ui'].includes(lowerName)) {
+    return isOpen ? <FolderOpen size={14} color={defaultColor || "#4fc1ff"} /> : <Folder size={14} color={defaultColor || "#4fc1ff"} />;
+  }
+  
+  return isOpen ? <FolderOpen size={14} color={defaultColor || "#dcb67a"} /> : <Folder size={14} color={defaultColor || "#dcb67a"} />;
+}
+
 function FileTree({
   entries,
   depth = 0,
+  iconTheme,
   onRefresh,
 }: {
   entries: FileEntry[];
   depth?: number;
+  iconTheme: string;
   onRefresh: () => Promise<void> | void;
 }) {
   const { openFile } = useEditorStore();
@@ -66,20 +140,16 @@ function FileTree({
                 setContextMenu({ x: e.clientX, y: e.clientY, entry });
               }}
             >
-              <span className="file-entry-icon">
-                {entry.is_dir
-                  ? isOpen ? <FolderOpen size={14} /> : <Folder size={14} />
-                  : entry.is_dir ? null : <File size={14} />}
+              <span className="file-entry-chevron">
+                {entry.is_dir ? isOpen ? <ChevronDown size={10} /> : <ChevronRight size={10} /> : <span style={{ width: 10 }}></span>}
               </span>
-              {entry.is_dir && (
-                <span className="file-entry-chevron">
-                  {isOpen ? <ChevronDown size={10} /> : <ChevronRight size={10} />}
-                </span>
-              )}
-              <span className="file-entry-name">{entry.name}</span>
+              <span className="file-entry-icon" style={{ display: 'flex', alignItems: 'center' }}>
+                {entry.is_dir ? getFolderIcon(entry.name, isOpen, iconTheme) : getFileIcon(entry.name, iconTheme)}
+              </span>
+              <span className="file-entry-name" style={{ marginLeft: 4 }}>{entry.name}</span>
             </div>
             {entry.is_dir && isOpen && entry.children && (
-              <FileTree entries={entry.children} depth={depth + 1} onRefresh={onRefresh} />
+              <FileTree entries={entry.children} depth={depth + 1} iconTheme={iconTheme} onRefresh={onRefresh} />
             )}
           </div>
         );
@@ -141,7 +211,7 @@ function FileTree({
 }
 
 export function Sidebar() {
-  const { activeView } = useUIStore();
+  const { activeView, iconTheme } = useUIStore();
   const { openFolder, setOpenFolder } = useEditorStore();
   const { indexCodebase, isIndexing, setOpenFolder: setAIOpenFolder } = useAIStore();
   const [fileTree, setFileTree] = useState<FileEntry[]>([]);
@@ -196,6 +266,7 @@ export function Sidebar() {
   if (activeView === "search") return <SearchPanel />;
   if (activeView === "search-replace") return <SearchReplacePanel />;
   if (activeView === "symbols") return <SymbolSearchPanel />;
+  if (activeView === "code-graph") return <CodeGraphPanel />;
   if (activeView === "keybindings") return <KeyBindingsPanel />;
   if (activeView === "git") return <GitPanel />;
   if (activeView === "extensions") return <ExtensionsPanel />;
@@ -213,7 +284,7 @@ export function Sidebar() {
             <FolderPlus size={14} />
           </button>
           <button title="Open Folder By Path" onClick={openFolderManual}>
-            📂
+            <FolderOpen size={14} />
           </button>
           <button title="Refresh" onClick={() => openFolder && loadFolder(openFolder)}>
             <RefreshCw size={14} />
@@ -224,7 +295,7 @@ export function Sidebar() {
               onClick={() => openFolder && indexCodebase(openFolder)}
               disabled={isIndexing}
             >
-              {isIndexing ? "⟳" : "🧠"}
+              {isIndexing ? <RefreshCw size={14} className="spin-icon" /> : <Database size={14} />}
             </button>
           )}
         </div>
@@ -251,6 +322,7 @@ export function Sidebar() {
         ) : (
           <FileTree
             entries={fileTree}
+            iconTheme={iconTheme}
             onRefresh={() => {
               if (openFolder) return loadFolder(openFolder);
             }}

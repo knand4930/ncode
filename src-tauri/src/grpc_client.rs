@@ -43,7 +43,6 @@ pub struct ChatResponse {
 pub enum GrpcError {
     ConnectionError(String),
     RequestError(String),
-    DecodingError(String),
 }
 
 impl std::fmt::Display for GrpcError {
@@ -51,7 +50,6 @@ impl std::fmt::Display for GrpcError {
         match self {
             GrpcError::ConnectionError(e) => write!(f, "Connection error: {}", e),
             GrpcError::RequestError(e) => write!(f, "Request error: {}", e),
-            GrpcError::DecodingError(e) => write!(f, "Decoding error: {}", e),
         }
     }
 }
@@ -204,67 +202,6 @@ impl GrpcAiClient {
     }
 
     /// Stream chat tokens (for real-time response)
-    pub async fn stream_chat(
-        &self,
-        model: impl Into<String>,
-        prompt: impl Into<String>,
-        history: Vec<ChatMessage>,
-        provider: impl Into<String>,
-        api_key: Option<String>,
-        temperature: Option<f32>,
-        max_tokens: Option<i32>,
-    ) -> Result<impl futures::Stream<Item = Result<String, GrpcError>>, GrpcError> {
-        if !self.is_connected().await {
-            self.connect().await?;
-        }
-
-        let proto_messages: Vec<ProtoMessage> = history
-            .into_iter()
-            .map(|msg| ProtoMessage {
-                role: msg.role,
-                content: msg.content,
-            })
-            .collect();
-
-        let request = ProtoChatRequest {
-            model: model.into(),
-            prompt: prompt.into(),
-            history: proto_messages,
-            provider: provider.into(),
-            api_key: api_key.unwrap_or_default(),
-            temperature: temperature.unwrap_or(0.7),
-            max_tokens: max_tokens.unwrap_or(2000),
-        };
-
-        let mut inner = self.inner.lock().await;
-        if let Some(client) = inner.as_mut() {
-            let tonic_request = tonic::Request::new(request);
-            match client.stream_chat(tonic_request).await {
-                Ok(response) => {
-                    let mut stream = response.into_inner();
-                    // Convert to our stream type
-                    let stream = async_stream::stream! {
-                        while let Some(result) = stream.message().await.transpose() {
-                            match result {
-                                Ok(token_resp) => {
-                                    yield Ok::<String, GrpcError>(token_resp.token);
-                                }
-                                Err(e) => {
-                                    yield Err::<String, GrpcError>(GrpcError::RequestError(e.to_string()));
-                                    break;
-                                }
-                            }
-                        }
-                    };
-                    Ok(stream)
-                }
-                Err(e) => Err(GrpcError::RequestError(e.to_string())),
-            }
-        } else {
-            Err(GrpcError::ConnectionError("Not connected".to_string()))
-        }
-    }
-
     /// Disconnect from the gRPC server
     pub async fn disconnect(&self) {
         let mut inner = self.inner.lock().await;

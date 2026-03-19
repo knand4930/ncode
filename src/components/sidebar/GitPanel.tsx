@@ -2,6 +2,8 @@ import { useEffect, useMemo, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { GitBranch, RefreshCw } from "lucide-react";
 import { useEditorStore } from "../../store/editorStore";
+import { useUIStore } from "../../store/uiStore";
+import { DiffModal } from "../ai/DiffModal";
 
 type GitStatusEntry = {
   code: string;
@@ -21,10 +23,13 @@ function parseGitStatus(output: string): GitStatusEntry[] {
 
 export function GitPanel() {
   const { openFolder } = useEditorStore();
+  const { addToast } = useUIStore();
   const [branch, setBranch] = useState<string>("(no repo)");
   const [status, setStatus] = useState<GitStatusEntry[]>([]);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string>("");
+  const [commitMsg, setCommitMsg] = useState("");
+  const [diffState, setDiffState] = useState<{ isOpen: boolean; path: string; original: string; modified: string } | null>(null);
 
   const loadGit = async () => {
     if (!openFolder) {
@@ -59,6 +64,24 @@ export function GitPanel() {
     loadGit();
   }, [openFolder]);
 
+  const handleCommit = async () => {
+    if (!commitMsg.trim() || !openFolder) return;
+    setLoading(true);
+    try {
+      await invoke("run_command", {
+        cmd: `git commit -m "${commitMsg.replace(/"/g, '\\"')}"`,
+        cwd: openFolder,
+      });
+      setCommitMsg("");
+      addToast("Successfully committed changes", "success");
+      await loadGit();
+    } catch (e: any) {
+      addToast(`Commit failed: ${String(e)}`, "error");
+    } finally {
+      setLoading(false);
+    }
+  };
+
   const grouped = useMemo(() => {
     const staged = status.filter((s) => /^[AMDRC]/.test(s.code[0] || ""));
     const unstaged = status.filter((s) => /^[AMDRC?]/.test(s.code[1] || s.code[0] || ""));
@@ -85,6 +108,25 @@ export function GitPanel() {
           <div style={{ color: "var(--text-secondary)", fontSize: 12 }}>{error}</div>
         ) : (
           <>
+            <div style={{ display: "flex", flexDirection: "column", gap: "6px", marginBottom: "12px" }}>
+              <input
+                value={commitMsg}
+                onChange={(e) => setCommitMsg(e.target.value)}
+                onKeyDown={(e) => e.key === "Enter" && handleCommit()}
+                placeholder="Commit message..."
+                disabled={grouped.staged.length === 0 || loading}
+                style={{ width: "100%", padding: "6px 8px" }}
+              />
+              <button
+                className="btn-primary"
+                disabled={grouped.staged.length === 0 || !commitMsg.trim() || loading}
+                onClick={handleCommit}
+                style={{ width: "100%", justifyContent: "center" }}
+              >
+                Commit Staged
+              </button>
+            </div>
+
             <div style={{ fontSize: 11, color: "var(--text-muted)", marginBottom: 6 }}>
               {status.length === 0 ? "No changes" : `${status.length} changed file(s)`}
             </div>
@@ -117,9 +159,19 @@ export function GitPanel() {
                     )}
                     <button className="btn-sm" onClick={async () => { 
                       try {
-                        const out = await invoke<string>('run_command', { cmd: `git --no-pager diff -- "${entry.path}"`, cwd: openFolder });
-                        alert(out || 'No diff');
-                      } catch(e:any){ alert(String(e)); }
+                        let original = "";
+                        let modified = "";
+                        
+                        if (isStaged) {
+                           original = await invoke<string>('run_command', { cmd: `git show HEAD:"${entry.path}"`, cwd: openFolder }).catch(() => "");
+                           modified = await invoke<string>('run_command', { cmd: `git show :"${entry.path}"`, cwd: openFolder }).catch(() => "");
+                        } else {
+                           original = await invoke<string>('run_command', { cmd: `git show :"${entry.path}"`, cwd: openFolder }).catch(() => "");
+                           modified = await invoke<string>('read_file', { path: `${openFolder}/${entry.path}` }).catch(() => "");
+                        }
+                        
+                        setDiffState({ isOpen: true, path: entry.path, original, modified });
+                      } catch(e:any){ addToast(String(e), "error"); }
                     }}>Diff</button>
                     <button className="btn-sm danger" onClick={async () => { 
                       if (!confirm(`Discard changes to ${entry.path}? This cannot be undone for unstaged changes.`)) return;
@@ -139,6 +191,18 @@ export function GitPanel() {
                 Staged: {grouped.staged.length} | Unstaged: {grouped.unstaged.length}
               </div>
             ) : null}
+
+            {diffState && diffState.isOpen && (
+               <DiffModal
+                 isOpen={diffState.isOpen}
+                 originalContent={diffState.original}
+                 modifiedContent={diffState.modified}
+                 originalPath={diffState.path}
+                 onClose={() => setDiffState(null)}
+                 onAccept={() => setDiffState(null)}
+                 onReject={() => setDiffState(null)}
+               />
+            )}
           </>
         )}
       </div>

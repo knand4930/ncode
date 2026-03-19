@@ -54,6 +54,7 @@ pub struct OllamaChatRequest {
 pub struct OllamaResponse {
     pub response: Option<String>,
     pub message: Option<OllamaChatMessage>,
+    #[serde(default)]
     pub done: bool,
 }
 
@@ -109,6 +110,247 @@ fn emit_agent_event(
         },
     )
     .map_err(|e| e.to_string())
+}
+
+fn normalize_ollama_base(base_url: Option<&str>) -> String {
+    base_url
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+        .unwrap_or(OLLAMA_BASE)
+        .trim_end_matches('/')
+        .to_string()
+}
+
+fn body_preview(body: String, max_len: usize) -> String {
+    let trimmed = body.trim().to_string();
+    if trimmed.is_empty() {
+        return "(empty response body)".to_string();
+    }
+    truncate_text(trimmed, max_len)
+}
+
+fn messages_to_generate_prompt(messages: &[OllamaChatMessage]) -> String {
+    let mut parts: Vec<String> = Vec::new();
+    for msg in messages {
+        let role = msg.role.to_lowercase();
+        let content = msg.content.trim();
+        if content.is_empty() {
+            continue;
+        }
+        let label = match role.as_str() {
+            "system" => "System",
+            "assistant" => "Assistant",
+            _ => "User",
+        };
+        parts.push(format!("{}:\n{}", label, content));
+    }
+    parts.push("Assistant:".to_string());
+    parts.join("\n\n")
+}
+
+async fn ollama_chat_with_fallback(
+    client: &reqwest::Client,
+    base_url: &str,
+    request: &OllamaChatRequest,
+) -> Result<OllamaResponse, String> {
+    let chat_url = format!("{}/api/chat", base_url);
+    let resp = client
+        .post(&chat_url)
+        .json(request)
+        .send()
+        .await
+        .map_err(|e| format!("Local LLM request failed at {}: {}", chat_url, e))?;
+
+    if resp.status().is_success() {
+        let mut parsed: OllamaResponse = resp.json().await.map_err(|e| e.to_string())?;
+        if parsed.message.is_none() {
+            if let Some(text) = parsed.response.clone() {
+                parsed.message = Some(OllamaChatMessage {
+                    role: "assistant".to_string(),
+                    content: text,
+                });
+            }
+        }
+        return Ok(parsed);
+    }
+
+    if resp.status() != reqwest::StatusCode::NOT_FOUND {
+        let status = resp.status();
+        let body = resp.text().await.unwrap_or_default();
+        return Err(format!(
+            "Local LLM chat error at {} (status {}): {}",
+            chat_url,
+            status,
+            body_preview(body, 220)
+        ));
+    }
+
+    let generate_url = format!("{}/api/generate", base_url);
+    let generate_req = OllamaRequest {
+        model: request.model.clone(),
+        prompt: messages_to_generate_prompt(&request.messages),
+        stream: false,
+        options: Some(OllamaOptions {
+            temperature: 0.7,
+            num_predict: 4000,
+            stop: None,
+        }),
+    };
+    let gen_resp = client
+        .post(&generate_url)
+        .json(&generate_req)
+        .send()
+        .await
+        .map_err(|e| format!("Local fallback request failed at {}: {}", generate_url, e))?;
+
+    if gen_resp.status().is_success() {
+        let mut parsed: OllamaResponse = gen_resp.json().await.map_err(|e| e.to_string())?;
+        if parsed.message.is_none() {
+            if let Some(text) = parsed.response.clone() {
+                parsed.message = Some(OllamaChatMessage {
+                    role: "assistant".to_string(),
+                    content: text,
+                });
+            }
+        }
+        return Ok(parsed);
+    }
+
+    let generate_status = gen_resp.status();
+    let generate_body = gen_resp.text().await.unwrap_or_default();
+    if generate_status != reqwest::StatusCode::NOT_FOUND {
+        return Err(format!(
+            "Local LLM fallback error at {} (status {}): {}",
+            generate_url,
+            generate_status,
+            body_preview(generate_body, 220)
+        ));
+    }
+
+    let openai_url = format!("{}/v1/chat/completions", base_url);
+    let openai_model = request.model.clone();
+    let openai_model_alt = openai_model.replace(':', "-");
+
+    let openai_payload = serde_json::json!({
+        "model": openai_model,
+        "messages": request.messages,
+        "stream": false,
+        "temperature": 0.7,
+        "max_tokens": 4000
+    });
+    let mut openai_resp = client
+        .post(&openai_url)
+        .json(&openai_payload)
+        .send()
+        .await
+        .map_err(|e| format!("Local OpenAI-compat fallback failed at {}: {}", openai_url, e))?;
+
+    // Some servers (OpenAI-compatible or otherwise) may use a slightly different model naming scheme
+    // (e.g. `deepseek-coder:1.3b` -> `deepseek-coder-1.3b`). Try that if the first call fails.
+    if !openai_resp.status().is_success() && openai_model != openai_model_alt {
+        let openai_payload_alt = serde_json::json!({
+            "model": openai_model_alt,
+            "messages": request.messages,
+            "stream": false,
+            "temperature": 0.7,
+            "max_tokens": 4000
+        });
+        openai_resp = client
+            .post(&openai_url)
+            .json(&openai_payload_alt)
+            .send()
+            .await
+            .map_err(|e| format!("Local OpenAI-compat fallback failed at {}: {}", openai_url, e))?;
+    }
+
+    if openai_resp.status().is_success() {
+        let parsed: serde_json::Value = openai_resp.json().await.map_err(|e| e.to_string())?;
+        let content = parsed
+            .get("choices")
+            .and_then(|v| v.as_array())
+            .and_then(|arr| arr.first())
+            .and_then(|choice| choice.get("message"))
+            .and_then(|msg| msg.get("content"))
+            .and_then(|c| c.as_str())
+            .unwrap_or("")
+            .to_string();
+        return Ok(OllamaResponse {
+            response: Some(content.clone()),
+            message: Some(OllamaChatMessage {
+                role: "assistant".to_string(),
+                content,
+            }),
+            done: true,
+        });
+    }
+
+    // Some local LLM servers expose the OpenAI-compatible `/v1/completions` endpoint instead of `/v1/chat/completions`.
+    // Try that as a fallback before failing hard.
+    let openai_status = openai_resp.status();
+    let openai_body = openai_resp.text().await.unwrap_or_default();
+
+    let completions_url = format!("{}/v1/completions", base_url);
+    let completions_payload = serde_json::json!({
+        "model": openai_model,
+        "prompt": messages_to_generate_prompt(&request.messages),
+        "stream": false,
+        "temperature": 0.7,
+        "max_tokens": 4000
+    });
+    let mut comp_resp = client
+        .post(&completions_url)
+        .json(&completions_payload)
+        .send()
+        .await
+        .map_err(|e| format!("Local OpenAI-compat fallback failed at {}: {}", completions_url, e))?;
+
+    if !comp_resp.status().is_success() && openai_model != openai_model_alt {
+        let completions_payload_alt = serde_json::json!({
+            "model": openai_model_alt,
+            "prompt": messages_to_generate_prompt(&request.messages),
+            "stream": false,
+            "temperature": 0.7,
+            "max_tokens": 4000
+        });
+        comp_resp = client
+            .post(&completions_url)
+            .json(&completions_payload_alt)
+            .send()
+            .await
+            .map_err(|e| format!("Local OpenAI-compat fallback failed at {}: {}", completions_url, e))?;
+    }
+
+    if comp_resp.status().is_success() {
+        let parsed: serde_json::Value = comp_resp.json().await.map_err(|e| e.to_string())?;
+        let content = parsed
+            .get("choices")
+            .and_then(|v| v.as_array())
+            .and_then(|arr| arr.first())
+            .and_then(|choice| choice.get("text"))
+            .and_then(|c| c.as_str())
+            .unwrap_or("")
+            .to_string();
+        return Ok(OllamaResponse {
+            response: Some(content.clone()),
+            message: Some(OllamaChatMessage {
+                role: "assistant".to_string(),
+                content,
+            }),
+            done: true,
+        });
+    }
+
+    let comp_status = comp_resp.status();
+    let comp_body = comp_resp.text().await.unwrap_or_default();
+
+    Err(format!(
+        "Local LLM endpoint {} is incompatible with Ollama-style chat. Tried /api/chat (404), /api/generate (404), /v1/chat/completions (status {}), and /v1/completions (status {}). Last response(s): chat: {} | completions: {}",
+        base_url,
+        openai_status,
+        comp_status,
+        body_preview(openai_body, 220),
+        body_preview(comp_body, 220)
+    ))
 }
 
 /// Check if Ollama is running and which models are available
@@ -286,12 +528,14 @@ pub async fn ollama_complete(
     model: String,
     prompt: String,
     max_tokens: Option<i32>,
+    base_url: Option<String>,
 ) -> Result<String, String> {
     let client = reqwest::Client::new();
+    let base = normalize_ollama_base(base_url.as_deref());
 
     let request = OllamaRequest {
-        model,
-        prompt,
+        model: model.clone(),
+        prompt: prompt.clone(),
         stream: false,
         options: Some(OllamaOptions {
             temperature: 0.1, // Low temp for code
@@ -305,11 +549,57 @@ pub async fn ollama_complete(
     };
 
     let resp = client
-        .post(format!("{}/api/generate", OLLAMA_BASE))
+        .post(format!("{}/api/generate", base))
         .json(&request)
         .send()
         .await
-        .map_err(|e| e.to_string())?;
+        .map_err(|e| format!("Local completion request failed: {}", e))?;
+
+    if !resp.status().is_success() {
+        let status = resp.status();
+        let body = resp.text().await.unwrap_or_default();
+
+        // Some local LLM servers expose an OpenAI-compatible `/v1/completions` endpoint instead of `/api/generate`.
+        // Try that before failing hard.
+        let openai_url = format!("{}/v1/completions", base);
+        let openai_payload = serde_json::json!({
+            "model": model.clone(),
+            "prompt": prompt.clone(),
+            "max_tokens": max_tokens.unwrap_or(150),
+            "temperature": 0.1,
+            "stream": false,
+        });
+        let openai_resp = client
+            .post(&openai_url)
+            .json(&openai_payload)
+            .send()
+            .await
+            .map_err(|e| format!("Local OpenAI-compat fallback failed at {}: {}", openai_url, e))?;
+
+        if openai_resp.status().is_success() {
+            let parsed: serde_json::Value = openai_resp.json().await.map_err(|e| e.to_string())?;
+            let content = parsed
+                .get("choices")
+                .and_then(|v| v.as_array())
+                .and_then(|arr| arr.first())
+                .and_then(|choice| choice.get("text"))
+                .and_then(|c| c.as_str())
+                .unwrap_or("")
+                .to_string();
+            return Ok(content);
+        }
+
+        let openai_status = openai_resp.status();
+        let openai_body = openai_resp.text().await.unwrap_or_default();
+
+        return Err(format!(
+            "Local completion endpoint returned status {}: {}\nFallback /v1/completions returned status {}: {}",
+            status,
+            body_preview(body, 220),
+            openai_status,
+            body_preview(openai_body, 220)
+        ));
+    }
 
     let result: OllamaResponse = resp.json().await.map_err(|e| e.to_string())?;
     Ok(result.response.unwrap_or_default())
@@ -321,8 +611,10 @@ pub async fn ollama_chat(
     model: String,
     messages: Vec<OllamaChatMessage>,
     context: Option<String>, // RAG context
+    base_url: Option<String>,
 ) -> Result<String, String> {
     let client = reqwest::Client::new();
+    let base = normalize_ollama_base(base_url.as_deref());
     let model_name = model.clone();
 
     let mut all_messages = messages;
@@ -353,14 +645,7 @@ pub async fn ollama_chat(
         stream: false,
     };
 
-    let resp = client
-        .post(format!("{}/api/chat", OLLAMA_BASE))
-        .json(&request)
-        .send()
-        .await
-        .map_err(|e| e.to_string())?;
-
-    let result: OllamaResponse = resp.json().await.map_err(|e| e.to_string())?;
+    let result = ollama_chat_with_fallback(&client, &base, &request).await?;
     
     if let Some(msg) = result.message {
         let mut content = msg.content;
@@ -369,6 +654,7 @@ pub async fn ollama_chat(
                 &model_name,
                 &messages_for_rewrite,
                 &content,
+                &base,
             )
             .await
             {
@@ -410,6 +696,7 @@ async fn rewrite_nonlocal_identity_response(
     model: &str,
     prior_messages: &[OllamaChatMessage],
     draft: &str,
+    base_url: &str,
 ) -> Result<String, String> {
     let last_user = prior_messages
         .iter()
@@ -440,7 +727,7 @@ async fn rewrite_nonlocal_identity_response(
         },
     ];
 
-    let rewritten = ollama_chat_direct(model, rewrite_messages).await?;
+    let rewritten = ollama_chat_direct(model, rewrite_messages, base_url).await?;
     Ok(sanitize_nonlocal_identity_terms(&rewritten))
 }
 
@@ -754,11 +1041,9 @@ fn index_directory(
 }
 
 fn default_model(model: String) -> String {
-    if model.trim().is_empty() {
-        "deepseek-coder:1.3b".to_string()
-    } else {
-        model
-    }
+    // Return the model as-is; callers must validate the model name before calling.
+    // We no longer fall back to a hardcoded model name since it may not be installed.
+    model
 }
 
 fn load_indexed_chunks(root_path: &str) -> Result<Vec<CodeChunk>, String> {
@@ -904,6 +1189,7 @@ fn build_rag_context(root_path: &str, sources: &[CodeChunk]) -> String {
 async fn ollama_chat_direct(
     model: &str,
     messages: Vec<OllamaChatMessage>,
+    base_url: &str,
 ) -> Result<String, String> {
     let client = reqwest::Client::new();
     let request = OllamaChatRequest {
@@ -911,15 +1197,7 @@ async fn ollama_chat_direct(
         messages,
         stream: false,
     };
-    let resp = client
-        .post(format!("{}/api/chat", OLLAMA_BASE))
-        .json(&request)
-        .send()
-        .await
-        .map_err(|e| e.to_string())?
-        .error_for_status()
-        .map_err(|e| e.to_string())?;
-    let result: OllamaResponse = resp.json().await.map_err(|e| e.to_string())?;
+    let result = ollama_chat_with_fallback(&client, base_url, &request).await?;
     if let Some(msg) = result.message {
         Ok(msg.content)
     } else {
@@ -1528,6 +1806,7 @@ async fn run_agent_planner_loop(
     app: &AppHandle,
     run_id: &str,
     model: &str,
+    base_url: &str,
     user_query: &str,
     root_path: Option<&str>,
     chunks: &[CodeChunk],
@@ -1561,6 +1840,7 @@ async fn run_agent_planner_loop(
                     content: planner_input,
                 },
             ],
+            base_url,
         )
         .await
         .unwrap_or_else(|_| "{\"action\":\"search_code\"}".to_string());
@@ -1704,6 +1984,7 @@ async fn stream_ollama_chat_direct(
     run_id: &str,
     model: &str,
     messages: Vec<OllamaChatMessage>,
+    base_url: &str,
 ) -> Result<String, String> {
     let client = reqwest::Client::new();
     let request = OllamaChatRequest {
@@ -1712,7 +1993,7 @@ async fn stream_ollama_chat_direct(
         stream: true,
     };
     let resp = client
-        .post(format!("{}/api/chat", OLLAMA_BASE))
+        .post(format!("{}/api/chat", base_url))
         .json(&request)
         .send()
         .await
@@ -1901,6 +2182,7 @@ async fn stream_ollama_agent_response(
     app: &AppHandle,
     run_id: &str,
     model: &str,
+    base_url: &str,
     query: &str,
     root_path: Option<&str>,
     rag_context: Option<String>,
@@ -1949,7 +2231,7 @@ async fn stream_ollama_agent_response(
         },
     ];
     let mut streamed_live = true;
-    let mut full = match stream_ollama_chat_direct(app, run_id, model, base_messages.clone()).await {
+    let mut full = match stream_ollama_chat_direct(app, run_id, model, base_messages.clone(), base_url).await {
         Ok(text) => text,
         Err(_) => {
             streamed_live = false;
@@ -1959,11 +2241,11 @@ async fn stream_ollama_agent_response(
                 "stage",
                 "Live token stream unavailable, using fast fallback response mode.",
             );
-            ollama_chat_direct(model, base_messages.clone()).await?
+            ollama_chat_direct(model, base_messages.clone(), base_url).await?
         }
     };
     if looks_like_nonlocal_identity_refusal(&full) {
-        if let Ok(rewritten) = rewrite_nonlocal_identity_response(model, &base_messages, &full).await {
+        if let Ok(rewritten) = rewrite_nonlocal_identity_response(model, &base_messages, &full, base_url).await {
             full = rewritten;
         } else {
             full = sanitize_nonlocal_identity_terms(&full);
@@ -1992,13 +2274,44 @@ async fn stream_ollama_agent_response(
     Ok(full)
 }
 
+/// Expose raw RAG context without tying to Ollama, for multi-model / API orchestration
+#[command]
+pub async fn get_rag_context(
+    root_path: String,
+    query: String,
+) -> Result<RAGResult, String> {
+    let chunks = match load_indexed_chunks(&root_path) {
+        Ok(chunks) => chunks,
+        Err(_) => {
+            let _ = index_codebase(root_path.clone(), None).await?;
+            load_indexed_chunks(&root_path)?
+        }
+    };
+
+    let sources = select_relevant_chunks(&chunks, &query, 8);
+    if sources.is_empty() {
+        return Ok(RAGResult {
+            answer: "".to_string(),
+            sources: vec![],
+        });
+    }
+
+    let context = build_rag_context(&root_path, &sources);
+    Ok(RAGResult { answer: context, sources })
+}
+
 /// RAG query: find relevant code + generate answer
 #[command]
 pub async fn rag_query(
     root_path: String,
     query: String,
     model: String,
+    base_url: Option<String>,
 ) -> Result<RAGResult, String> {
+    let selected_model = default_model(model);
+    if selected_model.trim().is_empty() {
+        return Err("No model specified. Please select an Ollama model in the AI panel.".to_string());
+    }
     let chunks = match load_indexed_chunks(&root_path) {
         Ok(chunks) => chunks,
         Err(_) => {
@@ -2017,7 +2330,7 @@ pub async fn rag_query(
 
     let context = build_rag_context(&root_path, &sources);
     let answer = ollama_chat(
-        default_model(model),
+        selected_model,
         vec![OllamaChatMessage {
             role: "user".to_string(),
             content: format!(
@@ -2026,6 +2339,7 @@ pub async fn rag_query(
             ),
         }],
         Some(context),
+        base_url,
     )
     .await?;
 
@@ -2038,6 +2352,7 @@ pub async fn rag_agent_query(
     root_path: String,
     query: String,
     model: String,
+    base_url: Option<String>,
 ) -> Result<RAGResult, String> {
     let agent_query = format!(
         "AGENT MODE.\n\
@@ -2051,7 +2366,7 @@ pub async fn rag_agent_query(
          User task:\n{}",
         query
     );
-    rag_query(root_path, agent_query, model).await
+    rag_query(root_path, agent_query, model, base_url).await
 }
 
 /// Streaming agent mode with realtime progress and token events.
@@ -2062,8 +2377,14 @@ pub async fn agentic_rag_chat(
     root_path: Option<String>,
     query: String,
     model: String,
+    base_url: Option<String>,
+    context: Option<String>,
 ) -> Result<RAGResult, String> {
     let selected_model = default_model(model);
+    if selected_model.trim().is_empty() {
+        return Err("No model specified. Please select an Ollama model in the AI panel.".to_string());
+    }
+    let resolved_base = normalize_ollama_base(base_url.as_deref());
     let normalized_root = root_path
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty());
@@ -2137,6 +2458,7 @@ pub async fn agentic_rag_chat(
         &app,
         &run_id,
         &selected_model,
+        &resolved_base,
         &query,
         normalized_root.as_deref(),
         &indexed_chunks,
@@ -2169,6 +2491,12 @@ pub async fn agentic_rag_chat(
 
     // Build comprehensive context
     let mut context_parts: Vec<String> = Vec::new();
+    // Inject caller-supplied system context (mode hints, project info) first
+    if let Some(ref extra_ctx) = context {
+        if !extra_ctx.trim().is_empty() {
+            context_parts.push(format!("=== SYSTEM INSTRUCTIONS ===\n{}", extra_ctx.trim()));
+        }
+    }
     if let Some(root) = normalized_root.as_deref() {
         if !sources.is_empty() {
             let rag_context = build_rag_context(root, &sources);
@@ -2193,6 +2521,7 @@ pub async fn agentic_rag_chat(
         &app,
         &run_id,
         &selected_model,
+        &resolved_base,
         &query,
         normalized_root.as_deref(),
         rag_context,
@@ -2215,165 +2544,8 @@ pub async fn agentic_rag_chat(
 ///
 /// Analyzes code for bugs, performance issues, security vulnerabilities
 #[command]
-pub async fn analyze_issues(
-    file_path: String,
-    code: String,
-    language: Option<String>,
-) -> Result<serde_json::Value, String> {
-    let lang = language.unwrap_or_else(|| detect_language(&file_path));
-    
-    // Run multiple analysis passes
-    let mut issues: Vec<serde_json::Value> = Vec::new();
-    
-    // 1. Syntax analysis
-    issues.extend(analyze_syntax(&code, &lang));
-    
-    // 2. Error handling check
-    issues.extend(analyze_error_handling(&code, &lang));
-    
-    // 3. Resource management check
-    issues.extend(analyze_resource_management(&code, &lang));
-    
-    // 4. Performance check
-    issues.extend(analyze_performance(&code, &lang));
-    
-    // 5. Security check
-    issues.extend(analyze_security(&code, &lang));
-    
-    Ok(serde_json::json!({
-        "file": file_path,
-        "language": lang,
-        "total_issues": issues.len(),
-        "issues": issues
-    }))
-}
-
-/// Analyze code for errors
-fn analyze_error_handling(code: &str, language: &str) -> Vec<serde_json::Value> {
-    let mut issues = Vec::new();
-    let lines: Vec<&str> = code.lines().collect();
-    
-    for (idx, line) in lines.iter().enumerate() {
-        let line_no = idx + 1;
-        
-        // Check for try blocks without catch
-        if (language == "typescript" || language == "javascript") && line.contains("try") {
-            if !lines[idx + 1..].iter().take(5).any(|l| l.contains("catch")) {
-                issues.push(serde_json::json!({
-                    "type": "error_handling",
-                    "severity": "high",
-                    "line": line_no,
-                    "message": "Try block without catch clause",
-                    "suggestion": "Add catch block or use .catch() handler"
-                }));
-            }
-        }
-        
-        // Check for unhandled async calls
-        if (language == "typescript" || language == "javascript" || language == "python")
-            && line.contains("async") && line.contains("await")
-        {
-            if !code[..code.find(line).unwrap_or(0)].contains("try") {
-                issues.push(serde_json::json!({
-                    "type": "error_handling",
-                    "severity": "medium",
-                    "line": line_no,
-                    "message": "Await without try-catch",
-                    "suggestion": "Wrap in try-catch for error handling"
-                }));
-            }
-        }
-    }
-    
-    issues
-}
-
-/// Analyze code for resource management issues
-fn analyze_resource_management(code: &str, language: &str) -> Vec<serde_json::Value> {
-    let mut issues = Vec::new();
-    let lines: Vec<&str> = code.lines().collect();
-    
-    for (idx, line) in lines.iter().enumerate() {
-        let line_no = idx + 1;
-        
-        // Check for unclosed file handles
-        if line.contains(".open(") || line.contains("open(") {
-            let slice = &lines[idx..].join("\n");
-            if !slice.contains(".close()") && !slice.contains("with ") {
-                issues.push(serde_json::json!({
-                    "type": "resource_leak",
-                    "severity": "high",
-                    "line": line_no,
-                    "message": "Potential file descriptor leak",
-                    "suggestion": "Use 'with' statement or ensure .close() is called"
-                }));
-            }
-        }
-        
-        // Check for unclosed connections
-        if line.contains("connect") && !line.contains("disconnect") {
-            issues.push(serde_json::json!({
-                "type": "resource_leak",
-                "severity": "medium",
-                "line": line_no,
-                "message": "Connection opened but not explicitly closed",
-                "suggestion": "Add disconnect/close call in cleanup"
-            }));
-        }
-    }
-    
-    issues
-}
-
-/// Analyze code for performance issues
-fn analyze_performance(code: &str, language: &str) -> Vec<serde_json::Value> {
-    let mut issues = Vec::new();
-    let lines: Vec<&str> = code.lines().collect();
-    
-    for (idx, line) in lines.iter().enumerate() {
-        let line_no = idx + 1;
-        
-        // Check for nested loops
-        let open_parens = line.matches('(').count();
-        let close_parens = line.matches(')').count();
-        if open_parens > 2 && close_parens > 2 {
-            issues.push(serde_json::json!({
-                "type": "performance",
-                "severity": "low",
-                "line": line_no,
-                "message": "High nesting level detected",
-                "suggestion": "Consider extracting complex expressions"
-            }));
-        }
-        
-        // Check for quadratic algorithms
-        if line.contains("for") && line.contains("for") {
-            issues.push(serde_json::json!({
-                "type": "performance",
-                "severity": "medium",
-                "line": line_no,
-                "message": "Nested loop detected - O(n²) complexity",
-                "suggestion": "Check if this can be optimized with a hash table or better algorithm"
-            }));
-        }
-        
-        // Check for inefficient string operations
-        if language == "python" && (line.contains("+ \"") || line.contains("+ '")) {
-            issues.push(serde_json::json!({
-                "type": "performance",
-                "severity": "low",
-                "line": line_no,
-                "message": "String concatenation in loop",
-                "suggestion": "Use ''.join() or StringBuilder for better performance"
-            }));
-        }
-    }
-    
-    issues
-}
-
 /// Analyze code for security issues
-fn analyze_security(code: &str, language: &str) -> Vec<serde_json::Value> {
+fn analyze_security(code: &str, _language: &str) -> Vec<serde_json::Value> {
     let mut issues = Vec::new();
     let lines: Vec<&str> = code.lines().collect();
     
@@ -2414,7 +2586,7 @@ fn analyze_security(code: &str, language: &str) -> Vec<serde_json::Value> {
 }
 
 /// Analyze code for syntax issues
-fn analyze_syntax(code: &str, language: &str) -> Vec<serde_json::Value> {
+fn analyze_syntax(code: &str, _language: &str) -> Vec<serde_json::Value> {
     let mut issues = Vec::new();
     
     // Basic bracket matching
@@ -2457,20 +2629,6 @@ fn analyze_syntax(code: &str, language: &str) -> Vec<serde_json::Value> {
     }
     
     issues
-}
-
-fn detect_language(file_path: &str) -> String {
-    if file_path.ends_with(".py") {
-        "python".to_string()
-    } else if file_path.ends_with(".rs") {
-        "rust".to_string()
-    } else if file_path.ends_with(".ts") || file_path.ends_with(".tsx") {
-        "typescript".to_string()
-    } else if file_path.ends_with(".js") || file_path.ends_with(".jsx") {
-        "javascript".to_string()
-    } else {
-        "unknown".to_string()
-    }
 }
 
 /// Send a chat message through the Python gRPC AI Service

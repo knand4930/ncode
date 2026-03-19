@@ -2,15 +2,9 @@
 // LSP (Language Server Protocol) bridge
 // Connects to language servers for advanced code intelligence
 
-use std::collections::HashMap;
 use std::process::Command;
-use std::sync::{LazyLock, Mutex};
 use serde::{Deserialize, Serialize};
 use tauri::command;
-
-// LSP_PROCESSES is prepared for future tracking of language servers
-static LSP_PROCESSES: LazyLock<Mutex<HashMap<String, u32>>> =
-    LazyLock::new(|| Mutex::new(HashMap::new()));
 
 #[derive(Serialize, Deserialize)]
 pub struct LSPConfig {

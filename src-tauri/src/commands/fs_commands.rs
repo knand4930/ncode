@@ -120,3 +120,8 @@ pub fn watch_directory(_path: String) -> Result<(), String> {
     // Implemented via Tauri's file watcher plugin in real impl
     Ok(())
 }
+
+#[command]
+pub fn check_file_exists(path: String) -> Result<bool, String> {
+    Ok(Path::new(&path).exists())
+}

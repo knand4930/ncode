@@ -31,18 +31,23 @@ interface EditorStore {
   recentFiles: string[];
   aiChangeHistory: AIChangeEntry[];
 
+  createUntitledTab: () => string;
   openFile: (filePath: string) => Promise<string | null>;
   openFileAt: (filePath: string, line: number, column?: number) => Promise<void>;
   closeTab: (tabId: string) => void;
+  closeAllTabs: () => void;
   setActiveTab: (tabId: string) => void;
   updateContent: (tabId: string, content: string) => void;
   saveFile: (tabId: string) => Promise<void>;
+  saveFileAs: (tabId: string, newPath: string) => Promise<void>;
   saveAllFiles: () => Promise<void>;
+  revertFile: (tabId: string) => Promise<void>;
   setCursorPosition: (tabId: string, line: number, column: number) => void;
-  setOpenFolder: (path: string) => void;
+  setOpenFolder: (path: string | null) => void;
   applyAIChangeToTab: (tabId: string, newContent: string, summary?: string) => Promise<boolean>;
   applyAIChangeToFile: (filePath: string, newContent: string, summary?: string) => Promise<boolean>;
   rollbackLastAIChange: () => Promise<boolean>;
+  reorderTabs: (startIndex: number, endIndex: number) => void;
 }
 
 function detectLanguage(filePath: string): string {
@@ -67,6 +72,35 @@ export const useEditorStore = create<EditorStore>((set, get) => ({
   openFolder: null,
   recentFiles: [],
   aiChangeHistory: [],
+
+  createUntitledTab: () => {
+    const untitledTabs = get().tabs.filter((tab) => tab.filePath.startsWith("untitled:"));
+    const existingNames = new Set(untitledTabs.map((tab) => tab.fileName));
+
+    let index = 1;
+    let fileName = `Untitled-${index}`;
+    while (existingNames.has(fileName)) {
+      index += 1;
+      fileName = `Untitled-${index}`;
+    }
+
+    const tab: EditorTab = {
+      id: `tab-${Date.now()}`,
+      filePath: `untitled:${fileName}`,
+      fileName,
+      content: "",
+      isDirty: false,
+      language: "plaintext",
+      cursorPosition: { line: 1, column: 1 },
+    };
+
+    set((state) => ({
+      tabs: [...state.tabs, tab],
+      activeTabId: tab.id,
+    }));
+
+    return tab.id;
+  },
 
   openFile: async (filePath: string) => {
     const { tabs } = get();
@@ -136,6 +170,10 @@ export const useEditorStore = create<EditorStore>((set, get) => ({
     set({ tabs: newTabs, activeTabId: newActive });
   },
 
+  closeAllTabs: () => {
+    set({ tabs: [], activeTabId: null });
+  },
+
   setActiveTab: (tabId: string) => set({ activeTabId: tabId }),
 
   updateContent: (tabId: string, content: string) => {
@@ -149,10 +187,35 @@ export const useEditorStore = create<EditorStore>((set, get) => ({
   saveFile: async (tabId: string) => {
     const tab = get().tabs.find((t) => t.id === tabId);
     if (!tab) return;
+    if (tab.filePath.startsWith("untitled:")) return;
     await invoke("write_file", { path: tab.filePath, content: tab.content });
     useAIStore.getState().markCodebaseChanged(tab.filePath);
     set((s) => ({
       tabs: s.tabs.map((t) => (t.id === tabId ? { ...t, isDirty: false } : t)),
+    }));
+  },
+
+  saveFileAs: async (tabId: string, newPath: string) => {
+    const tab = get().tabs.find((t) => t.id === tabId);
+    if (!tab) return;
+
+    await invoke("write_file", { path: newPath, content: tab.content });
+    useAIStore.getState().markCodebaseChanged(newPath);
+
+    const fileName = newPath.split(/[\\/]/).pop() || newPath;
+    set((s) => ({
+      recentFiles: [newPath, ...s.recentFiles.filter((p) => p !== newPath)].slice(0, 50),
+      tabs: s.tabs.map((t) =>
+        t.id === tabId
+          ? {
+              ...t,
+              filePath: newPath,
+              fileName,
+              language: detectLanguage(newPath),
+              isDirty: false,
+            }
+          : t
+      ),
     }));
   },
 
@@ -164,6 +227,18 @@ export const useEditorStore = create<EditorStore>((set, get) => ({
     }
   },
 
+  revertFile: async (tabId: string) => {
+    const tab = get().tabs.find((t) => t.id === tabId);
+    if (!tab || tab.filePath.startsWith("untitled:")) return;
+
+    const content = await invoke<string>("read_file", { path: tab.filePath });
+    set((s) => ({
+      tabs: s.tabs.map((t) =>
+        t.id === tabId ? { ...t, content, isDirty: false } : t
+      ),
+    }));
+  },
+
   setCursorPosition: (tabId, line, column) => {
     set((s) => ({
       tabs: s.tabs.map((t) =>
@@ -172,8 +247,12 @@ export const useEditorStore = create<EditorStore>((set, get) => ({
     }));
   },
 
-  setOpenFolder: async (path: string) => {
+  setOpenFolder: async (path: string | null) => {
     set({ openFolder: path });
+    if (!path) {
+      useAIStore.getState().setOpenFolder(null);
+      return;
+    }
     // Run background project scan to detect frameworks for AI context
     detectProjectContext(path).then((ctx) => {
       useAIStore.getState().setProjectContext(ctx);
@@ -278,5 +357,14 @@ export const useEditorStore = create<EditorStore>((set, get) => ({
       };
     });
     return true;
+  },
+
+  reorderTabs: (startIndex: number, endIndex: number) => {
+    set((s) => {
+      const result = Array.from(s.tabs);
+      const [removed] = result.splice(startIndex, 1);
+      result.splice(endIndex, 0, removed);
+      return { tabs: result };
+    });
   },
 }));

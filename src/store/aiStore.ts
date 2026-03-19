@@ -3,6 +3,8 @@ import { create } from "zustand";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { type ProjectContext } from "../utils/projectScanner";
+import { formatErrorsForAI } from "../utils/errorParser";
+import { useTerminalStore } from "./terminalStore";
 
 export interface ChatMessage {
   id: string;
@@ -33,12 +35,21 @@ export type AIModel = {
 };
 
 export const RECOMMENDED_MODELS: AIModel[] = [
-  { name: "deepseek-coder:1.3b", label: "DeepSeek 1.3B", ramGB: 1, description: "Fastest, 1GB RAM" },
-  { name: "codellama:7b-code-q4_0", label: "CodeLlama 7B Q4", ramGB: 4, description: "Best quality, 4GB RAM" },
-  { name: "deepseek-coder:6.7b-instruct-q4_K_M", label: "DeepSeek 6.7B", ramGB: 4, description: "Balanced, 4GB RAM" },
-  { name: "qwen2.5-coder:1.5b", label: "Qwen2.5 1.5B", ramGB: 1, description: "Lightweight, 1-2GB RAM" },
-  { name: "starcoder2:3b", label: "StarCoder2 3B", ramGB: 2, description: "Good for completions, 2GB RAM" },
+  { name: "deepseek-coder", label: "DeepSeek Coder", ramGB: 4, description: "Balanced, 4GB RAM" },
+  { name: "codellama", label: "CodeLlama", ramGB: 4, description: "Best quality, 4GB RAM" },
+  { name: "qwen2.5-coder", label: "Qwen2.5 Coder", ramGB: 4, description: "Lightweight, 4GB RAM" },
+  { name: "mistral", label: "Mistral", ramGB: 4, description: "General purpose, 4GB RAM" },
+  { name: "starcoder2", label: "StarCoder2", ramGB: 2, description: "Good for completions, 2GB RAM" },
 ];
+
+/**
+ * Validate selectedOllamaModels against the actual available models list.
+ * Removes any stale/non-existent model names from the selection.
+ */
+function validateSelectedModels(selected: string[], available: string[]): string[] {
+  if (available.length === 0) return selected; // can't validate yet, keep as-is
+  return selected.filter((m) => available.includes(m));
+}
 
 // describes an external LLM provider configuration saved by user
 export interface ApiKeyEntry {
@@ -51,8 +62,9 @@ export interface ApiKeyEntry {
 type PersistedAISettings = {
   selectedProvider: "ollama" | "api";
   aiServiceMode: AIServiceMode;
-  selectedOllamaModel: string | null;
-  selectedApiKeyIndex: number | null;
+  ollamaBaseUrl?: string;
+  selectedOllamaModels: string[];
+  selectedApiKeyIndices?: number[];
   useRAG: boolean;
   aiMode: AIMode;
   showThinking: boolean;
@@ -60,6 +72,38 @@ type PersistedAISettings = {
 
 const AI_SETTINGS_KEY = "NCode.ai.settings.v1";
 const AI_CHAT_HISTORY_KEY = "NCode.ai.chatHistory.v1";
+const AI_SESSIONS_KEY = "NCode.ai.sessions.v1";
+
+// ── Chat session types ────────────────────────────────────────
+export interface ChatSession {
+  id: string;
+  title: string;
+  createdAt: number;
+  updatedAt: number;
+  messages: ChatMessage[];
+}
+
+function loadSessions(): ChatSession[] {
+  try {
+    if (typeof window === "undefined") return [];
+    const raw = window.localStorage.getItem(AI_SESSIONS_KEY);
+    if (!raw) return [];
+    return JSON.parse(raw) as ChatSession[];
+  } catch { return []; }
+}
+
+function saveSessions(sessions: ChatSession[]) {
+  try {
+    if (typeof window === "undefined") return;
+    window.localStorage.setItem(AI_SESSIONS_KEY, JSON.stringify(sessions));
+  } catch { /* ignore */ }
+}
+
+function sessionTitle(messages: ChatMessage[]): string {
+  const first = messages.find(m => m.role === "user");
+  if (!first) return "New Chat";
+  return first.content.slice(0, 40) + (first.content.length > 40 ? "…" : "");
+}
 
 function loadAISettings(): PersistedAISettings | null {
   try {
@@ -72,6 +116,24 @@ function loadAISettings(): PersistedAISettings | null {
     }
     if (parsed.aiServiceMode !== "direct" && parsed.aiServiceMode !== "grpc") {
       parsed.aiServiceMode = "direct";
+    }
+    // Migration: remove known stale model names from old hardcoded list
+    // These will be re-validated against actual available models on first checkOllama()
+    const knownStaleModels = [
+      "deepseek-coder:1.3b",
+      "codellama:7b-code-q4_0",
+      "qwen2.5-coder:1.5b",
+      "starcoder2:3b",
+    ];
+    if (parsed.selectedOllamaModels) {
+      const cleaned = parsed.selectedOllamaModels.filter((m) => !knownStaleModels.includes(m));
+      if (cleaned.length !== parsed.selectedOllamaModels.length) {
+        parsed.selectedOllamaModels = cleaned;
+        // Persist the cleaned version immediately
+        try {
+          window.localStorage.setItem(AI_SETTINGS_KEY, JSON.stringify(parsed));
+        } catch { /* ignore */ }
+      }
     }
     return parsed;
   } catch {
@@ -150,7 +212,7 @@ interface AIStore {
   apiKeys: ApiKeyEntry[];
   selectedProvider: "ollama" | "api";
   aiServiceMode: AIServiceMode;
-  selectedApiKeyIndex: number | null;
+  selectedApiKeyIndices: number[];
   apiProviderModels: Record<string, string[]>; // cache of models per provider
   apiProviderLoading: Record<string, boolean>; // loading state per provider
   apiProviderErrors: Record<string, string>; // error messages per provider
@@ -172,12 +234,17 @@ interface AIStore {
   agentEvents: AgentEvent[];
   showThinking: boolean;
 
+  // Multi-session chat
+  sessions: ChatSession[];
+  activeSessionId: string | null;
+  showSessionList: boolean;
+
   checkOllama: () => Promise<void>;
   startOllama: () => Promise<void>;
   toggleOllamaModel: (model: string) => void;
   addAPIKey: (entry: ApiKeyEntry) => void;
   removeAPIKey: (index: number) => void;
-  selectAPIKey: (index: number) => void;
+  toggleAPIKey: (index: number) => void;
   setProvider: (provider: "ollama" | "api") => void;
   setAIServiceMode: (mode: AIServiceMode) => void;
   checkGrpcService: () => Promise<void>;
@@ -187,8 +254,12 @@ interface AIStore {
   fetchOpenAIModels: (index?: number) => Promise<void>;
   fetchAnthropicModels: (index?: number) => Promise<void>;
   fetchGroqModels: (index?: number) => Promise<void>;
-  sendMessage: (content: string) => Promise<void>;
+  sendMessage: (content: string, activeFileContext?: string) => Promise<void>;
   clearChat: () => void;
+  newChat: () => void;
+  switchSession: (id: string) => void;
+  deleteSession: (id: string) => void;
+  toggleSessionList: () => void;
   addStreamToken: (messageId: string, token: string) => void;
   updateMessage: (id: string, content: string, metadata?: Partial<ChatMessage>) => void;
   indexCodebase: (path: string) => Promise<void>;
@@ -201,20 +272,21 @@ interface AIStore {
   markCodebaseChanged: (filePath?: string) => void;
   projectContext: ProjectContext | null;
   setProjectContext: (ctx: ProjectContext | null) => void;
+  _syncSessionMessages: (messages: ChatMessage[]) => void;
 }
 
 export const useAIStore = create<AIStore>((set, get) => ({
   isOllamaRunning: false,
   availableModels: [],
-  ollamaBaseUrl: "http://localhost:11434",
+  ollamaBaseUrl: persisted?.ollamaBaseUrl || "http://localhost:11434",
   ollamaModelsLoading: false,
   ollamaModelsError: null,
-  selectedOllamaModels: persisted?.selectedOllamaModel ? [persisted.selectedOllamaModel] : [],
+  selectedOllamaModels: persisted?.selectedOllamaModels || [],
 
   apiKeys: [],
   selectedProvider: persisted?.selectedProvider || "ollama",
   aiServiceMode: persisted?.aiServiceMode || "direct",
-  selectedApiKeyIndex: persisted?.selectedApiKeyIndex ?? null,
+  selectedApiKeyIndices: persisted?.selectedApiKeyIndices || (persisted && 'selectedApiKeyIndex' in persisted && (persisted as any).selectedApiKeyIndex != null ? [(persisted as any).selectedApiKeyIndex] : []),
   apiProviderModels: {},
   apiProviderLoading: {},
   apiProviderErrors: {},
@@ -237,10 +309,15 @@ export const useAIStore = create<AIStore>((set, get) => ({
   showThinking: persisted?.showThinking ?? true,
   projectContext: null,
 
+  sessions: loadSessions(),
+  activeSessionId: loadSessions()[0]?.id ?? null,
+  showSessionList: false,
+
   setProjectContext: (ctx) => set({ projectContext: ctx }),
 
   setOllamaBaseUrl: (url) => {
     set({ ollamaBaseUrl: url });
+    get().persistSettings();
   },
 
   fetchOllamaModels: async () => {
@@ -263,6 +340,16 @@ export const useAIStore = create<AIStore>((set, get) => ({
       } else {
         const models = await invoke<string[]>("fetch_ollama_models", { baseUrl: ollamaBaseUrl });
         set({ availableModels: models, isOllamaRunning: true, ollamaModelsError: null });
+        // Validate and clean stale selections
+        const validSelected = validateSelectedModels(get().selectedOllamaModels, models);
+        if (validSelected.length !== get().selectedOllamaModels.length) {
+          set({ selectedOllamaModels: validSelected });
+          get().persistSettings();
+        }
+        if (models.length > 0 && get().selectedOllamaModels.length === 0) {
+          set({ selectedOllamaModels: [models[0]] });
+          get().persistSettings();
+        }
       }
     } catch (e) {
       const errorMsg = String(e);
@@ -289,9 +376,12 @@ export const useAIStore = create<AIStore>((set, get) => ({
   },
 
   fetchOpenAIModels: async (index) => {
-    const { apiKeys, selectedApiKeyIndex, aiServiceMode } = get();
-    const targetIndex = typeof index === "number" ? index : selectedApiKeyIndex;
-    if (targetIndex === null || !apiKeys[targetIndex]) return;
+    const { apiKeys, selectedApiKeyIndices, aiServiceMode } = get();
+    let targetIndex: number | null | undefined = index;
+    if (targetIndex === undefined) {
+      targetIndex = selectedApiKeyIndices.length > 0 ? selectedApiKeyIndices[0] : null;
+    }
+    if (targetIndex === null || targetIndex === undefined || !apiKeys[targetIndex]) return;
     const key = apiKeys[targetIndex];
     if (key.provider !== "openai") return;
 
@@ -315,9 +405,12 @@ export const useAIStore = create<AIStore>((set, get) => ({
   },
 
   fetchAnthropicModels: async (index) => {
-    const { apiKeys, selectedApiKeyIndex, aiServiceMode } = get();
-    const targetIndex = typeof index === "number" ? index : selectedApiKeyIndex;
-    if (targetIndex === null || !apiKeys[targetIndex]) return;
+    const { apiKeys, selectedApiKeyIndices, aiServiceMode } = get();
+    let targetIndex: number | null | undefined = index;
+    if (targetIndex === undefined) {
+      targetIndex = selectedApiKeyIndices.length > 0 ? selectedApiKeyIndices[0] : null;
+    }
+    if (targetIndex === null || targetIndex === undefined || !apiKeys[targetIndex]) return;
     const key = apiKeys[targetIndex];
     if (key.provider !== "anthropic") return;
 
@@ -341,9 +434,12 @@ export const useAIStore = create<AIStore>((set, get) => ({
   },
 
   fetchGroqModels: async (index) => {
-    const { apiKeys, selectedApiKeyIndex, aiServiceMode } = get();
-    const targetIndex = typeof index === "number" ? index : selectedApiKeyIndex;
-    if (targetIndex === null || !apiKeys[targetIndex]) return;
+    const { apiKeys, selectedApiKeyIndices, aiServiceMode } = get();
+    let targetIndex: number | null | undefined = index;
+    if (targetIndex === undefined) {
+      targetIndex = selectedApiKeyIndices.length > 0 ? selectedApiKeyIndices[0] : null;
+    }
+    if (targetIndex === null || targetIndex === undefined || !apiKeys[targetIndex]) return;
     const key = apiKeys[targetIndex];
     if (key.provider !== "groq") return;
 
@@ -381,6 +477,13 @@ export const useAIStore = create<AIStore>((set, get) => ({
           isOllamaRunning: models.length > 0,
           availableModels: models,
         });
+        // Validate and clean stale model selections
+        const currentSelected = get().selectedOllamaModels;
+        const validSelected = validateSelectedModels(currentSelected, models);
+        if (validSelected.length !== currentSelected.length) {
+          set({ selectedOllamaModels: validSelected });
+          get().persistSettings();
+        }
         if (models.length > 0 && get().selectedOllamaModels.length === 0) {
           set({ selectedOllamaModels: [models[0]] });
           get().persistSettings();
@@ -389,12 +492,16 @@ export const useAIStore = create<AIStore>((set, get) => ({
         const errorMsg = String(e);
         let localModels: string[] = [];
         try {
-          localModels = await invoke<string[]>("check_ollama_status");
+          localModels = await invoke<string[]>("fetch_ollama_models", { baseUrl: ollamaBaseUrl });
         } catch {
           try {
-            localModels = await invoke<string[]>("ollama_list_local");
+            localModels = await invoke<string[]>("check_ollama_status");
           } catch {
-            localModels = [];
+            try {
+              localModels = await invoke<string[]>("ollama_list_local");
+            } catch {
+              localModels = [];
+            }
           }
         }
         set({
@@ -408,15 +515,25 @@ export const useAIStore = create<AIStore>((set, get) => ({
     }
 
     try {
-      const models = await invoke<string[]>("check_ollama_status");
+      const models = await invoke<string[]>("fetch_ollama_models", { baseUrl: ollamaBaseUrl });
       set({ isOllamaRunning: true, availableModels: models, grpcStatusError: null });
-      // auto-select default if nothing chosen yet
-      const state = get();
-      if (state.selectedOllamaModels.length === 0 && models.length > 0) {
-        const preferred = ["deepseek-coder:1.3b", "qwen2.5-coder:1.5b", "codellama:7b-code-q4_0"];
+
+      // Validate and clean stale model selections against actual available models
+      const currentSelected = get().selectedOllamaModels;
+      const validSelected = validateSelectedModels(currentSelected, models);
+      if (validSelected.length !== currentSelected.length) {
+        // Some selected models no longer exist — remove them
+        set({ selectedOllamaModels: validSelected });
+        get().persistSettings();
+      }
+
+      // Auto-select a model if nothing valid is chosen
+      if (get().selectedOllamaModels.length === 0 && models.length > 0) {
+        // Pick the first available model that matches a preferred base name
+        const preferredBases = ["qwen2.5-coder", "deepseek-coder", "codellama", "mistral", "starcoder2"];
         let chosen = models[0];
-        for (const m of preferred) {
-          const found = models.find((am) => am.startsWith(m.split(":")[0]));
+        for (const base of preferredBases) {
+          const found = models.find((m) => m.toLowerCase().startsWith(base));
           if (found) {
             chosen = found;
             break;
@@ -428,22 +545,34 @@ export const useAIStore = create<AIStore>((set, get) => ({
     } catch {
       // HTTP failure; try list fallback
       try {
-        const localModels = await invoke<string[]>("ollama_list_local");
-        set({ isOllamaRunning: false, availableModels: localModels });
+        const localModels = await invoke<string[]>("check_ollama_status");
+        set({ isOllamaRunning: localModels.length > 0, availableModels: localModels });
+        const validSelected = validateSelectedModels(get().selectedOllamaModels, localModels);
+        if (validSelected.length !== get().selectedOllamaModels.length) {
+          set({ selectedOllamaModels: validSelected });
+          get().persistSettings();
+        }
         if (localModels.length > 0 && get().selectedOllamaModels.length === 0) {
           set({ selectedOllamaModels: [localModels[0]] });
           get().persistSettings();
         }
       } catch {
-        set({ isOllamaRunning: false, availableModels: [] });
+        try {
+          const localModels = await invoke<string[]>("ollama_list_local");
+          set({ isOllamaRunning: false, availableModels: localModels });
+        } catch {
+          set({ isOllamaRunning: false, availableModels: [] });
+        }
       }
     }
   },
 
   toggleOllamaModel: (model) => {
     set((s) => {
-      // single active local model: selecting one replaces previous selection
-      const arr = s.selectedOllamaModels[0] === model ? [model] : [model];
+      const isSelected = s.selectedOllamaModels.includes(model);
+      const arr = isSelected
+        ? s.selectedOllamaModels.filter((m) => m !== model)
+        : [...s.selectedOllamaModels, model];
       return {
         selectedOllamaModels: arr,
         selectedProvider: "ollama",
@@ -468,19 +597,26 @@ export const useAIStore = create<AIStore>((set, get) => ({
     set((s) => {
       const keys = [...s.apiKeys];
       keys.splice(index, 1);
-      // adjust selected index if necessary
-      let sel = s.selectedApiKeyIndex;
-      if (sel !== null) {
-        if (sel === index) sel = null;
-        else if (sel > index) sel = sel - 1;
-      }
-      return { apiKeys: keys, selectedApiKeyIndex: sel };
+      // adjust selected indices
+      const newIndices = s.selectedApiKeyIndices
+        .filter((i) => i !== index)
+        .map((i) => (i > index ? i - 1 : i));
+      return { apiKeys: keys, selectedApiKeyIndices: newIndices };
     });
     get().persistSettings();
   },
 
-  selectAPIKey: (index) => {
-    set({ selectedProvider: "api", selectedApiKeyIndex: index });
+  toggleAPIKey: (index) => {
+    set((s) => {
+      const isSelected = s.selectedApiKeyIndices.includes(index);
+      const arr = isSelected
+        ? s.selectedApiKeyIndices.filter((i) => i !== index)
+        : [...s.selectedApiKeyIndices, index];
+      return {
+        selectedApiKeyIndices: arr,
+        selectedProvider: "api",
+      };
+    });
     get().persistSettings();
   },
 
@@ -521,21 +657,22 @@ export const useAIStore = create<AIStore>((set, get) => ({
     saveAISettings({
       selectedProvider: s.selectedProvider,
       aiServiceMode: s.aiServiceMode,
-      selectedOllamaModel: s.selectedOllamaModels[0] || null,
-      selectedApiKeyIndex: s.selectedApiKeyIndex,
+      ollamaBaseUrl: s.ollamaBaseUrl,
+      selectedOllamaModels: s.selectedOllamaModels,
+      selectedApiKeyIndices: s.selectedApiKeyIndices,
       useRAG: s.useRAG,
       aiMode: s.aiMode,
       showThinking: s.showThinking,
     });
   },
 
-  sendMessage: async (content: string) => {
+  sendMessage: async (content: string, activeFileContext?: string) => {
     const {
       chatHistory,
       selectedProvider,
       aiServiceMode,
       selectedOllamaModels,
-      selectedApiKeyIndex,
+      selectedApiKeyIndices,
       apiKeys,
       useRAG,
       aiMode,
@@ -543,6 +680,7 @@ export const useAIStore = create<AIStore>((set, get) => ({
       indexedChunks,
       indexDirty,
       isOllamaRunning,
+      ollamaBaseUrl,
     } = get();
 
     const userMsg: ChatMessage = {
@@ -564,17 +702,30 @@ export const useAIStore = create<AIStore>((set, get) => ({
     set((s) => {
       const isDuplicate = s.chatHistory.some(m => m.role === userMsg.role && m.content === userMsg.content && (Date.now() - m.timestamp < 2000));
       const updated = isDuplicate ? s.chatHistory : [...s.chatHistory, userMsg];
-      if (!isDuplicate) saveChatHistory(updated);
+      if (!isDuplicate) {
+        saveChatHistory(updated);
+        get()._syncSessionMessages(updated);
+      }
       return { chatHistory: updated, isThinking: true };
     });
 
     try {
-      let response: string;
+      let response: string | undefined;
       let sources: ChatMessage["sources"] = undefined;
       const { projectContext } = get();
-      const ctxString = projectContext
+      let ctxString = projectContext
         ? `\n[PROJECT CONTEXT]\nLanguages: ${projectContext.languages.join(", ")}\nFrameworks: ${projectContext.frameworks.join(", ")}\nManager: ${projectContext.packageManager || "N/A"}\nEnsure code aligns with these frameworks.`
         : "";
+
+      if (activeFileContext) {
+        ctxString += `\n[ACTIVE EDITING CONTEXT]\nThe user is currently looking at this open file:\n${activeFileContext}\nProvide exactly relevant suggestions.`;
+      }
+
+      // Inject any terminal-detected errors into AI context
+      const { lastErrors } = useTerminalStore.getState();
+      if (lastErrors && lastErrors.length > 0) {
+        ctxString += `\n\n${formatErrorsForAI(lastErrors)}`;
+      }
 
       const modeContext =
         aiMode === "think"
@@ -589,15 +740,56 @@ export const useAIStore = create<AIStore>((set, get) => ({
 
       const fullContextStr = modeContext ? `${modeContext}\n${ctxString}` : ctxString;
 
-      if (shouldUseAgenticReview) {
-        if (!isOllamaRunning) {
-          throw new Error("Agent mode requires local Ollama to be running");
-        }
-        const runId = `agent-${Date.now()}`;
-        const ragModel = selectedOllamaModels[0] || "deepseek-coder:1.3b";
-        set({ agentLiveOutput: "", agentEvents: [] });
+      // 1. Gather active models — validate Ollama models against availableModels
+      const { availableModels } = get();
+      const validOllamaModels = selectedOllamaModels.filter((m) =>
+        availableModels.length === 0 || availableModels.includes(m)
+      );
+      const invalidOllamaModels = selectedOllamaModels.filter((m) => !validOllamaModels.includes(m));
 
-        if (openFolder && (indexedChunks === 0 || indexDirty || autoProjectReviewIntent)) {
+      if (invalidOllamaModels.length > 0) {
+        // Remove stale models from selection silently
+        set({ selectedOllamaModels: validOllamaModels });
+        get().persistSettings();
+      }
+
+      const activeModels: { isApi: boolean; provider: string; model: string; apiKey?: string }[] = [
+        ...validOllamaModels.map((m) => ({ isApi: false, provider: "ollama", model: m })),
+        ...selectedApiKeyIndices
+          .map((i) => {
+            const entry = apiKeys[i];
+            if (!entry) return null;
+            return { isApi: true, provider: entry.provider, model: entry.model, apiKey: entry.apiKey };
+          })
+          .filter(Boolean) as { isApi: boolean; provider: string; model: string; apiKey: string }[],
+      ];
+
+      if (activeModels.length === 0) {
+        const hint = invalidOllamaModels.length > 0
+          ? `Previously selected model(s) [${invalidOllamaModels.join(", ")}] are not installed. Available: ${availableModels.join(", ") || "none — is Ollama running?"}`
+          : "No AI models selected. Please configure a model in Settings.";
+        set((s) => ({
+          chatHistory: [
+            ...s.chatHistory,
+            {
+              id: `msg-${Date.now()}-error`,
+              role: "assistant",
+              content: `Error: ${hint}`,
+              timestamp: Date.now(),
+            },
+          ],
+          isThinking: false,
+        }));
+        return;
+      }
+
+      // 2. Build RAG indexes and fetch RAG context if needed
+      let ragContextSources: any[] = [];
+      let finalFullContextStr = fullContextStr;
+      
+      const requiresRag = useRAG || shouldUseAgenticReview;
+      if (requiresRag && openFolder) {
+        if (indexedChunks === 0 || indexDirty || autoProjectReviewIntent) {
           set({ isIndexing: true });
           try {
             const count = await invoke<number>("index_codebase", { rootPath: openFolder });
@@ -608,154 +800,150 @@ export const useAIStore = create<AIStore>((set, get) => ({
           }
         }
 
-        const unlisten = await listen<AgentEvent>(`ai-agent-${runId}`, (event) => {
+        try {
+          // Fetch the combined codebase context from Rust
+          const ragData = await invoke<{ answer: string; sources: any[] }>("get_rag_context", {
+            rootPath: openFolder,
+            query: content,
+          });
+          
+          if (ragData.answer) {
+             finalFullContextStr += `\n\n[RETRIEVED CODEBASE CONTEXT]\n${ragData.answer}`;
+          }
+          ragContextSources = ragData.sources;
+        } catch (e) {
+          console.warn("RAG Context fetch failed", e);
+        }
+      }
+
+      // 3. Prepare queries based on Mode
+      let baseMessages = chatHistory
+          .filter((m) => m.role !== "system")
+          .map((m) => ({ role: m.role, content: m.content }));
+      
+      let finalQueryContent = content;
+      
+      if (shouldUseAgenticReview) {
+        set({ agentLiveOutput: "", agentEvents: [] });
+        // Keep the user-visible query clean — inject instructions into context only
+        finalQueryContent = content;
+        const agentSystemHint =
+          autoProjectReviewIntent && aiMode !== "agent"
+            ? `PROJECT REVIEW MODE: Review the codebase one by one. Identify bugs, risky patterns, missing dependencies, and concrete fixes. Prefer file-level findings with clear reasoning. IMPORTANT: Do not output suggestions to create a file if it already exists, instead propose modifications to the existing file path.`
+            : autoProjectActionIntent && aiMode !== "agent"
+              ? `PROJECT CHANGE PROPOSAL MODE: Analyze the whole project and propose exact create/update actions. Requirements: Provide concrete file paths for each change. OUTPUT MODIFICATIONS TO EXISTING FILES if you are changing an existing component. Do NOT propose to create a file that already exists. Output terminal commands using the exact syntax: '<execute>command here</execute>'. When your entire overall objective is finished, you MUST output exactly: '<task_complete>'. Do NOT claim files are already changed; this is proposal-only until user approval.`
+              : `IMPORTANT: When suggesting code changes, if a file already exists, provide the updated code for that specific existing file path, do NOT propose creating a duplicate file.`;
+        // Append agent hint to context (system side), not to the user message
+        finalFullContextStr = agentSystemHint + (finalFullContextStr ? `\n${finalFullContextStr}` : "");
+        baseMessages.push({ role: "user", content: finalQueryContent });
+      } else {
+        baseMessages.push({ role: "user", content: finalQueryContent });
+      }
+
+      // 4. Dispatch — RACE MODE: first model to respond wins, others are cancelled
+      const runId = `req-${Date.now()}`;
+      
+      // We'll set up the listener for agent mode live streams
+      let unlisten: (() => void) | undefined;
+      if (shouldUseAgenticReview) {
+        unlisten = await listen<{kind: string; message: string}>(`ai-agent-${runId}`, (event) => {
           const payload = event.payload;
           if (payload.kind === "token") {
             set((s) => ({ agentLiveOutput: s.agentLiveOutput + payload.message }));
           } else {
-            set((s) => ({ agentEvents: [...s.agentEvents, payload] }));
+            set((s) => ({ agentEvents: [...s.agentEvents, payload] as any }));
           }
         });
-
-        try {
-          const agentQuery =
-            autoProjectReviewIntent && aiMode !== "agent"
-              ? `PROJECT REVIEW MODE: Review the codebase one by one. Identify bugs, risky patterns, missing dependencies, and concrete fixes. Prefer file-level findings with clear reasoning. IMPORTANT: Do not output suggestions to create a file if it already exists, instead propose modifications to the existing file path.\n${fullContextStr}\n\nUser request:\n${content}`
-              : autoProjectActionIntent && aiMode !== "agent"
-                ? `PROJECT CHANGE PROPOSAL MODE: Analyze the whole project and propose exact create/update actions.\n\
-                 Requirements:\n\
-                 - Provide concrete file paths for each change.\n\
-                 - OUTPUT MODIFICATIONS TO EXISTING FILES if you are changing an existing component. Do NOT propose to create a file that already exists.\n\
-                 - Output terminal commands using the exact syntax: '<execute>command here</execute>'.\n\
-                 - The system will run your '<execute>' block and reply with the output automatically.\n\
-                 - When your entire overall objective is finished, you MUST output exactly: '<task_complete>'.\n\
-                 - Do NOT claim files are already changed; this is proposal-only until user approval.\n${fullContextStr}\n\n\
-                 User request:\n${content}`
-                : `IMPORTANT: When suggesting code changes, if a file already exists, provide the updated code for that specific existing file path, do NOT propose creating a duplicate file.\n\n${content}\n${fullContextStr}`;
-          const result = await invoke<{ answer: string; sources: any[] }>("agentic_rag_chat", {
-            runId,
-            rootPath: openFolder,
-            query: agentQuery,
-            model: ragModel,
-          });
-          response = result.answer;
-          sources = result.sources.map((s: any) => ({
-            filePath: s.file_path,
-            startLine: s.start_line,
-            endLine: s.end_line,
-          }));
-        } finally {
-          unlisten();
-        }
-      } else if (useRAG && openFolder) {
-        if (!isOllamaRunning) {
-          throw new Error("RAG requires local Ollama to be running");
-        }
-        const ragModel = selectedOllamaModels[0] || "deepseek-coder:1.3b";
-
-        // Build index on-demand the first time RAG is used for this folder.
-        if (indexedChunks === 0 || indexDirty) {
-          set({ isIndexing: true });
-          try {
-            const count = await invoke<number>("index_codebase", { rootPath: openFolder });
-            set({ indexedChunks: count, isIndexing: false, openFolder, indexDirty: false });
-          } catch (e) {
-            set({ isIndexing: false });
-            throw new Error(`RAG index failed: ${String(e)} `);
-          }
-        }
-
-        // RAG currently uses local Ollama chat for grounded answers.
-        const ragQuery =
-          aiMode === "chat"
-            ? `${content} \n${ctxString} `
-            : `${content} \n\n[${aiMode.toUpperCase()} MODE]\n${fullContextStr} `;
-        const result = await invoke<{ answer: string; sources: any[] }>("rag_query", {
-          rootPath: openFolder,
-          query: ragQuery,
-          model: ragModel,
-        });
-        response = result.answer;
-        sources = result.sources.map((s: any) => ({
-          filePath: s.file_path,
-          startLine: s.start_line,
-          endLine: s.end_line,
-        }));
-      } else if (selectedProvider === "ollama") {
-        const model = selectedOllamaModels[0] || "";
-        const messages = chatHistory
-          .filter((m) => m.role !== "system")
-          .map((m) => ({ role: m.role, content: m.content }));
-        messages.push({ role: "user", content });
-        if (aiServiceMode === "grpc") {
-          if (modeContext) {
-            messages.unshift({ role: "system", content: modeContext });
-          }
-          response = await invoke<string>("grpc_ai_chat", {
-            model,
-            messages,
-            provider: "ollama",
-            temperature: 0.7,
-            maxTokens: 2000,
-          });
-        } else {
-          response = await invoke<string>("ollama_chat", {
-            model,
-            messages,
-            context: modeContext,
-          });
-        }
-      } else if (selectedProvider === "api" && selectedApiKeyIndex !== null) {
-        const keyEntry = apiKeys[selectedApiKeyIndex];
-        const messages = chatHistory
-          .filter((m) => m.role !== "system")
-          .map((m) => ({ role: m.role, content: m.content }));
-        messages.push({ role: "user", content });
-        if (aiServiceMode === "grpc") {
-          if (modeContext) {
-            messages.unshift({ role: "system", content: modeContext });
-          }
-          response = await invoke<string>("grpc_ai_chat", {
-            provider: keyEntry.provider,
-            apiKey: keyEntry.apiKey,
-            model: keyEntry.model,
-            messages,
-            temperature: 0.7,
-            maxTokens: 2000,
-          });
-        } else {
-          response = await invoke<string>("api_chat", {
-            provider: keyEntry.provider,
-            apiKey: keyEntry.apiKey,
-            model: keyEntry.model,
-            messages,
-            context: modeContext,
-          });
-        }
-      } else {
-        response = "Error: no model/provider selected";
       }
 
-      const assistantMsg: ChatMessage = {
-        id: `msg - ${Date.now()} `,
-        role: "assistant",
-        content: response,
-        sources,
-        timestamp: Date.now(),
-        model: selectedProvider === "ollama" ? selectedOllamaModels[0] : apiKeys[selectedApiKeyIndex!]?.model,
-        provider: selectedProvider === "ollama" ? "ollama" : (apiKeys[selectedApiKeyIndex!]?.provider as "openai" | "anthropic" | "groq" | "airllm" | "vllm" | undefined) || "openai",
-        isStreaming: false,
-      };
+      try {
+        // Build per-model promise factory
+        const makeModelPromise = async (am: typeof activeModels[0]) => {
+          let res = "";
+          let sourcesToAttach = requiresRag ? ragContextSources.map((s: any) => ({
+              filePath: s.file_path,
+              startLine: s.start_line,
+              endLine: s.end_line,
+          })) : undefined;
 
-      set((s) => {
-        const isDuplicate = s.chatHistory.some(m => m.role === assistantMsg.role && m.content === assistantMsg.content && (Date.now() - m.timestamp < 3000));
-        const updated = isDuplicate ? s.chatHistory : [...s.chatHistory, assistantMsg];
-        if (!isDuplicate) saveChatHistory(updated);
-        return { chatHistory: updated, isThinking: false };
-      });
+          if (am.isApi) {
+            if (aiServiceMode === "grpc") {
+              const grpcMessages = finalFullContextStr ? [{ role: "system", content: finalFullContextStr }, ...baseMessages] : baseMessages;
+              try {
+                res = await invoke<string>("grpc_ai_chat", {
+                  provider: am.provider, apiKey: am.apiKey, model: am.model,
+                  messages: grpcMessages, temperature: 0.7, maxTokens: 4000,
+                });
+              } catch (err) {
+                res = await invoke<string>("api_chat", {
+                  provider: am.provider, apiKey: am.apiKey, model: am.model,
+                  messages: baseMessages, context: finalFullContextStr,
+                });
+              }
+            } else {
+              res = await invoke<string>("api_chat", {
+                provider: am.provider, apiKey: am.apiKey, model: am.model,
+                messages: baseMessages, context: finalFullContextStr,
+              });
+            }
+          } else {
+            if (shouldUseAgenticReview) {
+              const result = await invoke<{ answer: string; sources: any[] }>("agentic_rag_chat", {
+                runId, rootPath: openFolder, query: finalQueryContent,
+                model: am.model, baseUrl: ollamaBaseUrl, context: finalFullContextStr || null,
+              });
+              res = result.answer;
+              sourcesToAttach = result.sources.map((s: any) => ({
+                filePath: s.file_path, startLine: s.start_line, endLine: s.end_line,
+              }));
+            } else {
+              res = await invoke<string>("ollama_chat", {
+                model: am.model, messages: baseMessages,
+                context: finalFullContextStr, baseUrl: ollamaBaseUrl,
+              });
+            }
+          }
+          return { res, sourcesToAttach, am };
+        };
 
-      // Autonomous Agent Loop logic
-      if (aiMode === "agent" && openFolder && !response.includes("<task_complete>")) {
+        // Race: only the fastest model's response is shown
+        const { res, sourcesToAttach, am: winner } = await Promise.race(
+          activeModels.map(makeModelPromise)
+        );
+        response = res;
+
+        const assistantMsg: ChatMessage = {
+          id: `msg-${Date.now()}-${winner.model}`,
+          role: "assistant",
+          content: res,
+          sources: sourcesToAttach,
+          timestamp: Date.now(),
+          model: winner.model,
+          provider: winner.provider as any,
+          isStreaming: false,
+        };
+
+        set((s) => {
+          const isDuplicate = s.chatHistory.some(m => m.role === assistantMsg.role && m.content === assistantMsg.content && (Date.now() - m.timestamp < 3000));
+          const updated = isDuplicate ? s.chatHistory : [...s.chatHistory, assistantMsg];
+          if (!isDuplicate) {
+            saveChatHistory(updated);
+            // Persist to active session
+            get()._syncSessionMessages(updated);
+          }
+          return { chatHistory: updated };
+        });
+
+      } finally {
+        if (unlisten) unlisten();
+      }
+
+      set({ isThinking: false });
+
+      // Autonomous Agent Loop logic: only take action for single model responses (for now) or update differently if needed.
+      // Currently, it gets tricky to run agent loops automatically when multiple models might try to execute the same command concurrently.
+      // Let's rely on user acceptance for multi-model output initially or run the loop for the first model's output if standard single run.
+      if (aiMode === "agent" && openFolder && response && !response.includes("<task_complete>")) {
         const executeMatches = Array.from(response.matchAll(/<execute>([\s\S]*?)<\/execute>/g));
         if (executeMatches.length > 0) {
           const firstCmd = executeMatches[0][1].trim();
@@ -809,8 +997,8 @@ export const useAIStore = create<AIStore>((set, get) => ({
         role: "assistant",
         content: `Error: ${e.toString()}. Make sure your LLM service is configured correctly.`,
         timestamp: Date.now(),
-        provider: selectedProvider === "ollama" ? "ollama" : (apiKeys[selectedApiKeyIndex!]?.provider as "openai" | "anthropic" | "groq" | "airllm" | "vllm" | undefined) || "openai",
-        model: selectedProvider === "ollama" ? selectedOllamaModels[0] : apiKeys[selectedApiKeyIndex!]?.model,
+        provider: selectedProvider === "ollama" ? "ollama" : (apiKeys[selectedApiKeyIndices[0]]?.provider as "openai" | "anthropic" | "groq" | "airllm" | "vllm" | undefined) || "openai",
+        model: selectedProvider === "ollama" ? selectedOllamaModels[0] : apiKeys[selectedApiKeyIndices[0]]?.model,
       };
       set((s) => {
         const isDuplicate = s.chatHistory.some(m => m.role === errMsg.role && m.content === errMsg.content && (Date.now() - m.timestamp < 3000));
@@ -843,7 +1031,82 @@ export const useAIStore = create<AIStore>((set, get) => ({
 
   clearChat: () => {
     saveChatHistory([]);
+    // Update active session
+    const { sessions, activeSessionId } = get();
+    if (activeSessionId) {
+      const updated = sessions.map(s => s.id === activeSessionId ? { ...s, messages: [], updatedAt: Date.now() } : s);
+      saveSessions(updated);
+      set({ sessions: updated });
+    }
     set({ chatHistory: [], agentLiveOutput: "", agentEvents: [] });
+  },
+
+  newChat: () => {
+    // Save current chat to session first
+    const { chatHistory, sessions, activeSessionId } = get();
+    let updatedSessions = [...sessions];
+    if (activeSessionId && chatHistory.length > 0) {
+      updatedSessions = updatedSessions.map(s =>
+        s.id === activeSessionId ? { ...s, messages: chatHistory, title: sessionTitle(chatHistory), updatedAt: Date.now() } : s
+      );
+    }
+    // Create new session
+    const newId = `session-${Date.now()}`;
+    const newSession: ChatSession = { id: newId, title: "New Chat", createdAt: Date.now(), updatedAt: Date.now(), messages: [] };
+    updatedSessions = [newSession, ...updatedSessions];
+    saveSessions(updatedSessions);
+    saveChatHistory([]);
+    set({ sessions: updatedSessions, activeSessionId: newId, chatHistory: [], agentLiveOutput: "", agentEvents: [] });
+  },
+
+  switchSession: (id: string) => {
+    const { chatHistory, sessions, activeSessionId } = get();
+    // Save current session
+    let updatedSessions = [...sessions];
+    if (activeSessionId && chatHistory.length > 0) {
+      updatedSessions = updatedSessions.map(s =>
+        s.id === activeSessionId ? { ...s, messages: chatHistory, title: sessionTitle(chatHistory), updatedAt: Date.now() } : s
+      );
+    }
+    const target = updatedSessions.find(s => s.id === id);
+    if (!target) return;
+    saveSessions(updatedSessions);
+    saveChatHistory(target.messages);
+    set({ sessions: updatedSessions, activeSessionId: id, chatHistory: target.messages, agentLiveOutput: "", agentEvents: [] });
+  },
+
+  deleteSession: (id: string) => {
+    const { sessions, activeSessionId } = get();
+    const updated = sessions.filter(s => s.id !== id);
+    saveSessions(updated);
+    if (activeSessionId === id) {
+      const next = updated[0];
+      saveChatHistory(next?.messages ?? []);
+      set({ sessions: updated, activeSessionId: next?.id ?? null, chatHistory: next?.messages ?? [] });
+    } else {
+      set({ sessions: updated });
+    }
+  },
+
+  toggleSessionList: () => set(s => ({ showSessionList: !s.showSessionList })),
+
+  // Internal: sync current chatHistory into the active session
+  _syncSessionMessages: (messages: ChatMessage[]) => {
+    const { sessions, activeSessionId } = get();
+    if (!activeSessionId) {
+      // Auto-create first session
+      const newId = `session-${Date.now()}`;
+      const newSession: ChatSession = { id: newId, title: sessionTitle(messages), createdAt: Date.now(), updatedAt: Date.now(), messages };
+      const updated = [newSession, ...sessions];
+      saveSessions(updated);
+      set({ sessions: updated, activeSessionId: newId });
+      return;
+    }
+    const updated = sessions.map(s =>
+      s.id === activeSessionId ? { ...s, messages, title: sessionTitle(messages), updatedAt: Date.now() } : s
+    );
+    saveSessions(updated);
+    set({ sessions: updated });
   },
 
   indexCodebase: async (path: string) => {
@@ -871,30 +1134,22 @@ export const useAIStore = create<AIStore>((set, get) => ({
   },
 
   getInlineCompletion: async (code: string, language: string): Promise<string> => {
-    const { selectedProvider, aiServiceMode, selectedOllamaModels, selectedApiKeyIndex, apiKeys, isOllamaRunning } = get();
+    const { selectedProvider, aiServiceMode, selectedOllamaModels, selectedApiKeyIndices, apiKeys, isOllamaRunning, ollamaBaseUrl } = get();
     if (selectedProvider === "ollama" && !isOllamaRunning) return "";
 
     try {
       const prompt = `Complete this ${language} code (output only the completion, no explanation):\n\`\`\`${language}\n${code}`;
       if (selectedProvider === "ollama") {
         const model = selectedOllamaModels[0] || "";
-        const result =
-          aiServiceMode === "grpc"
-            ? await invoke<string>("grpc_ai_chat", {
-              model,
-              provider: "ollama",
-              messages: [{ role: "user", content: prompt }],
-              temperature: 0.1,
-              maxTokens: 120,
-            })
-            : await invoke<string>("ollama_complete", {
-              model,
-              prompt,
-              maxTokens: 100,
-            });
+        const result = await invoke<string>("ollama_complete", {
+          model,
+          prompt,
+          maxTokens: 100,
+          baseUrl: ollamaBaseUrl,
+        });
         return result.trim();
-      } else if (selectedProvider === "api" && selectedApiKeyIndex !== null) {
-        const keyEntry = apiKeys[selectedApiKeyIndex];
+      } else if (selectedProvider === "api" && selectedApiKeyIndices.length > 0) {
+        const keyEntry = apiKeys[selectedApiKeyIndices[0]];
         const result =
           aiServiceMode === "grpc"
             ? await invoke<string>("grpc_ai_chat", {

@@ -21,17 +21,17 @@ interface Command {
   action: () => void;
 }
 
-async function runInTerminal(cmd: string, cwd: string | null) {
+async function runInTerminal(cmd: string, cwd: string | null, addToast: (msg: string, type: "info"|"success"|"error"|"warning") => void) {
   if (!cwd) {
-    window.alert("Open a project folder first.");
+    addToast("Open a project folder first.", "warning");
     return;
   }
   try {
     const out = await invoke<string>("run_command", { cmd, cwd });
     const preview = out.length > 2000 ? `${out.slice(0, 2000)}\n…[truncated]` : out;
-    window.alert(`✓ Command succeeded:\n\n$ ${cmd}\n\n${preview || "(no output)"}`);
+    addToast(`✓ Command succeeded:\n\n$ ${cmd}\n\n${preview || "(no output)"}`, "success");
   } catch (e) {
-    window.alert(`✗ Command failed:\n\n$ ${cmd}\n\n${String(e)}`);
+    addToast(`✗ Command failed:\n\n$ ${cmd}\n\n${String(e)}`, "error");
   }
 }
 
@@ -42,8 +42,11 @@ export function CommandPalette() {
     toggleAIPanel,
     setTheme,
     toggleSettingsPanel,
-    setActiveView,
+    openView,
+    showSidebar,
+    toggleSidebar,
     toggleQuickOpen,
+    addToast,
   } = useUIStore();
   const { saveAllFiles, activeTabId, tabs, openFolder } = useEditorStore();
   const { setAIMode, toggleRAG, sendMessage } = useAIStore();
@@ -61,12 +64,19 @@ export function CommandPalette() {
     { id: "quick-open", category: "File", label: "File: Quick Open", keybind: "Ctrl+P", action: toggleQuickOpen },
 
     // ── View ──
-    { id: "view-explorer", category: "View", label: "View: Explorer", keybind: "Ctrl+Shift+E", action: () => setActiveView("explorer") },
-    { id: "view-search", category: "View", label: "View: Search", keybind: "Ctrl+Shift+F", action: () => setActiveView("search") },
-    { id: "view-search-replace", category: "View", label: "View: Search & Replace", keybind: "Ctrl+H", action: () => setActiveView("search-replace") },
-    { id: "view-git", category: "View", label: "View: Source Control", keybind: "Ctrl+Shift+G", action: () => setActiveView("git") },
-    { id: "view-ext", category: "View", label: "View: Extensions", keybind: "Ctrl+Shift+X", action: () => setActiveView("extensions") },
-    { id: "view-keybindings", category: "View", label: "View: Keybindings", action: () => setActiveView("keybindings") },
+    { id: "view-explorer", category: "View", label: "View: Explorer", keybind: "Ctrl+Shift+E", action: () => openView("explorer") },
+    { id: "view-search", category: "View", label: "View: Search", keybind: "Ctrl+Shift+F", action: () => openView("search") },
+    { id: "view-search-replace", category: "View", label: "View: Search & Replace", keybind: "Ctrl+H", action: () => openView("search-replace") },
+    { id: "view-git", category: "View", label: "View: Source Control", keybind: "Ctrl+Shift+G", action: () => openView("git") },
+    { id: "view-ext", category: "View", label: "View: Extensions", keybind: "Ctrl+Shift+X", action: () => openView("extensions") },
+    { id: "view-keybindings", category: "View", label: "View: Keybindings", action: () => openView("keybindings") },
+    {
+      id: "view-toggle-sidebar",
+      category: "View",
+      label: showSidebar ? "View: Hide Primary Side Bar" : "View: Show Primary Side Bar",
+      keybind: "Ctrl+B",
+      action: toggleSidebar,
+    },
     { id: "toggle-terminal", category: "View", label: "View: Toggle Terminal", keybind: "Ctrl+`", action: toggleTerminal },
     { id: "toggle-ai", category: "View", label: "View: Toggle AI Panel", keybind: "Ctrl+Shift+A", action: toggleAIPanel },
 
@@ -82,7 +92,7 @@ export function CommandPalette() {
         category: "Run",
         label: `Run: Run ${fileName || "File"} (${lang})`,
         keybind: "F5",
-        action: () => runInTerminal(getRunCommand(lang, filePath, fileName)!, openFolder),
+        action: () => runInTerminal(getRunCommand(lang, filePath, fileName)!, openFolder, addToast),
       }]
       : []),
     ...(getBuildCommand(lang, filePath, fileName)
@@ -91,7 +101,7 @@ export function CommandPalette() {
         category: "Run",
         label: `Run: Build (${lang})`,
         keybind: "Ctrl+Shift+B",
-        action: () => runInTerminal(getBuildCommand(lang, filePath, fileName)!, openFolder),
+        action: () => runInTerminal(getBuildCommand(lang, filePath, fileName)!, openFolder, addToast),
       }]
       : []),
 
@@ -101,7 +111,7 @@ export function CommandPalette() {
         id: "test-run",
         category: "Test",
         label: `Test: Run Tests (${lang})`,
-        action: () => runInTerminal(getTestCommand(lang, filePath, fileName)!, openFolder),
+        action: () => runInTerminal(getTestCommand(lang, filePath, fileName)!, openFolder, addToast),
       }]
       : []),
 
@@ -111,7 +121,7 @@ export function CommandPalette() {
         id: "lint-file",
         category: "Lint",
         label: `Lint: Check ${fileName || "File"} (${lang})`,
-        action: () => runInTerminal(getLintCommand(lang, filePath, fileName)!, openFolder),
+        action: () => runInTerminal(getLintCommand(lang, filePath, fileName)!, openFolder, addToast),
       }]
       : []),
     ...(getFormatCommand(lang, filePath, fileName)
@@ -119,7 +129,7 @@ export function CommandPalette() {
         id: "format-file",
         category: "Format",
         label: `Format: Format ${fileName || "File"} (${lang})`,
-        action: () => runInTerminal(getFormatCommand(lang, filePath, fileName)!, openFolder),
+        action: () => runInTerminal(getFormatCommand(lang, filePath, fileName)!, openFolder, addToast),
       }]
       : []),
 
@@ -129,7 +139,7 @@ export function CommandPalette() {
         id: "project-init",
         category: "Project",
         label: `Project: Install Dependencies (${lang})`,
-        action: () => runInTerminal(getInitCommand(lang, filePath, fileName)!, openFolder),
+        action: () => runInTerminal(getInitCommand(lang, filePath, fileName)!, openFolder, addToast),
       }]
       : []),
 
@@ -141,7 +151,7 @@ export function CommandPalette() {
       action: async () => {
         const msg = prompt("Commit message:");
         if (msg && openFolder) {
-          await runInTerminal(`git add -A && git commit -m "${msg.replace(/"/g, '\\"')}"`, openFolder);
+          await runInTerminal(`git add -A && git commit -m "${msg.replace(/"/g, '\\"')}"`, openFolder, addToast);
         }
       },
     },
@@ -149,19 +159,19 @@ export function CommandPalette() {
       id: "git-push",
       category: "Git",
       label: "Git: Push",
-      action: () => runInTerminal("git push", openFolder),
+      action: () => runInTerminal("git push", openFolder, addToast),
     },
     {
       id: "git-pull",
       category: "Git",
       label: "Git: Pull",
-      action: () => runInTerminal("git pull", openFolder),
+      action: () => runInTerminal("git pull", openFolder, addToast),
     },
     {
       id: "git-status",
       category: "Git",
       label: "Git: Status",
-      action: () => runInTerminal("git status", openFolder),
+      action: () => runInTerminal("git status", openFolder, addToast),
     },
 
     // ── AI Modes ──

@@ -3,6 +3,7 @@ import { useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { Search, Replace } from "lucide-react";
 import { useEditorStore } from "../../store/editorStore";
+import { useUIStore } from "../../store/uiStore";
 
 interface DirEntry {
   name: string;
@@ -57,6 +58,7 @@ export function SearchReplacePanel() {
     Array<{ file: string; filePath: string; line: number; text: string; matches: number }>
   >([]);
   const { tabs, openFolder, updateContent, saveFile } = useEditorStore();
+  const { addToast } = useUIStore();
 
   const getTargets = async (): Promise<SearchTarget[]> => {
     if (!openFolder) {
@@ -139,7 +141,7 @@ export function SearchReplacePanel() {
       });
     } catch (e) {
       setError(`Search failed: ${String(e)}`);
-      alert("Invalid regex pattern or failed to scan workspace");
+      addToast("Invalid regex pattern or failed to scan workspace", "error");
       setLoading(false);
       return;
     }
@@ -176,13 +178,13 @@ export function SearchReplacePanel() {
       }
 
       if (replacedFiles > 0) {
-        alert(`Replaced ${replacedMatches} match(es) in ${replacedFiles} file(s)`);
+        addToast(`Replaced ${replacedMatches} match(es) in ${replacedFiles} file(s)`, "success");
       } else {
-        alert("No matches found to replace");
+        addToast("No matches found to replace", "warning");
       }
     } catch (e) {
       setError(`Replace failed: ${String(e)}`);
-      alert("Invalid regex pattern or replace failed");
+      addToast("Invalid regex pattern or replace failed", "error");
       setLoading(false);
       return;
     }
@@ -269,17 +271,33 @@ export function SearchReplacePanel() {
               {results.reduce((sum, r) => sum + r.matches, 0)} matches in {results.length} file(s)
             </div>
             {results.map((r, i) => (
-              <div
-                key={i}
-                className="file-entry"
-                style={{ paddingLeft: 8, flexDirection: "column", height: "auto", padding: "4px 8px" }}
-              >
-                <span style={{ color: "var(--accent)", fontSize: 11 }}>
-                  {r.file} • {r.matches} matches
-                </span>
-                <span style={{ fontSize: 12, color: "var(--text-secondary)", fontFamily: "var(--font-mono)" }}>
-                  Line {r.line}: {r.text.slice(0, 60)}
-                </span>
+              <div key={r.filePath} style={{ marginBottom: 6 }}>
+                <div 
+                  className="file-entry" 
+                  style={{ paddingLeft: 4, fontWeight: 500, color: "var(--accent)" }}
+                  title={r.filePath}
+                >
+                  <span style={{ fontSize: 11 }}>{r.file}</span>
+                  <span style={{ fontSize: 10, color: "var(--text-muted)", marginLeft: 6, fontWeight: 'normal' }}>
+                    {r.matches} match{r.matches !== 1 ? 'es' : ''}
+                  </span>
+                </div>
+                <div style={{ display: "flex", flexDirection: "column", gap: 2, marginTop: 2 }}>
+                  {r.text.split('\n').map((textLine, lineIndex) => (
+                    <div
+                      key={lineIndex}
+                      className="file-entry"
+                      style={{ paddingLeft: 16, height: "auto", minHeight: 22, padding: "2px 16px" }}
+                    >
+                      <span style={{ fontSize: 11, color: "var(--text-muted)", minWidth: 24, textAlign: "right", marginRight: 8, userSelect: "none" }}>
+                        {r.line}
+                      </span>
+                      <span style={{ fontSize: 12, color: "var(--text-secondary)", fontFamily: "var(--font-mono)", wordBreak: "break-all" }}>
+                        {textLine.trim().slice(0, 100)}{textLine.trim().length > 100 ? '...' : ''}
+                      </span>
+                    </div>
+                  ))}
+                </div>
               </div>
             ))}
           </div>

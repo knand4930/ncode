@@ -1,6 +1,6 @@
 // src/App.tsx
-import { useEffect } from "react";
-import { PanelGroup, Panel, PanelResizeHandle } from "react-resizable-panels";
+import { useEffect, useRef } from "react";
+import { PanelGroup, Panel, PanelResizeHandle, type ImperativePanelHandle } from "react-resizable-panels";
 import { ActivityBar } from "./components/sidebar/ActivityBar";
 import { Sidebar } from "./components/sidebar/Sidebar";
 import { EditorTabs } from "./components/editor/EditorTabs";
@@ -10,8 +10,10 @@ import { Terminal } from "./components/terminal/Terminal";
 import { AIPanel } from "./components/ai/AIPanel";
 import { StatusBar } from "./components/statusbar/StatusBar";
 import { SettingsPanel } from "./components/settings/SettingsPanel";
+import { TitleBar } from "./components/titlebar/TitleBar";
 import { CommandPalette } from "./components/editor/CommandPalette";
 import { QuickOpenPanel } from "./components/editor/QuickOpenPanel";
+import { ToastContainer } from "./components/ui/ToastContainer";
 import { ErrorBoundary } from "./components/ErrorBoundary";
 import { useEditorStore } from "./store/editorStore";
 import { useUIStore } from "./store/uiStore";
@@ -19,19 +21,26 @@ import { useAIStore } from "./store/aiStore";
 import "./index.css";
 
 export default function App() {
+  const terminalPanelRef = useRef<ImperativePanelHandle | null>(null);
   const {
+    showActivityBar,
+    showSidebar,
+    showStatusBar,
     showTerminal,
     showAIPanel,
     showCommandPalette,
     showSettingsPanel,
     showQuickOpen,
+    colorTheme,
+    iconTheme,
   } = useUIStore();
   const { checkOllama } = useAIStore();
   const {
-    setActiveView,
+    openView,
     toggleCommandPalette,
     toggleQuickOpen,
     toggleSettingsPanel,
+    toggleSidebar,
     toggleTerminal,
     toggleAIPanel,
   } = useUIStore();
@@ -40,6 +49,16 @@ export default function App() {
   useEffect(() => {
     checkOllama();
   }, [checkOllama]);
+
+  useEffect(() => {
+    if (!terminalPanelRef.current) return;
+
+    if (showTerminal) {
+      terminalPanelRef.current.expand(25);
+    } else {
+      terminalPanelRef.current.collapse();
+    }
+  }, [showTerminal]);
 
   // Global keyboard shortcuts
   useEffect(() => {
@@ -68,19 +87,19 @@ export default function App() {
             return;
           case "e":
             e.preventDefault();
-            setActiveView("explorer");
+            openView("explorer");
             return;
           case "f":
             e.preventDefault();
-            setActiveView("search");
+            openView("search");
             return;
           case "g":
             e.preventDefault();
-            setActiveView("git");
+            openView("git");
             return;
           case "x":
             e.preventDefault();
-            setActiveView("extensions");
+            openView("extensions");
             return;
           case "s":
             e.preventDefault();
@@ -105,17 +124,15 @@ export default function App() {
           break;
         case "t":
           e.preventDefault();
-          setActiveView("symbols");
+          openView("symbols");
           break;
         case "h":
           e.preventDefault();
-          setActiveView("search-replace");
+          openView("search-replace");
           break;
         case "b":
           e.preventDefault();
-          // VS Code standard is to toggle sidebar visibility, but since we rely on views,
-          // falling back to opening 'explorer' view for Ctrl+B
-          setActiveView("explorer");
+          toggleSidebar();
           break;
         case "/":
           // The Monaco editor handles Ctrl+/ internally for Toggle Comment
@@ -135,20 +152,21 @@ export default function App() {
   }, [
     activeTabId,
     closeTab,
+    openView,
     saveAllFiles,
     saveFile,
-    setActiveView,
     showCommandPalette,
     showQuickOpen,
     toggleAIPanel,
     toggleCommandPalette,
     toggleQuickOpen,
     toggleSettingsPanel,
+    toggleSidebar,
     toggleTerminal,
   ]);
 
   return (
-    <div className="app-root">
+    <div className="app-root" data-color-theme={colorTheme} data-icon-theme={iconTheme}>
       {showQuickOpen && <QuickOpenPanel />}
       {/* Command Palette */}
       {showCommandPalette && <CommandPalette />}
@@ -164,17 +182,22 @@ export default function App() {
       )}
 
       {/* Main layout */}
+      <TitleBar />
       <div className="app-body">
         {/* Activity Bar (left icons) */}
-        <ActivityBar />
+        {showActivityBar && <ActivityBar />}
 
         <PanelGroup direction="horizontal" className="flex-1">
           {/* Sidebar */}
-          <Panel defaultSize={18} minSize={10} maxSize={40} id="sidebar">
-            <Sidebar />
-          </Panel>
+          {showSidebar && (
+            <>
+              <Panel defaultSize={18} minSize={10} maxSize={40} id="sidebar">
+                <Sidebar />
+              </Panel>
 
-          <PanelResizeHandle className="resize-handle-vertical" />
+              <PanelResizeHandle className="resize-handle-vertical" />
+            </>
+          )}
 
           {/* Editor + Terminal */}
           <Panel id="main">
@@ -191,16 +214,24 @@ export default function App() {
               </Panel>
 
               {/* Terminal (toggleable) */}
-              {showTerminal && (
-                <>
-                  <PanelResizeHandle className="resize-handle-horizontal" />
-                  <Panel defaultSize={25} minSize={15} maxSize={50} id="terminal">
-                    <ErrorBoundary fallbackLabel="Terminal">
-                      <Terminal />
-                    </ErrorBoundary>
-                  </Panel>
-                </>
-              )}
+              <>
+                <PanelResizeHandle
+                  className={`resize-handle-horizontal ${showTerminal ? "" : "resize-handle-hidden"}`}
+                />
+                <Panel
+                  ref={terminalPanelRef}
+                  defaultSize={25}
+                  minSize={15}
+                  maxSize={50}
+                  collapsible
+                  collapsedSize={0}
+                  id="terminal"
+                >
+                  <ErrorBoundary fallbackLabel="Terminal">
+                    <Terminal />
+                  </ErrorBoundary>
+                </Panel>
+              </>
             </PanelGroup>
           </Panel>
 
@@ -219,7 +250,8 @@ export default function App() {
       </div>
 
       {/* Status Bar */}
-      <StatusBar />
+      {showStatusBar && <StatusBar />}
+      <ToastContainer />
     </div>
   );
 }
