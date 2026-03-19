@@ -33,6 +33,8 @@ export default function App() {
     showQuickOpen,
     colorTheme,
     iconTheme,
+    editorFont,
+    uiFont,
   } = useUIStore();
   const { checkOllama } = useAIStore();
   const {
@@ -49,6 +51,11 @@ export default function App() {
   useEffect(() => {
     checkOllama();
   }, [checkOllama]);
+
+  useEffect(() => {
+    document.documentElement.style.setProperty("--font-mono", editorFont);
+    document.documentElement.style.setProperty("--font-ui", uiFont);
+  }, [editorFont, uiFont]);
 
   useEffect(() => {
     if (!terminalPanelRef.current) return;

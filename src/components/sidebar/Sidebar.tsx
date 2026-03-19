@@ -4,12 +4,13 @@ import { invoke } from "@tauri-apps/api/core";
 import { open } from "@tauri-apps/plugin-dialog";
 import {
   ChevronRight, ChevronDown, File, Folder, FolderOpen,
-  RefreshCw, FolderPlus, Trash2, FileType2, Image, FileJson,
-  FileCode2, FileText, Database, Settings
+  RefreshCw, FolderPlus, Trash2, Image, FileJson,
+  FileCode2, FileText, Database, Settings, Terminal, FolderSearch
 } from "lucide-react";
 import { useEditorStore } from "../../store/editorStore";
 import { useUIStore } from "../../store/uiStore";
 import { useAIStore } from "../../store/aiStore";
+import { useTerminalStore } from "../../store/terminalStore";
 import { SearchPanel } from "./SearchPanel";
 import { SearchReplacePanel } from "./SearchReplacePanel";
 import { SymbolSearchPanel } from "./SymbolSearchPanel";
@@ -103,14 +104,18 @@ function FileTree({
   entries,
   depth = 0,
   iconTheme,
+  openFolder,
   onRefresh,
 }: {
   entries: FileEntry[];
   depth?: number;
   iconTheme: string;
+  openFolder?: string;
   onRefresh: () => Promise<void> | void;
 }) {
   const { openFile } = useEditorStore();
+  const { toggleTerminal } = useUIStore();
+  const { runCommandInTerminal } = useTerminalStore();
   const [expanded, setExpanded] = useState<Set<string>>(new Set());
   const [contextMenu, setContextMenu] = useState<{ x: number; y: number; entry: FileEntry } | null>(null);
 
@@ -120,6 +125,32 @@ function FileTree({
       n.has(path) ? n.delete(path) : n.add(path);
       return n;
     });
+  };
+
+  const openInTerminal = (dirPath: string) => {
+    toggleTerminal();
+    const cmd = `cd "${dirPath}"`;
+    runCommandInTerminal(cmd);
+  };
+
+  const copyPath = (path: string) => {
+    navigator.clipboard.writeText(path).catch(console.error);
+  };
+
+  const copyRelativePath = (path: string) => {
+    if (openFolder) {
+      const rel = path.startsWith(openFolder)
+        ? path.slice(openFolder.length).replace(/^[\\/]/, "")
+        : path;
+      navigator.clipboard.writeText(rel).catch(console.error);
+    } else {
+      navigator.clipboard.writeText(path).catch(console.error);
+    }
+  };
+
+  const findInFolder = (dirPath: string) => {
+    // Dispatch a custom event that SearchPanel can listen to
+    window.dispatchEvent(new CustomEvent("ncode:findInFolder", { detail: { path: dirPath } }));
   };
 
   return (
@@ -149,7 +180,7 @@ function FileTree({
               <span className="file-entry-name" style={{ marginLeft: 4 }}>{entry.name}</span>
             </div>
             {entry.is_dir && isOpen && entry.children && (
-              <FileTree entries={entry.children} depth={depth + 1} iconTheme={iconTheme} onRefresh={onRefresh} />
+              <FileTree entries={entry.children} depth={depth + 1} iconTheme={iconTheme} openFolder={openFolder} onRefresh={onRefresh} />
             )}
           </div>
         );
@@ -160,10 +191,9 @@ function FileTree({
         <>
           <div className="context-menu-overlay" onClick={() => setContextMenu(null)} />
           <div className="context-menu" style={{ top: contextMenu.y, left: contextMenu.x }}>
-            {contextMenu.entry.is_dir && (
+            {contextMenu.entry.is_dir ? (
               <>
                 <button onClick={() => {
-                  // New file in dir
                   const name = prompt("File name:");
                   if (name) {
                     invoke("create_file", { path: `${contextMenu.entry.path}/${name}`, isDir: false })
@@ -181,8 +211,30 @@ function FileTree({
                   }
                   setContextMenu(null);
                 }}>New Folder</button>
+                <div className="context-menu-separator" />
+                <button onClick={() => { openInTerminal(contextMenu.entry.path); setContextMenu(null); }}>
+                  <Terminal size={12} /> Open in Integrated Terminal
+                </button>
+                <button onClick={() => { findInFolder(contextMenu.entry.path); setContextMenu(null); }}>
+                  <FolderSearch size={12} /> Find in Folder...
+                </button>
+                <div className="context-menu-separator" />
+              </>
+            ) : (
+              <>
+                <button onClick={() => { openFile(contextMenu.entry.path); setContextMenu(null); }}>
+                  Open
+                </button>
+                <div className="context-menu-separator" />
               </>
             )}
+            <button onClick={() => { copyPath(contextMenu.entry.path); setContextMenu(null); }}>
+              Copy Path
+            </button>
+            <button onClick={() => { copyRelativePath(contextMenu.entry.path); setContextMenu(null); }}>
+              Copy Relative Path
+            </button>
+            <div className="context-menu-separator" />
             <button onClick={() => {
               const newName = prompt("Rename to:", contextMenu.entry.name);
               if (newName) {
@@ -323,6 +375,7 @@ export function Sidebar() {
           <FileTree
             entries={fileTree}
             iconTheme={iconTheme}
+            openFolder={openFolder}
             onRefresh={() => {
               if (openFolder) return loadFolder(openFolder);
             }}

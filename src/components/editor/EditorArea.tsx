@@ -178,6 +178,51 @@ export function EditorArea() {
       }
     });
 
+    // Navigation actions
+    editor.addAction({
+      id: "ncode.goToDefinition",
+      label: "Go to Definition",
+      keybindings: [monaco.KeyCode.F12],
+      contextMenuGroupId: "navigation",
+      contextMenuOrder: 0.5,
+      run: () => editor.getAction("editor.action.revealDefinition")?.run(),
+    });
+
+    editor.addAction({
+      id: "ncode.peekDefinition",
+      label: "Peek Definition",
+      keybindings: [monaco.KeyMod.Alt | monaco.KeyCode.F12],
+      contextMenuGroupId: "navigation",
+      contextMenuOrder: 0.6,
+      run: () => editor.getAction("editor.action.peekDefinition")?.run(),
+    });
+
+    editor.addAction({
+      id: "ncode.changeAllOccurrences",
+      label: "Change All Occurrences",
+      keybindings: [monaco.KeyMod.CtrlCmd | monaco.KeyCode.F2],
+      contextMenuGroupId: "3_slot1",
+      contextMenuOrder: 1,
+      run: () => editor.getAction("editor.action.changeAll")?.run(),
+    });
+
+    editor.addAction({
+      id: "ncode.refactor",
+      label: "Refactor...",
+      keybindings: [monaco.KeyMod.CtrlCmd | monaco.KeyMod.Shift | monaco.KeyCode.KeyR],
+      contextMenuGroupId: "1_modification",
+      contextMenuOrder: 2,
+      run: () => editor.getAction("editor.action.refactor")?.run(),
+    });
+
+    editor.addAction({
+      id: "ncode.commandPalette",
+      label: "Command Palette...",
+      contextMenuGroupId: "z_commands",
+      contextMenuOrder: 1,
+      run: () => editor.getAction("editor.action.quickCommand")?.run(),
+    });
+
     // Register AI inline completion provider
     if (isOllamaRunning) {
       monaco.languages.registerInlineCompletionsProvider("*", {

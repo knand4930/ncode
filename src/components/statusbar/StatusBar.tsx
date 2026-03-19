@@ -102,12 +102,22 @@ export const StatusBar = memo(function StatusBar() {
 
   const themeLabel = useMemo(() => {
     switch (colorTheme) {
+      case "dark":
+        return "One Dark Pro";
+      case "light":
+        return "One Light";
+      case "high-contrast":
+        return "High Contrast";
+      case "solarized-dark":
+        return "Solarized Dark";
+      case "monokai":
+        return "Monokai";
       case "github":
         return "GitHub Dark";
       case "dracula":
         return "Dracula";
       default:
-        return "Dark+";
+        return "One Dark Pro";
     }
   }, [colorTheme]);
 

@@ -1,17 +1,52 @@
 // src/components/settings/SettingsPanel.tsx
 import { useEffect, useState } from "react";
 import { useUIStore } from "../../store/uiStore";
+import type { ColorTheme, EditorFont, UiFont } from "../../store/uiStore";
 import { useAIStore } from "../../store/aiStore";
-import { Settings, Moon, Sun, Type } from "lucide-react";
+import { Settings, Type } from "lucide-react";
+
+interface ThemePreviewData {
+  id: ColorTheme;
+  label: string;
+  swatches: { bg: string; sidebar: string; accent: string; text: string };
+}
+
+const THEME_PREVIEWS: ThemePreviewData[] = [
+  { id: "dark",          label: "One Dark Pro",   swatches: { bg: "#1e1e1e", sidebar: "#252526", accent: "#007acc", text: "#cccccc" } },
+  { id: "light",         label: "One Light",      swatches: { bg: "#fafafa", sidebar: "#f3f3f3", accent: "#007acc", text: "#383a42" } },
+  { id: "high-contrast", label: "High Contrast",  swatches: { bg: "#000000", sidebar: "#0a0a0a", accent: "#ffffff", text: "#ffffff" } },
+  { id: "solarized-dark",label: "Solarized Dark", swatches: { bg: "#002b36", sidebar: "#073642", accent: "#268bd2", text: "#839496" } },
+  { id: "monokai",       label: "Monokai",        swatches: { bg: "#272822", sidebar: "#1e1f1c", accent: "#a6e22e", text: "#f8f8f2" } },
+  { id: "github",        label: "GitHub Dark",    swatches: { bg: "#0d1117", sidebar: "#010409", accent: "#1f6feb", text: "#c9d1d9" } },
+  { id: "dracula",       label: "Dracula",        swatches: { bg: "#282a36", sidebar: "#21222c", accent: "#bd93f9", text: "#f8f8f2" } },
+];
+
+const EDITOR_FONTS: { value: EditorFont; label: string }[] = [
+  { value: "JetBrains Mono",        label: "JetBrains Mono" },
+  { value: "Fira Code",             label: "Fira Code" },
+  { value: "Cascadia Code",         label: "Cascadia Code" },
+  { value: "Source Code Pro",       label: "Source Code Pro" },
+  { value: "Inconsolata",           label: "Inconsolata" },
+  { value: "Consolas, Courier New", label: "Consolas / Courier New" },
+];
+
+const UI_FONTS: { value: UiFont; label: string }[] = [
+  { value: "Inter",                         label: "Inter" },
+  { value: "Segoe UI, system-ui",           label: "Segoe UI" },
+  { value: "-apple-system, SF Pro Display", label: "SF Pro" },
+  { value: "Roboto",                        label: "Roboto" },
+];
 
 export function SettingsPanel() {
   const {
-    theme,
-    setTheme,
     colorTheme,
     setColorTheme,
     iconTheme,
     setIconTheme,
+    editorFont,
+    setEditorFont,
+    uiFont,
+    setUiFont,
     fontSize,
     setFontSize,
     tabSize,
@@ -92,7 +127,7 @@ export function SettingsPanel() {
           className={`settings-tab ${selectedTab === "theme" ? "active" : ""}`}
           onClick={() => setSelectedTab("theme")}
         >
-          Theme
+          Appearance
         </button>
         <button
           className={`settings-tab ${selectedTab === "ai" ? "active" : ""}`}
@@ -187,42 +222,100 @@ export function SettingsPanel() {
           <div className="settings-section">
             <h3>Appearance</h3>
 
-            <div className="setting-item">
-              <label>Theme</label>
-              <div style={{ display: "flex", gap: "8px" }}>
+            <h4 style={{ margin: "0 0 8px 0", fontSize: 12, color: "var(--text-secondary)" }}>Color Theme</h4>
+            <div style={{ display: "grid", gridTemplateColumns: "repeat(2, 1fr)", gap: 8, marginBottom: 16 }}>
+              {THEME_PREVIEWS.map((theme) => (
                 <button
-                  className={`theme-btn ${theme === "dark" ? "active" : ""}`}
-                  onClick={() => setTheme("dark")}
+                  key={theme.id}
+                  onClick={() => setColorTheme(theme.id)}
+                  style={{
+                    background: "var(--bg-input)",
+                    border: `2px solid ${colorTheme === theme.id ? "var(--accent)" : "var(--border)"}`,
+                    borderRadius: 6,
+                    padding: "8px",
+                    cursor: "pointer",
+                    textAlign: "left",
+                    color: "var(--text-primary)",
+                  }}
                 >
-                  <Moon size={14} /> Dark
+                  <div style={{ fontSize: 11, marginBottom: 6, fontWeight: colorTheme === theme.id ? 600 : 400 }}>
+                    {theme.label}
+                  </div>
+                  <div style={{ display: "flex", gap: 4 }}>
+                    {(["bg", "sidebar", "accent", "text"] as const).map((key) => (
+                      <div
+                        key={key}
+                        style={{
+                          width: 14,
+                          height: 14,
+                          borderRadius: 2,
+                          backgroundColor: theme.swatches[key],
+                          border: "1px solid rgba(255,255,255,0.1)",
+                        }}
+                      />
+                    ))}
+                  </div>
                 </button>
-                <button
-                  className={`theme-btn ${theme === "light" ? "active" : ""}`}
-                  onClick={() => setTheme("light")}
-                >
-                  <Sun size={14} /> Light
-                </button>
-              </div>
+              ))}
             </div>
 
+            <h4 style={{ margin: "0 0 8px 0", fontSize: 12, color: "var(--text-secondary)" }}>Fonts</h4>
+
             <div className="setting-item">
-              <label>Color Theme</label>
-              <select 
-                value={colorTheme} 
-                onChange={(e) => setColorTheme(e.target.value as any)} 
+              <label htmlFor="editor-font">Editor Font</label>
+              <select
+                id="editor-font"
+                value={editorFont}
+                onChange={(e) => setEditorFont(e.target.value as EditorFont)}
                 className="setting-select"
               >
-                <option value="dark">One Dark Pro</option>
-                <option value="github">GitHub</option>
-                <option value="dracula">Dracula</option>
+                {EDITOR_FONTS.map((font) => (
+                  <option key={font.value} value={font.value} style={{ fontFamily: font.value }}>
+                    {font.label}
+                  </option>
+                ))}
               </select>
             </div>
 
             <div className="setting-item">
+              <label htmlFor="ui-font">UI Font</label>
+              <select
+                id="ui-font"
+                value={uiFont}
+                onChange={(e) => setUiFont(e.target.value as UiFont)}
+                className="setting-select"
+              >
+                {UI_FONTS.map((font) => (
+                  <option key={font.value} value={font.value} style={{ fontFamily: font.value }}>
+                    {font.label}
+                  </option>
+                ))}
+              </select>
+            </div>
+
+            <div className="setting-item">
+              <label htmlFor="appearance-font-size">Font Size</label>
+              <div style={{ display: "flex", alignItems: "center", gap: "8px" }}>
+                <Type size={14} />
+                <input
+                  id="appearance-font-size"
+                  type="range"
+                  min="10"
+                  max="28"
+                  step="1"
+                  value={fontSize}
+                  onChange={(e) => setFontSize(Number(e.target.value))}
+                  style={{ flex: 1 }}
+                />
+                <span className="setting-value">{fontSize}px</span>
+              </div>
+            </div>
+
+            <div className="setting-item">
               <label>Icon Theme</label>
-              <select 
-                value={iconTheme} 
-                onChange={(e) => setIconTheme(e.target.value as any)} 
+              <select
+                value={iconTheme}
+                onChange={(e) => setIconTheme(e.target.value as any)}
                 className="setting-select"
               >
                 <option value="default">Default</option>
