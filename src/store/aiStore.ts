@@ -7,6 +7,7 @@ import { formatErrorsForAI } from "../utils/errorParser";
 import { parseThinkingBlock } from "../utils/parseThinkingBlock";
 import { parseBugReport } from "../utils/parseBugReport";
 import { useTerminalStore } from "./terminalStore";
+import { useUIStore } from "./uiStore";
 
 export interface ChatMessage {
   id: string;
@@ -108,6 +109,149 @@ type PersistedAISettings = {
 const AI_SETTINGS_KEY = "NCode.ai.settings.v1";
 const AI_CHAT_HISTORY_KEY = "NCode.ai.chatHistory.v1";
 const AI_SESSIONS_KEY = "NCode.ai.sessions.v1";
+export const INLINE_COMPLETION_DEBOUNCE_MS = 600;
+export const INLINE_COMPLETION_TIMEOUT_MS = 3000;
+
+type InlineCompletionSnapshot = {
+  selectedProvider: "ollama" | "api";
+  aiServiceMode: AIServiceMode;
+  selectedOllamaModels: string[];
+  selectedApiKeyIndices: number[];
+  apiKeys: ApiKeyEntry[];
+  isOllamaRunning: boolean;
+  ollamaBaseUrl: string;
+};
+
+type InlineCompletionRequestFn = (code: string, language: string) => Promise<string>;
+
+export function createInlineCompletionDebouncer(
+  requestFn: InlineCompletionRequestFn,
+  debounceMs = INLINE_COMPLETION_DEBOUNCE_MS
+) {
+  let timer: ReturnType<typeof setTimeout> | null = null;
+  let pendingResolve: ((value: string) => void) | null = null;
+  let latestRequestId = 0;
+
+  return (code: string, language: string): Promise<string> => {
+    latestRequestId += 1;
+    const requestId = latestRequestId;
+
+    if (timer) {
+      clearTimeout(timer);
+      timer = null;
+    }
+
+    if (pendingResolve) {
+      pendingResolve("");
+      pendingResolve = null;
+    }
+
+    return new Promise((resolve) => {
+      pendingResolve = resolve;
+
+      timer = setTimeout(async () => {
+        timer = null;
+        if (pendingResolve === resolve) {
+          pendingResolve = null;
+        }
+
+        try {
+          const result = await requestFn(code, language);
+          resolve(requestId === latestRequestId ? result : "");
+        } catch {
+          resolve("");
+        }
+      }, debounceMs);
+    });
+  };
+}
+
+async function requestInlineCompletionFromBackend(
+  code: string,
+  language: string,
+  getSnapshot: () => InlineCompletionSnapshot
+): Promise<string> {
+  if (!useUIStore.getState().inlineCompletionsEnabled) return "";
+
+  const {
+    selectedProvider,
+    aiServiceMode,
+    selectedOllamaModels,
+    selectedApiKeyIndices,
+    apiKeys,
+    isOllamaRunning,
+    ollamaBaseUrl,
+  } = getSnapshot();
+  const ollamaModel = selectedOllamaModels[0];
+
+  if (selectedProvider === "ollama") {
+    if (!isOllamaRunning) return "";
+    if (!ollamaModel) return "";
+  }
+
+  if (selectedProvider === "api" && selectedApiKeyIndices.length === 0) {
+    return "";
+  }
+
+  try {
+    const prompt = [
+      `Complete this ${language} code.`,
+      "Return only the text that should be inserted at the cursor.",
+      "Do not repeat the existing code, add markdown fences, or explain anything.",
+      "",
+      `\`\`\`${language}`,
+      code,
+      "```",
+    ].join("\n");
+
+    const timeoutPromise = new Promise<string>((_, reject) =>
+      setTimeout(() => reject(new Error("INLINE_COMPLETION_TIMEOUT")), INLINE_COMPLETION_TIMEOUT_MS)
+    );
+
+    const completionPromise = (async (): Promise<string> => {
+      if (selectedProvider === "ollama") {
+        const result = await invoke<string>("ollama_complete", {
+          model: ollamaModel,
+          prompt,
+          maxTokens: 100,
+          baseUrl: ollamaBaseUrl,
+        });
+        return result.trim();
+      }
+
+      const keyEntry = apiKeys[selectedApiKeyIndices[0]];
+      if (!keyEntry) return "";
+
+      const result =
+        aiServiceMode === "grpc"
+          ? await invoke<string>("grpc_ai_chat", {
+              provider: keyEntry.provider,
+              apiKey: keyEntry.apiKey,
+              model: keyEntry.model,
+              messages: [{ role: "user", content: prompt }],
+              temperature: 0.1,
+              maxTokens: 120,
+            })
+          : await invoke<string>("api_complete", {
+              provider: keyEntry.provider,
+              apiKey: keyEntry.apiKey,
+              model: keyEntry.model,
+              prompt,
+              maxTokens: 100,
+            });
+
+      return result.trim();
+    })();
+
+    return await Promise.race([completionPromise, timeoutPromise]);
+  } catch {
+    return "";
+  }
+}
+
+let debouncedInlineCompletionRequest:
+  | ((code: string, language: string) => Promise<string>)
+  | null = null;
 
 // ── Chat session types ────────────────────────────────────────
 export interface ChatSession {
@@ -1351,56 +1495,13 @@ export const useAIStore = create<AIStore>((set, get) => ({
   },
 
   getInlineCompletion: async (code: string, language: string): Promise<string> => {
-    const { selectedProvider, aiServiceMode, selectedOllamaModels, selectedApiKeyIndices, apiKeys, isOllamaRunning, ollamaBaseUrl } = get();
-    if (selectedProvider === "ollama" && !isOllamaRunning) return "";
-
-    try {
-      const prompt = `Complete this ${language} code (output only the completion, no explanation):\n\`\`\`${language}\n${code}`;
-
-      // 3-second timeout — silently dismiss on failure (Req 8.7)
-      const timeoutPromise = new Promise<string>((_, reject) =>
-        setTimeout(() => reject(new Error("INLINE_COMPLETION_TIMEOUT")), 3000)
+    if (!debouncedInlineCompletionRequest) {
+      debouncedInlineCompletionRequest = createInlineCompletionDebouncer((nextCode, nextLanguage) =>
+        requestInlineCompletionFromBackend(nextCode, nextLanguage, () => get())
       );
-
-      const completionPromise = (async (): Promise<string> => {
-        if (selectedProvider === "ollama") {
-          const model = selectedOllamaModels[0] || "";
-          const result = await invoke<string>("ollama_complete", {
-            model,
-            prompt,
-            maxTokens: 100,
-            baseUrl: ollamaBaseUrl,
-          });
-          return result.trim();
-        } else if (selectedProvider === "api" && selectedApiKeyIndices.length > 0) {
-          const keyEntry = apiKeys[selectedApiKeyIndices[0]];
-          const result =
-            aiServiceMode === "grpc"
-              ? await invoke<string>("grpc_ai_chat", {
-                provider: keyEntry.provider,
-                apiKey: keyEntry.apiKey,
-                model: keyEntry.model,
-                messages: [{ role: "user", content: prompt }],
-                temperature: 0.1,
-                maxTokens: 120,
-              })
-              : await invoke<string>("api_complete", {
-                provider: keyEntry.provider,
-                apiKey: keyEntry.apiKey,
-                model: keyEntry.model,
-                prompt,
-                maxTokens: 100,
-              });
-          return result.trim();
-        }
-        return "";
-      })();
-
-      return await Promise.race([completionPromise, timeoutPromise]);
-    } catch {
-      // Silently dismiss on timeout or any error (Req 8.7)
-      return "";
     }
+
+    return debouncedInlineCompletionRequest(code, language);
   },
 
   setOpenFolder: (path) => {

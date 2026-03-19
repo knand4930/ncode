@@ -38,12 +38,12 @@ export function EditorArea() {
     toggleCommandPalette,
     inlineCompletionsEnabled,
   } = useUIStore();
-  const { getInlineCompletion, isOllamaRunning, setOpenFolder: setAIOpenFolder } = useAIStore();
+  const { setOpenFolder: setAIOpenFolder } = useAIStore();
   const { runCommandInTerminal, lastErrors } = useTerminalStore();
   
   const editorRef = useRef<Monaco.editor.IStandaloneCodeEditor | null>(null);
   const monacoRef = useRef<typeof Monaco | null>(null);
-  const completionTimeout = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const inlineCompletionProviderRef = useRef<Monaco.IDisposable | null>(null);
   const saveTimeout = useRef<ReturnType<typeof setTimeout> | null>(null);
   const activeTabIdRef = useRef<string | null>(activeTabId);
   const activeTabRef = useRef<typeof activeTab>(undefined);
@@ -64,6 +64,18 @@ export function EditorArea() {
   useEffect(() => {
     terminalStoreRef.current = { runCommandInTerminal, showTerminal, toggleTerminal };
   }, [runCommandInTerminal, showTerminal, toggleTerminal]);
+
+  useEffect(() => {
+    return () => {
+      inlineCompletionProviderRef.current?.dispose();
+      inlineCompletionProviderRef.current = null;
+    };
+  }, []);
+
+  useEffect(() => {
+    if (inlineCompletionsEnabled || !editorRef.current) return;
+    void editorRef.current.getAction("editor.action.inlineSuggest.hide")?.run();
+  }, [inlineCompletionsEnabled]);
 
   // ── Sync terminal errors → Monaco markers ───────────────────────────────
   useEffect(() => {
@@ -226,53 +238,45 @@ export function EditorArea() {
 
     // Register AI inline completion provider (Req 8.1)
     // Always register the provider; it checks inlineCompletionsEnabled at call time
-    monaco.languages.registerInlineCompletionsProvider("*", {
-      provideInlineCompletions: async (model, position) => {
-        // Gate on setting (Req 8.6)
+    inlineCompletionProviderRef.current?.dispose();
+    inlineCompletionProviderRef.current = monaco.languages.registerInlineCompletionsProvider("*", {
+      provideInlineCompletions: async (model, position, _context, token) => {
         if (!useUIStore.getState().inlineCompletionsEnabled) {
           return { items: [] };
         }
 
-        // 600ms debounce (Req 8.1, 8.5)
-        if (completionTimeout.current) clearTimeout(completionTimeout.current);
-
-        return new Promise((resolve) => {
-          completionTimeout.current = setTimeout(async () => {
-            const lineContent = model.getValueInRange({
-              startLineNumber: Math.max(1, position.lineNumber - 20),
-              startColumn: 1,
-              endLineNumber: position.lineNumber,
-              endColumn: position.column,
-            });
-
-            if (lineContent.trim().length < 5) {
-              resolve({ items: [] });
-              return;
-            }
-
-            const lang = model.getLanguageId() || "plaintext";
-            // getInlineCompletion handles 3s timeout and silently returns "" on failure (Req 8.7)
-            const completion = await getInlineCompletion(lineContent, lang);
-
-            if (completion) {
-              resolve({
-                items: [
-                  {
-                    insertText: completion,
-                    range: {
-                      startLineNumber: position.lineNumber,
-                      startColumn: position.column,
-                      endLineNumber: position.lineNumber,
-                      endColumn: position.column,
-                    },
-                  },
-                ],
-              });
-            } else {
-              resolve({ items: [] });
-            }
-          }, 600);
+        const lineContent = model.getValueInRange({
+          startLineNumber: Math.max(1, position.lineNumber - 20),
+          startColumn: 1,
+          endLineNumber: position.lineNumber,
+          endColumn: position.column,
         });
+
+        if (lineContent.trim().length < 5) {
+          return { items: [] };
+        }
+
+        const lang = model.getLanguageId() || "plaintext";
+        const completion = await useAIStore.getState().getInlineCompletion(lineContent, lang);
+
+        if (token.isCancellationRequested || !completion) {
+          return { items: [] };
+        }
+
+        return {
+          items: [
+            {
+              insertText: completion,
+              range: {
+                startLineNumber: position.lineNumber,
+                startColumn: position.column,
+                endLineNumber: position.lineNumber,
+                endColumn: position.column,
+              },
+            },
+          ],
+          enableForwardStability: false,
+        };
       },
       freeInlineCompletions: () => { },
     });
@@ -283,6 +287,12 @@ export function EditorArea() {
       if (currentTabId) {
         setCursorPosition(currentTabId, e.position.lineNumber, e.position.column);
       }
+    });
+
+    editor.onDidChangeModelContent((event) => {
+      if (!useUIStore.getState().inlineCompletionsEnabled) return;
+      if (!event.changes.some((change) => change.text.length > 0 || change.rangeLength > 0)) return;
+      void editor.getAction("editor.action.inlineSuggest.hide")?.run();
     });
 
     // CodeLens Provider for AI Changes
@@ -665,7 +675,7 @@ export function EditorArea() {
           guides: { bracketPairs: true, indentation: true },
           renderWhitespace: "selection",
           inlayHints: { enabled: "on" },
-          inlineSuggest: { enabled: true },
+          inlineSuggest: { enabled: inlineCompletionsEnabled },
           padding: { top: 8 },
         }}
       />
