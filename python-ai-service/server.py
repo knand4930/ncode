@@ -18,6 +18,7 @@ import json
 import logging
 import os
 import sys
+import time
 from concurrent import futures
 from typing import AsyncIterator, List, Dict, Optional
 
@@ -49,7 +50,7 @@ CORE_DEPS_AVAILABLE = AIOHTTP_AVAILABLE and PYDANTIC_AVAILABLE
 # Import AI modules for advanced reasoning and RAG
 try:
     from config import Settings
-    from prompts import get_system_prompt, SYSTEM_PROMPTS, AIMode
+    from prompts import get_system_prompt, SYSTEM_PROMPTS, AIMode, ISSUE_DETECTION_PROMPT
     from reasoning import IssueDetector, ConfidenceScorer, ResponseValidator
     from rag_advanced import AdvancedCodeChunker, SmartRetriever, ContextBuilder
     MODULES_AVAILABLE = True
@@ -96,6 +97,122 @@ if not PROTOBUF_AVAILABLE:
 SERVICE_VERSION = "0.1.0"
 GRPC_HOST = os.getenv("GRPC_HOST", "127.0.0.1")
 GRPC_PORT = int(os.getenv("GRPC_PORT", "50051"))
+
+# ============================================================================
+# PROMPT TEMPLATE LOADER (Tasks 6.1 - 6.4)
+# ============================================================================
+
+class PromptTemplateLoader:
+    """Loads and watches .kiro/prompts/*.md files, reloading within 5 seconds of changes."""
+
+    MAX_TEMPLATE_CHARS = 8000
+    POLL_INTERVAL = 5  # seconds
+
+    def __init__(self, prompts_dir: str):
+        self.prompts_dir = prompts_dir
+        self._templates: Dict[str, str] = {}
+        self._mtimes: Dict[str, float] = {}
+        self._watcher_task: Optional[asyncio.Task] = None
+
+    def load_all(self) -> None:
+        """Scan and load all .md files from the prompts directory at startup."""
+        if not os.path.isdir(self.prompts_dir):
+            logger.info(f"[PromptTemplates] Directory not found: {self.prompts_dir}")
+            return
+        for fname in os.listdir(self.prompts_dir):
+            if fname.endswith(".md"):
+                self._load_file(fname)
+
+    def _load_file(self, fname: str) -> None:
+        """Load a single template file, validating UTF-8 and size."""
+        fpath = os.path.join(self.prompts_dir, fname)
+        stem = fname[:-3]  # strip .md
+        try:
+            with open(fpath, "rb") as f:
+                raw = f.read()
+            try:
+                content = raw.decode("utf-8")
+            except UnicodeDecodeError:
+                logger.warning(f"[PromptTemplates] WARNING: Skipping {fname}: invalid UTF-8")
+                return
+            if len(content) > self.MAX_TEMPLATE_CHARS:
+                logger.warning(
+                    f"[PromptTemplates] WARNING: Skipping {fname}: "
+                    f"file is {len(content)} chars (max {self.MAX_TEMPLATE_CHARS})"
+                )
+                return
+            self._templates[stem] = content
+            self._mtimes[fname] = os.path.getmtime(fpath)
+            logger.info(f"[PromptTemplates] Loaded template: {stem}")
+        except FileNotFoundError:
+            pass
+        except Exception as e:
+            logger.warning(f"[PromptTemplates] WARNING: Skipping {fname}: {e}")
+
+    def get(self, name: str) -> Optional[str]:
+        """Return a loaded template by stem name, or None if not loaded."""
+        return self._templates.get(name)
+
+    def get_system_prompt(self, mode: str) -> str:
+        """
+        Resolve system prompt for a mode using the template resolution order:
+        1. default.md prepended (if present)
+        2. <mode>.md overrides built-in (if present)
+        3. Built-in SYSTEM_PROMPTS[mode] as fallback
+        """
+        parts: List[str] = []
+        default_tpl = self._templates.get("default")
+        if default_tpl:
+            parts.append(default_tpl)
+
+        mode_tpl = self._templates.get(mode)
+        if mode_tpl:
+            parts.append(mode_tpl)
+            return "\n\n".join(parts)
+
+        # Fall back to built-in
+        if MODULES_AVAILABLE:
+            builtin = get_system_prompt(mode)
+        else:
+            builtin = "You are a helpful AI assistant."
+        parts.append(builtin)
+        return "\n\n".join(parts)
+
+    async def _watch_loop(self) -> None:
+        """Periodically poll the prompts directory for changes."""
+        while True:
+            await asyncio.sleep(self.POLL_INTERVAL)
+            if not os.path.isdir(self.prompts_dir):
+                continue
+            try:
+                current_files = {f for f in os.listdir(self.prompts_dir) if f.endswith(".md")}
+                for fname in current_files:
+                    fpath = os.path.join(self.prompts_dir, fname)
+                    try:
+                        mtime = os.path.getmtime(fpath)
+                    except OSError:
+                        continue
+                    if self._mtimes.get(fname) != mtime:
+                        logger.info(f"[PromptTemplates] Reloading changed template: {fname}")
+                        self._load_file(fname)
+            except Exception as e:
+                logger.warning(f"[PromptTemplates] Watch loop error: {e}")
+
+    def start_watcher(self) -> None:
+        """Start the background asyncio polling task."""
+        try:
+            loop = asyncio.get_event_loop()
+            self._watcher_task = loop.create_task(self._watch_loop())
+        except RuntimeError:
+            pass  # No running event loop yet; watcher will be started later
+
+
+# Global template loader — initialized in run_server() with the project root
+_template_loader: Optional[PromptTemplateLoader] = None
+
+
+def _get_template_loader() -> Optional[PromptTemplateLoader]:
+    return _template_loader
 
 class ModelConfig(BaseModel):
     """Configuration for model access"""
@@ -449,6 +566,17 @@ class AnthropicProvider(LLMProvider):
             if system_parts:
                 payload["system"] = "\n\n".join(system_parts)
 
+            # Enable extended thinking when requested (Req 4.7)
+            if kwargs.get("enable_thinking", False):
+                thinking_budget = kwargs.get("thinking_budget", 5000)
+                payload["thinking"] = {
+                    "type": "enabled",
+                    "budget_tokens": thinking_budget,
+                }
+                # Extended thinking requires a higher max_tokens than the budget
+                if payload["max_tokens"] <= thinking_budget:
+                    payload["max_tokens"] = thinking_budget + 1000
+
             headers = {
                 "x-api-key": self.api_key,
                 "anthropic-version": "2023-06-01",
@@ -460,10 +588,24 @@ class AnthropicProvider(LLMProvider):
             ) as resp:
                 if resp.status == 200:
                     data = await resp.json()
-                    content = data.get("content", [])
-                    if content and isinstance(content, list):
-                        return content[0].get("text", "")
-                    return ""
+                    content_blocks = data.get("content", [])
+                    if not content_blocks:
+                        return ""
+                    # Collect thinking blocks and text blocks separately
+                    thinking_parts: List[str] = []
+                    text_parts: List[str] = []
+                    for block in content_blocks:
+                        if isinstance(block, dict):
+                            if block.get("type") == "thinking":
+                                thinking_parts.append(block.get("thinking", ""))
+                            elif block.get("type") == "text":
+                                text_parts.append(block.get("text", ""))
+                    # Wrap thinking in <thinking> tags so the frontend can parse it
+                    if thinking_parts:
+                        thinking_text = "\n".join(thinking_parts)
+                        text_text = "\n".join(text_parts)
+                        return f"<thinking>{thinking_text}</thinking>{text_text}"
+                    return "\n".join(text_parts)
                 body = await resp.text()
                 raise RuntimeError(f"Anthropic chat error {resp.status}: {body[:300]}")
         except Exception as e:
@@ -789,18 +931,35 @@ class AIServicer(AIServiceServicer if PROTOBUF_AVAILABLE else object):
             # Use advanced prompting if available
             if MODULES_AVAILABLE:
                 try:
-                    # Determine AI mode based on request context
-                    mode = AIMode.CHAT  # Default mode
-                    if "debug" in request.prompt.lower() or "bug" in request.prompt.lower():
-                        mode = AIMode.BUG_HUNT
-                    elif "analyze" in request.prompt.lower() or "review" in request.prompt.lower():
-                        mode = AIMode.CODE
-                    elif "think" in request.prompt.lower() or "reason" in request.prompt.lower():
-                        mode = AIMode.THINK
-                    elif "design" in request.prompt.lower() or "architecture" in request.prompt.lower():
-                        mode = AIMode.ARCHITECT
-                    
-                    system_prompt = get_system_prompt(mode)
+                    # Prefer explicit mode field from request, fall back to heuristics
+                    mode_str = getattr(request, "mode", "") or ""
+                    if mode_str:
+                        mode = get_system_prompt.__module__ and AIMode.CHAT  # placeholder
+                        try:
+                            mode = AIMode[mode_str.upper()] if mode_str.upper() in AIMode.__members__ else AIMode(mode_str.lower())
+                        except (KeyError, ValueError):
+                            mode = AIMode.CHAT
+                    else:
+                        # Determine AI mode based on request context
+                        mode = AIMode.CHAT  # Default mode
+                        if "debug" in request.prompt.lower() or "bug" in request.prompt.lower():
+                            mode = AIMode.BUG_HUNT
+                        elif "analyze" in request.prompt.lower() or "review" in request.prompt.lower():
+                            mode = AIMode.CODE
+                        elif "think" in request.prompt.lower() or "reason" in request.prompt.lower():
+                            mode = AIMode.THINK
+                        elif "design" in request.prompt.lower() or "architecture" in request.prompt.lower():
+                            mode = AIMode.ARCHITECT
+
+                    # Use ISSUE_DETECTION_PROMPT for bug_hunt mode (Req 5.1)
+                    if mode == AIMode.BUG_HUNT:
+                        system_prompt = ISSUE_DETECTION_PROMPT
+                    else:
+                        loader = _get_template_loader()
+                        if loader:
+                            system_prompt = loader.get_system_prompt(mode.value)
+                        else:
+                            system_prompt = get_system_prompt(mode)
                     logger.info(f"Using AI mode: {mode.value}")
                 except Exception as e:
                     logger.warning(f"Failed to get advanced prompt: {e}, using default")
@@ -821,12 +980,21 @@ class AIServicer(AIServiceServicer if PROTOBUF_AVAILABLE else object):
             try:
                 # Prepare messages with system prompt
                 enhanced_messages = [{"role": "system", "content": system_prompt}] + messages
-                
+
+                # Enable Anthropic extended thinking when provider is anthropic and mode is think (Req 4.7)
+                extra_kwargs: Dict = {}
+                if request.provider.lower() == "anthropic":
+                    mode_str = getattr(request, "mode", "") or ""
+                    if mode_str == "think" or "think" in request.prompt.lower()[:50]:
+                        extra_kwargs["enable_thinking"] = True
+                        extra_kwargs["thinking_budget"] = 5000
+
                 response = await prov.chat(
                     request.model,
                     enhanced_messages,
                     temperature=request.temperature,
-                    max_tokens=request.max_tokens
+                    max_tokens=request.max_tokens,
+                    **extra_kwargs,
                 )
             finally:
                 await prov.close()
@@ -893,9 +1061,12 @@ class AIServicer(AIServiceServicer if PROTOBUF_AVAILABLE else object):
                     elif "analyze" in request.prompt.lower() or "review" in request.prompt.lower():
                         mode = AIMode.CODE
                     
-                    system_prompt = get_system_prompt(mode)
-                    logger.info(f"Streaming with AI mode: {mode.value}")
-                except Exception as e:
+                    loader = _get_template_loader()
+                    if loader:
+                        system_prompt = loader.get_system_prompt(mode.value)
+                    else:
+                        system_prompt = get_system_prompt(mode)
+                    logger.info(f"Streaming with AI mode: {mode.value}")                except Exception as e:
                     logger.warning(f"Failed to get advanced prompt: {e}")
             
             # Get the provider
@@ -963,7 +1134,15 @@ async def run_server():
         raise RuntimeError("grpcio is not installed. Run: python3 -m pip install -r requirements.txt")
     if not PROTOBUF_AVAILABLE:
         raise RuntimeError("Protobuf code not generated. Run: python3 -m grpc_tools.protoc -I. --python_out=. --grpc_python_out=. ai_service.proto")
-    
+
+    # Initialize prompt template loader (Tasks 6.1, 6.2)
+    global _template_loader
+    project_root = os.getenv("KIRO_PROJECT_ROOT", os.getcwd())
+    prompts_dir = os.path.join(project_root, ".kiro", "prompts")
+    _template_loader = PromptTemplateLoader(prompts_dir)
+    _template_loader.load_all()
+    _template_loader.start_watcher()
+
     servicer = AIServicer()
     await servicer.initialize_providers()
     

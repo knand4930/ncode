@@ -48,10 +48,16 @@ pub fn run() {
             ai::grpc_ai_chat,
             ai::grpc_health_check,
             ai::grpc_fetch_models,
+            ai::grpc_stream_chat,
             ai::start_grpc_service,
+            ai::ollama_chat_stream,
+            ai::run_agent_task,
             // LSP
             lsp::start_lsp,
             lsp::lsp_request,
+            // Prompt templates
+            ai::list_prompt_templates,
+            ai::save_prompt_template,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

@@ -202,6 +202,107 @@ impl GrpcAiClient {
     }
 
     /// Stream chat tokens (for real-time response)
+    pub async fn stream_chat(
+        &self,
+        app: &tauri::AppHandle,
+        message_id: String,
+        model: impl Into<String>,
+        messages: Vec<ChatMessage>,
+        provider: impl Into<String>,
+        api_key: Option<String>,
+        temperature: Option<f32>,
+        max_tokens: Option<i32>,
+    ) -> Result<(), GrpcError> {
+        use tauri::Emitter;
+
+        if !self.is_connected().await {
+            self.connect().await?;
+        }
+
+        let proto_messages: Vec<ProtoMessage> = messages
+            .into_iter()
+            .map(|msg| ProtoMessage {
+                role: msg.role,
+                content: msg.content,
+            })
+            .collect();
+
+        // StreamChat uses the same ChatRequest as Chat
+        let request = ProtoChatRequest {
+            model: model.into(),
+            prompt: String::new(),
+            history: proto_messages,
+            provider: provider.into(),
+            api_key: api_key.unwrap_or_default(),
+            temperature: temperature.unwrap_or(0.7),
+            max_tokens: max_tokens.unwrap_or(2000),
+        };
+
+        #[derive(Clone, serde::Serialize)]
+        struct StreamTokenPayload {
+            #[serde(rename = "messageId")]
+            message_id: String,
+            token: String,
+        }
+
+        #[derive(Clone, serde::Serialize)]
+        struct StreamDonePayload {
+            #[serde(rename = "messageId")]
+            message_id: String,
+        }
+
+        #[derive(Clone, serde::Serialize)]
+        struct StreamErrorPayload {
+            #[serde(rename = "messageId")]
+            message_id: String,
+            error: String,
+        }
+
+        let mut inner = self.inner.lock().await;
+        if let Some(client) = inner.as_mut() {
+            let tonic_request = tonic::Request::new(request);
+            match client.stream_chat(tonic_request).await {
+                Ok(response) => {
+                    let mut stream = response.into_inner();
+                    loop {
+                        match stream.message().await {
+                            Ok(Some(token_resp)) => {
+                                if !token_resp.token.is_empty() {
+                                    let _ = app.emit("ai-stream-token", StreamTokenPayload {
+                                        message_id: message_id.clone(),
+                                        token: token_resp.token,
+                                    });
+                                }
+                                if token_resp.done {
+                                    break;
+                                }
+                            }
+                            Ok(None) => break,
+                            Err(e) => {
+                                let _ = app.emit("ai-stream-error", StreamErrorPayload {
+                                    message_id: message_id.clone(),
+                                    error: e.to_string(),
+                                });
+                                return Err(GrpcError::RequestError(e.to_string()));
+                            }
+                        }
+                    }
+                    let _ = app.emit("ai-stream-done", StreamDonePayload { message_id });
+                    Ok(())
+                }
+                Err(e) => {
+                    let _ = app.emit("ai-stream-error", StreamErrorPayload {
+                        message_id: message_id.clone(),
+                        error: e.to_string(),
+                    });
+                    Err(GrpcError::RequestError(e.to_string()))
+                }
+            }
+        } else {
+            Err(GrpcError::ConnectionError("Not connected".to_string()))
+        }
+    }
+
     /// Disconnect from the gRPC server
     pub async fn disconnect(&self) {
         let mut inner = self.inner.lock().await;

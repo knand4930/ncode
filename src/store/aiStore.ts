@@ -4,19 +4,54 @@ import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { type ProjectContext } from "../utils/projectScanner";
 import { formatErrorsForAI } from "../utils/errorParser";
+import { parseThinkingBlock } from "../utils/parseThinkingBlock";
+import { parseBugReport } from "../utils/parseBugReport";
 import { useTerminalStore } from "./terminalStore";
 
 export interface ChatMessage {
   id: string;
   role: "user" | "assistant" | "system";
   content: string;
+  thinkingContent?: string;
+  bugReport?: BugReport;
   sources?: Array<{ filePath: string; startLine: number; endLine: number }>;
   timestamp: number;
   model?: string;
   provider?: "ollama" | "openai" | "anthropic" | "groq" | "airllm" | "vllm";
   isStreaming?: boolean;
   tokens?: number;
+  isError?: boolean;        // marks error/timeout messages
+  isIncomplete?: boolean;   // stream was cut off
+  retryContent?: string;    // original user message to re-send on retry
 }
+
+export interface BugReport {
+  bugs: BugEntry[];
+  summary: { critical: number; high: number; medium: number; low: number };
+}
+
+export interface BugEntry {
+  filePath: string;
+  line: number;
+  severity: 'critical' | 'high' | 'medium' | 'low';
+  description: string;
+  fix: string;
+}
+
+export interface AgentFileChange {
+  path: string;
+  originalContent?: string;
+  action: string;
+}
+
+export interface MentionedFile {
+  path: string;
+  content: string;
+  truncated: boolean;
+}
+
+const MENTION_FILE_LIMIT = 5;
+const MENTION_CHAR_LIMIT = 6000;
 
 export type AIMode = "chat" | "think" | "agent" | "bug_hunt" | "architect";
 export type AIServiceMode = "direct" | "grpc";
@@ -197,6 +232,12 @@ function debouncedSaveChatHistory(messages: ChatMessage[]) {
   }, 300);
 }
 
+// Structured error logging (Req 12.6)
+function logAIError(errorType: string, message: string) {
+  const ts = new Date().toISOString();
+  console.error(`[AI_Store] ${ts} ${errorType}: ${message}`);
+}
+
 const persisted = loadAISettings();
 
 interface AIStore {
@@ -239,6 +280,17 @@ interface AIStore {
   activeSessionId: string | null;
   showSessionList: boolean;
 
+  // Abort controller for in-flight requests (Task 1.1)
+  abortController: AbortController | null;
+  // Reconnect state (Task 1.2 / 12.2)
+  reconnectAttempts: number;
+
+  // Agent change history for rollback (Task 3.6)
+  aiChangeHistory: AgentFileChange[];
+
+  // @-mention context (Task 7)
+  mentionedFiles: MentionedFile[];
+
   checkOllama: () => Promise<void>;
   startOllama: () => Promise<void>;
   toggleOllamaModel: (model: string) => void;
@@ -255,12 +307,22 @@ interface AIStore {
   fetchAnthropicModels: (index?: number) => Promise<void>;
   fetchGroqModels: (index?: number) => Promise<void>;
   sendMessage: (content: string, activeFileContext?: string) => Promise<void>;
+  abortRequest: () => void;
+  retryLastMessage: () => Promise<void>;
+  recordAgentChanges: (changes: AgentFileChange[]) => void;
+  rollbackAgentChanges: () => Promise<void>;
+  runAgentTask: (content: string) => Promise<void>;
+  // @-mention actions (Task 7)
+  addMentionedFile: (path: string) => Promise<{ ok: boolean; reason?: string }>;
+  removeMentionedFile: (path: string) => void;
+  clearMentionedFiles: () => void;
   clearChat: () => void;
   newChat: () => void;
   switchSession: (id: string) => void;
   deleteSession: (id: string) => void;
   toggleSessionList: () => void;
   addStreamToken: (messageId: string, token: string) => void;
+  initStreamingMessage: (messageId: string, model?: string) => void;
   updateMessage: (id: string, content: string, metadata?: Partial<ChatMessage>) => void;
   indexCodebase: (path: string) => Promise<void>;
   toggleRAG: () => void;
@@ -312,6 +374,12 @@ export const useAIStore = create<AIStore>((set, get) => ({
   sessions: loadSessions(),
   activeSessionId: loadSessions()[0]?.id ?? null,
   showSessionList: false,
+
+  abortController: null,
+  reconnectAttempts: 0,
+
+  aiChangeHistory: [],
+  mentionedFiles: [],
 
   setProjectContext: (ctx) => set({ projectContext: ctx }),
 
@@ -709,6 +777,32 @@ export const useAIStore = create<AIStore>((set, get) => ({
       return { chatHistory: updated, isThinking: true };
     });
 
+    // ── 90-second watchdog timer (Req 12.4) ──────────────────────────────
+    const watchdogTimer = setTimeout(() => {
+      const state = get();
+      if (state.isThinking) {
+        logAIError("WATCHDOG_TIMEOUT", "isThinking stuck for 90s — auto-resetting");
+        const timeoutMsg: ChatMessage = {
+          id: `msg-${Date.now()}-watchdog`,
+          role: "assistant",
+          content: "Request timed out after 90 seconds. The AI service may be unresponsive. Please try again.",
+          timestamp: Date.now(),
+          isError: true,
+          retryContent: content,
+        };
+        set((s) => {
+          const updated = [...s.chatHistory, timeoutMsg];
+          saveChatHistory(updated);
+          get()._syncSessionMessages(updated);
+          return { chatHistory: updated, isThinking: false, abortController: null };
+        });
+      }
+    }, 90_000);
+
+    // ── AbortController for in-flight requests (Req 1.7) ─────────────────
+    const controller = new AbortController();
+    set({ abortController: controller });
+
     try {
       let response: string | undefined;
       let sources: ChatMessage["sources"] = undefined;
@@ -725,6 +819,17 @@ export const useAIStore = create<AIStore>((set, get) => ({
       const { lastErrors } = useTerminalStore.getState();
       if (lastErrors && lastErrors.length > 0) {
         ctxString += `\n\n${formatErrorsForAI(lastErrors)}`;
+      }
+
+      // Inject @-mentioned files into context (Req 7.2, 7.4, 7.5)
+      const { mentionedFiles } = get();
+      if (mentionedFiles.length > 0) {
+        const fileBlocks = mentionedFiles.map(f => {
+          const ext = f.path.split(".").pop() || "text";
+          const truncNote = f.truncated ? "\n// [truncated at 6000 chars]" : "";
+          return `\`\`\`${ext}\n// ${f.path}${truncNote}\n${f.content}\n\`\`\``;
+        }).join("\n\n");
+        ctxString += `\n\n[MENTIONED FILES]\n${fileBlocks}`;
       }
 
       const modeContext =
@@ -768,18 +873,23 @@ export const useAIStore = create<AIStore>((set, get) => ({
         const hint = invalidOllamaModels.length > 0
           ? `Previously selected model(s) [${invalidOllamaModels.join(", ")}] are not installed. Available: ${availableModels.join(", ") || "none — is Ollama running?"}`
           : "No AI models selected. Please configure a model in Settings.";
+        logAIError("NO_MODEL", hint);
         set((s) => ({
           chatHistory: [
             ...s.chatHistory,
             {
               id: `msg-${Date.now()}-error`,
               role: "assistant",
-              content: `Error: ${hint}`,
+              content: hint,
               timestamp: Date.now(),
+              isError: true,
+              retryContent: content,
             },
           ],
           isThinking: false,
+          abortController: null,
         }));
+        clearTimeout(watchdogTimer);
         return;
       }
 
@@ -906,16 +1016,30 @@ export const useAIStore = create<AIStore>((set, get) => ({
           return { res, sourcesToAttach, am };
         };
 
-        // Race: only the fastest model's response is shown
-        const { res, sourcesToAttach, am: winner } = await Promise.race(
-          activeModels.map(makeModelPromise)
+        // Race: fastest model wins; also race against 60-second timeout (Req 1.4)
+        const timeoutPromise = new Promise<never>((_, reject) =>
+          setTimeout(() => reject(new Error("REQUEST_TIMEOUT")), 60_000)
         );
+        const { res, sourcesToAttach, am: winner } = await Promise.race([
+          ...activeModels.map(makeModelPromise),
+          timeoutPromise,
+        ]);
         response = res;
+
+        // Parse <thinking> block for think mode (Req 4.2 / Property 5)
+        const { thinkingContent, content: parsedContent } = aiMode === "think"
+          ? parseThinkingBlock(res)
+          : { thinkingContent: undefined, content: res };
+
+        // Parse structured bug report for bug_hunt mode (Req 5.2)
+        const bugReport = aiMode === "bug_hunt" ? parseBugReport(res) : undefined;
 
         const assistantMsg: ChatMessage = {
           id: `msg-${Date.now()}-${winner.model}`,
           role: "assistant",
-          content: res,
+          content: parsedContent,
+          thinkingContent,
+          bugReport,
           sources: sourcesToAttach,
           timestamp: Date.now(),
           model: winner.model,
@@ -938,7 +1062,10 @@ export const useAIStore = create<AIStore>((set, get) => ({
         if (unlisten) unlisten();
       }
 
-      set({ isThinking: false });
+      clearTimeout(watchdogTimer);
+      set({ isThinking: false, abortController: null });
+      // Clear @-mentions after successful send
+      set({ mentionedFiles: [] });
 
       // Autonomous Agent Loop logic: only take action for single model responses (for now) or update differently if needed.
       // Currently, it gets tricky to run agent loops automatically when multiple models might try to execute the same command concurrently.
@@ -984,6 +1111,22 @@ export const useAIStore = create<AIStore>((set, get) => ({
       }
 
     } catch (e: any) {
+      clearTimeout(watchdogTimer);
+      // Abort any in-flight request
+      controller.abort();
+
+      const isTimeout = e?.message === "REQUEST_TIMEOUT";
+      const isAborted = e?.name === "AbortError" || controller.signal.aborted;
+
+      if (isAborted && !isTimeout) {
+        // User manually aborted — just reset state, no error message
+        set({ isThinking: false, abortController: null });
+        return;
+      }
+
+      const errorType = isTimeout ? "REQUEST_TIMEOUT" : "SEND_ERROR";
+      logAIError(errorType, String(e));
+
       if (shouldUseAgenticReview) {
         set((s) => ({
           agentEvents: [
@@ -992,11 +1135,18 @@ export const useAIStore = create<AIStore>((set, get) => ({
           ],
         }));
       }
+
+      const errorContent = isTimeout
+        ? "Request timed out after 60 seconds. The AI service did not respond in time."
+        : `Error: ${e.toString()}. Make sure your LLM service is configured correctly.`;
+
       const errMsg: ChatMessage = {
         id: `msg-${Date.now()}`,
         role: "assistant",
-        content: `Error: ${e.toString()}. Make sure your LLM service is configured correctly.`,
+        content: errorContent,
         timestamp: Date.now(),
+        isError: true,
+        retryContent: content,
         provider: selectedProvider === "ollama" ? "ollama" : (apiKeys[selectedApiKeyIndices[0]]?.provider as "openai" | "anthropic" | "groq" | "airllm" | "vllm" | undefined) || "openai",
         model: selectedProvider === "ollama" ? selectedOllamaModels[0] : apiKeys[selectedApiKeyIndices[0]]?.model,
       };
@@ -1004,18 +1154,85 @@ export const useAIStore = create<AIStore>((set, get) => ({
         const isDuplicate = s.chatHistory.some(m => m.role === errMsg.role && m.content === errMsg.content && (Date.now() - m.timestamp < 3000));
         const updated = isDuplicate ? s.chatHistory : [...s.chatHistory, errMsg];
         if (!isDuplicate) saveChatHistory(updated);
-        return { chatHistory: updated, isThinking: false };
+        return { chatHistory: updated, isThinking: false, abortController: null };
       });
+    }
+  },
+
+  // Abort in-flight request (Req 1.7) — must complete within 200ms
+  abortRequest: () => {
+    const { abortController } = get();
+    if (abortController) {
+      abortController.abort();
+    }
+    set({ isThinking: false, abortController: null });
+  },
+
+  // Re-send the last user message from an error message's retryContent (Req 1.5)
+  retryLastMessage: async () => {
+    const { chatHistory } = get();
+    // Find the last error message with retryContent
+    for (let i = chatHistory.length - 1; i >= 0; i--) {
+      const msg = chatHistory[i];
+      if (msg.isError && msg.retryContent) {
+        // Remove the error message before retrying
+        const withoutError = chatHistory.filter((_, idx) => idx !== i);
+        // Also remove the user message that preceded it if it matches
+        const cleaned = withoutError.filter(
+          (m, idx) => !(m.role === "user" && m.content === msg.retryContent && idx === withoutError.length - 1)
+        );
+        set({ chatHistory: cleaned });
+        saveChatHistory(cleaned);
+        await get().sendMessage(msg.retryContent);
+        return;
+      }
     }
   },
 
   addStreamToken: (messageId: string, token: string) => {
     set((s) => {
-      const updated = s.chatHistory.map((m) =>
-        m.id === messageId ? { ...m, content: m.content + token } : m
-      );
+      const updated = s.chatHistory.map((m) => {
+        if (m.id !== messageId) return m;
+
+        // If we're in think mode, route tokens to thinkingContent while inside
+        // the <thinking> block, then to content once the block closes.
+        const combined = (m.thinkingContent !== undefined ? `<thinking>${m.thinkingContent}</thinking>` : "") + m.content + token;
+        const inThinkingBlock = combined.includes("<thinking>") && !combined.includes("</thinking>");
+
+        if (inThinkingBlock) {
+          // Still accumulating thinking content — strip the opening tag
+          const inner = combined.replace(/^<thinking>/, "");
+          return { ...m, thinkingContent: inner };
+        }
+
+        if (combined.includes("<thinking>") && combined.includes("</thinking>")) {
+          // Block is now closed — parse it properly
+          const { thinkingContent, content } = parseThinkingBlock(combined);
+          return { ...m, thinkingContent, content };
+        }
+
+        // No thinking block — just append to content
+        return { ...m, content: m.content + token };
+      });
       debouncedSaveChatHistory(updated);
       return { chatHistory: updated };
+    });
+  },
+
+  initStreamingMessage: (messageId: string, model?: string) => {
+    const placeholder: ChatMessage = {
+      id: messageId,
+      role: "assistant",
+      content: "",
+      timestamp: Date.now(),
+      isStreaming: true,
+      model,
+    };
+    set((s) => {
+      const updated = [...s.chatHistory, placeholder];
+      debouncedSaveChatHistory(updated);
+      get()._syncSessionMessages(updated);
+      return { chatHistory: updated, isStreaming: true, streamingMessageId: messageId };
     });
   },
 
@@ -1139,38 +1356,49 @@ export const useAIStore = create<AIStore>((set, get) => ({
 
     try {
       const prompt = `Complete this ${language} code (output only the completion, no explanation):\n\`\`\`${language}\n${code}`;
-      if (selectedProvider === "ollama") {
-        const model = selectedOllamaModels[0] || "";
-        const result = await invoke<string>("ollama_complete", {
-          model,
-          prompt,
-          maxTokens: 100,
-          baseUrl: ollamaBaseUrl,
-        });
-        return result.trim();
-      } else if (selectedProvider === "api" && selectedApiKeyIndices.length > 0) {
-        const keyEntry = apiKeys[selectedApiKeyIndices[0]];
-        const result =
-          aiServiceMode === "grpc"
-            ? await invoke<string>("grpc_ai_chat", {
-              provider: keyEntry.provider,
-              apiKey: keyEntry.apiKey,
-              model: keyEntry.model,
-              messages: [{ role: "user", content: prompt }],
-              temperature: 0.1,
-              maxTokens: 120,
-            })
-            : await invoke<string>("api_complete", {
-              provider: keyEntry.provider,
-              apiKey: keyEntry.apiKey,
-              model: keyEntry.model,
-              prompt,
-              maxTokens: 100,
-            });
-        return result.trim();
-      }
-      return "";
+
+      // 3-second timeout — silently dismiss on failure (Req 8.7)
+      const timeoutPromise = new Promise<string>((_, reject) =>
+        setTimeout(() => reject(new Error("INLINE_COMPLETION_TIMEOUT")), 3000)
+      );
+
+      const completionPromise = (async (): Promise<string> => {
+        if (selectedProvider === "ollama") {
+          const model = selectedOllamaModels[0] || "";
+          const result = await invoke<string>("ollama_complete", {
+            model,
+            prompt,
+            maxTokens: 100,
+            baseUrl: ollamaBaseUrl,
+          });
+          return result.trim();
+        } else if (selectedProvider === "api" && selectedApiKeyIndices.length > 0) {
+          const keyEntry = apiKeys[selectedApiKeyIndices[0]];
+          const result =
+            aiServiceMode === "grpc"
+              ? await invoke<string>("grpc_ai_chat", {
+                provider: keyEntry.provider,
+                apiKey: keyEntry.apiKey,
+                model: keyEntry.model,
+                messages: [{ role: "user", content: prompt }],
+                temperature: 0.1,
+                maxTokens: 120,
+              })
+              : await invoke<string>("api_complete", {
+                provider: keyEntry.provider,
+                apiKey: keyEntry.apiKey,
+                model: keyEntry.model,
+                prompt,
+                maxTokens: 100,
+              });
+          return result.trim();
+        }
+        return "";
+      })();
+
+      return await Promise.race([completionPromise, timeoutPromise]);
     } catch {
+      // Silently dismiss on timeout or any error (Req 8.7)
       return "";
     }
   },
@@ -1190,4 +1418,163 @@ export const useAIStore = create<AIStore>((set, get) => ({
       return { indexDirty: true };
     }),
 
+  recordAgentChanges: (changes) => {
+    set((s) => ({ aiChangeHistory: [...s.aiChangeHistory, ...changes] }));
+  },
+
+  rollbackAgentChanges: async () => {
+    const { aiChangeHistory } = get();
+    for (const change of [...aiChangeHistory].reverse()) {
+      try {
+        if (change.action === 'delete' && change.originalContent !== undefined) {
+          await invoke('write_file', { path: change.path, content: change.originalContent });
+        } else if (change.action === 'create') {
+          await invoke('delete_file', { path: change.path });
+        } else if (change.action === 'write' && change.originalContent !== undefined) {
+          await invoke('write_file', { path: change.path, content: change.originalContent });
+        }
+      } catch (e) {
+        logAIError('ROLLBACK_ERROR', String(e));
+      }
+    }
+    set({ aiChangeHistory: [] });
+  },
+
+  // @-mention: add a file to the mention context (Property 6 — truncate at 6000 chars)
+  addMentionedFile: async (path: string) => {
+    const { mentionedFiles } = get();
+    // Enforce 5-file limit (Req 7.3)
+    if (mentionedFiles.length >= MENTION_FILE_LIMIT) {
+      return { ok: false, reason: `Limit of ${MENTION_FILE_LIMIT} file mentions reached.` };
+    }
+    // Avoid duplicates
+    if (mentionedFiles.some(f => f.path === path)) {
+      return { ok: true };
+    }
+    try {
+      const raw: string = await invoke("read_file", { path });
+      const truncated = raw.length > MENTION_CHAR_LIMIT;
+      const content = truncated ? raw.slice(0, MENTION_CHAR_LIMIT) : raw;
+      set(s => ({ mentionedFiles: [...s.mentionedFiles, { path, content, truncated }] }));
+      return { ok: true };
+    } catch (e) {
+      logAIError("MENTION_FILE_READ", String(e));
+      return { ok: false, reason: `Could not read file: ${String(e)}` };
+    }
+  },
+
+  removeMentionedFile: (path: string) => {
+    set(s => ({ mentionedFiles: s.mentionedFiles.filter(f => f.path !== path) }));
+  },
+
+  clearMentionedFiles: () => {
+    set({ mentionedFiles: [] });
+  },
+
+  runAgentTask: async (content) => {
+    const { selectedOllamaModels, openFolder, chatHistory } = get();
+    const model = selectedOllamaModels[0] || '';
+    if (!model || !openFolder) return;
+
+    const userMsg: ChatMessage = {
+      id: `user-${Date.now()}`,
+      role: 'user',
+      content,
+      timestamp: Date.now(),
+    };
+    set((s) => ({ chatHistory: [...s.chatHistory, userMsg], isThinking: true }));
+
+    try {
+      const messages = [...chatHistory, userMsg].map(m => ({ role: m.role, content: m.content }));
+      const resultJson = await invoke<string>('run_agent_task', {
+        model,
+        messages,
+        projectRoot: openFolder,
+        maxSteps: 20,
+      });
+      const result = JSON.parse(resultJson) as { summary: string; changes: AgentFileChange[] };
+      get().recordAgentChanges(result.changes);
+      const assistantMsg: ChatMessage = {
+        id: `assistant-${Date.now()}`,
+        role: 'assistant',
+        content: result.summary,
+        timestamp: Date.now(),
+        model,
+      };
+      set((s) => ({ chatHistory: [...s.chatHistory, assistantMsg], isThinking: false }));
+    } catch (e) {
+      logAIError('AGENT_ERROR', String(e));
+      const errMsg: ChatMessage = {
+        id: `error-${Date.now()}`,
+        role: 'assistant',
+        content: `Agent error: ${String(e)}`,
+        timestamp: Date.now(),
+        isError: true,
+      };
+      set((s) => ({ chatHistory: [...s.chatHistory, errMsg], isThinking: false }));
+    }
+  },
+
 }));
+
+// Set up Tauri event listeners for real-time token streaming
+// These run once at module load time and wire the store to Tauri events
+(async () => {
+  try {
+    await listen<{ messageId: string; token: string }>("ai-stream-token", (event) => {
+      const { messageId, token } = event.payload;
+      useAIStore.getState().addStreamToken(messageId, token);
+    });
+
+    await listen<{ messageId: string }>("ai-stream-done", (event) => {
+      const { messageId } = event.payload;
+      useAIStore.setState((s) => {
+        const updated = s.chatHistory.map((m) =>
+          m.id === messageId ? { ...m, isStreaming: false } : m
+        );
+        saveChatHistory(updated);
+        return {
+          chatHistory: updated,
+          isStreaming: false,
+          streamingMessageId: null,
+          isThinking: false,
+        };
+      });
+    });
+
+    await listen<{ messageId: string; error: string }>("ai-stream-error", (event) => {
+      const { messageId, error } = event.payload;
+      useAIStore.setState((s) => {
+        const updated = s.chatHistory.map((m) =>
+          m.id === messageId
+            ? { ...m, isStreaming: false, isIncomplete: true, isError: true }
+            : m
+        );
+        // If no message with that id exists yet, add an error message
+        const found = updated.some((m) => m.id === messageId);
+        const final = found
+          ? updated
+          : [
+              ...updated,
+              {
+                id: messageId,
+                role: "assistant" as const,
+                content: `Stream error: ${error}`,
+                timestamp: Date.now(),
+                isError: true,
+                isIncomplete: true,
+              },
+            ];
+        saveChatHistory(final);
+        return {
+          chatHistory: final,
+          isStreaming: false,
+          streamingMessageId: null,
+          isThinking: false,
+        };
+      });
+    });
+  } catch {
+    // Tauri event listeners may fail in non-Tauri environments (e.g. tests)
+  }
+})();

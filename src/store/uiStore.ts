@@ -52,6 +52,7 @@ interface UIStore {
   multiCursorModifier: "alt" | "ctrlCmd";
   formatOnSave: boolean;
   autoSave: boolean;
+  inlineCompletionsEnabled: boolean;
   toasts: Toast[];
 
   setActiveView: (view: SidebarView) => void;
@@ -78,6 +79,7 @@ interface UIStore {
   toggleMultiCursorModifier: () => void;
   setFormatOnSave: (enabled: boolean) => void;
   setAutoSave: (enabled: boolean) => void;
+  setInlineCompletionsEnabled: (enabled: boolean) => void;
 
   addToast: (message: string, type?: ToastType) => void;
   removeToast: (id: string) => void;
@@ -109,6 +111,7 @@ export const useUIStore = create<UIStore>()(
       multiCursorModifier: "alt",
       formatOnSave: true,
       autoSave: true,
+      inlineCompletionsEnabled: true,
       toasts: [],
 
       setActiveView: (view) => set({ activeView: view }),
@@ -136,6 +139,7 @@ export const useUIStore = create<UIStore>()(
         set((s) => ({ multiCursorModifier: s.multiCursorModifier === "alt" ? "ctrlCmd" : "alt" })),
       setFormatOnSave: (formatOnSave) => set({ formatOnSave }),
       setAutoSave: (autoSave) => set({ autoSave }),
+      setInlineCompletionsEnabled: (inlineCompletionsEnabled) => set({ inlineCompletionsEnabled }),
 
       addToast: (message, type = "info") => {
         const id = Math.random().toString(36).substring(2, 9);
@@ -155,6 +159,7 @@ export const useUIStore = create<UIStore>()(
         minimapEnabled: state.minimapEnabled,
         formatOnSave: state.formatOnSave,
         autoSave: state.autoSave,
+        inlineCompletionsEnabled: state.inlineCompletionsEnabled,
       }),
     }
   )

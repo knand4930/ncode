@@ -59,6 +59,8 @@ export function SettingsPanel() {
     setAutoSave,
     minimapEnabled,
     setMinimapEnabled,
+    inlineCompletionsEnabled,
+    setInlineCompletionsEnabled,
   } = useUIStore();
   const [selectedTab, setSelectedTab] = useState("editor");
 
@@ -213,6 +215,17 @@ export function SettingsPanel() {
                   onChange={(e) => setAutoSave(e.target.checked)}
                 />{" "}
                 Auto Save
+              </label>
+            </div>
+
+            <div className="setting-item">
+              <label>
+                <input
+                  type="checkbox"
+                  checked={inlineCompletionsEnabled}
+                  onChange={(e) => setInlineCompletionsEnabled(e.target.checked)}
+                />{" "}
+                Inline AI Completions
               </label>
             </div>
           </div>

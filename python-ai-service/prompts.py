@@ -285,15 +285,33 @@ Issues to look for:
 - Security vulnerabilities
 - Memory leaks or inefficient allocations
 
-For each issue:
-1. Location (file:line)
-2. Type of issue
-3. Severity (critical/high/medium/low)
-4. Description of the problem
-5. Example of how it could fail
-6. Recommended fix
+You MUST respond with a JSON bug report followed by a markdown explanation.
 
-Format as a structured bug report."""
+The JSON block MUST appear first, wrapped in ```json ... ``` fences, with this exact structure:
+```json
+{
+  "bugs": [
+    {
+      "filePath": "src/example.ts",
+      "line": 42,
+      "severity": "high",
+      "description": "Unhandled promise rejection can crash the process",
+      "fix": "Add try/catch around the async call"
+    }
+  ],
+  "summary": {
+    "critical": 0,
+    "high": 1,
+    "medium": 0,
+    "low": 0
+  }
+}
+```
+
+Severity values MUST be one of: critical, high, medium, low.
+If no bugs are found, return an empty bugs array with all summary counts set to 0.
+
+After the JSON block, provide a markdown explanation of each bug with reproduction steps."""
 
 # ============================================================================
 # HELPER FUNCTIONS

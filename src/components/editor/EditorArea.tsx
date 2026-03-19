@@ -36,6 +36,7 @@ export function EditorArea() {
     toggleTerminal,
     toggleQuickOpen,
     toggleCommandPalette,
+    inlineCompletionsEnabled,
   } = useUIStore();
   const { getInlineCompletion, isOllamaRunning, setOpenFolder: setAIOpenFolder } = useAIStore();
   const { runCommandInTerminal, lastErrors } = useTerminalStore();
@@ -223,53 +224,58 @@ export function EditorArea() {
       run: () => editor.getAction("editor.action.quickCommand")?.run(),
     });
 
-    // Register AI inline completion provider
-    if (isOllamaRunning) {
-      monaco.languages.registerInlineCompletionsProvider("*", {
-        provideInlineCompletions: async (model, position) => {
-          // Debounce
-          if (completionTimeout.current) clearTimeout(completionTimeout.current);
+    // Register AI inline completion provider (Req 8.1)
+    // Always register the provider; it checks inlineCompletionsEnabled at call time
+    monaco.languages.registerInlineCompletionsProvider("*", {
+      provideInlineCompletions: async (model, position) => {
+        // Gate on setting (Req 8.6)
+        if (!useUIStore.getState().inlineCompletionsEnabled) {
+          return { items: [] };
+        }
 
-          return new Promise((resolve) => {
-            completionTimeout.current = setTimeout(async () => {
-              const lineContent = model.getValueInRange({
-                startLineNumber: Math.max(1, position.lineNumber - 20),
-                startColumn: 1,
-                endLineNumber: position.lineNumber,
-                endColumn: position.column,
-              });
+        // 600ms debounce (Req 8.1, 8.5)
+        if (completionTimeout.current) clearTimeout(completionTimeout.current);
 
-              if (lineContent.trim().length < 5) {
-                resolve({ items: [] });
-                return;
-              }
+        return new Promise((resolve) => {
+          completionTimeout.current = setTimeout(async () => {
+            const lineContent = model.getValueInRange({
+              startLineNumber: Math.max(1, position.lineNumber - 20),
+              startColumn: 1,
+              endLineNumber: position.lineNumber,
+              endColumn: position.column,
+            });
 
-              const lang = model.getLanguageId() || "plaintext";
-              const completion = await getInlineCompletion(lineContent, lang);
+            if (lineContent.trim().length < 5) {
+              resolve({ items: [] });
+              return;
+            }
 
-              if (completion) {
-                resolve({
-                  items: [
-                    {
-                      insertText: completion,
-                      range: {
-                        startLineNumber: position.lineNumber,
-                        startColumn: position.column,
-                        endLineNumber: position.lineNumber,
-                        endColumn: position.column,
-                      },
+            const lang = model.getLanguageId() || "plaintext";
+            // getInlineCompletion handles 3s timeout and silently returns "" on failure (Req 8.7)
+            const completion = await getInlineCompletion(lineContent, lang);
+
+            if (completion) {
+              resolve({
+                items: [
+                  {
+                    insertText: completion,
+                    range: {
+                      startLineNumber: position.lineNumber,
+                      startColumn: position.column,
+                      endLineNumber: position.lineNumber,
+                      endColumn: position.column,
                     },
-                  ],
-                });
-              } else {
-                resolve({ items: [] });
-              }
-            }, 1200);
-          });
-        },
-        freeInlineCompletions: () => { },
-      });
-    }
+                  },
+                ],
+              });
+            } else {
+              resolve({ items: [] });
+            }
+          }, 600);
+        });
+      },
+      freeInlineCompletions: () => { },
+    });
 
     // Track cursor
     editor.onDidChangeCursorPosition((e) => {

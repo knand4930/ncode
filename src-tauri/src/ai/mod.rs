@@ -88,6 +88,54 @@ struct AgentAction {
     path: Option<String>,
 }
 
+/// A single tool call emitted by the agent model
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct ToolCall {
+    pub tool: String,
+    pub args: serde_json::Value,
+}
+
+/// The agent's response containing one or more tool calls
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct ToolCallResponse {
+    pub tool_calls: Vec<ToolCall>,
+}
+
+/// Payload for ai-agent-event Tauri event
+#[derive(Serialize, Clone)]
+pub struct AgentStepEvent {
+    pub step: usize,
+    pub tool: String,
+    pub args: serde_json::Value,
+    pub result: String,
+    pub ts: u64,
+}
+
+/// Payload for ai-agent-file-change Tauri event
+#[derive(Serialize, Clone)]
+pub struct AgentFileChangeEvent {
+    pub path: String,
+    pub content: String,
+    pub action: String, // "write" | "create" | "delete"
+}
+
+/// Payload for ai-agent-confirm-required Tauri event
+#[derive(Serialize, Clone)]
+pub struct AgentConfirmEvent {
+    pub confirm_id: String,
+    pub path: String,
+    pub diff: String,
+    pub tool: String, // "write_file" | "delete_file"
+}
+
+/// A recorded file change for rollback
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct AgentFileChange {
+    pub path: String,
+    pub original_content: Option<String>, // None if file was created (didn't exist)
+    pub action: String,
+}
+
 fn now_ts_millis() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -2935,6 +2983,172 @@ pub async fn start_grpc_service() -> Result<String, String> {
     ))
 }
 
+/// Streaming chat command — emits ai-stream-token, ai-stream-done, ai-stream-error events
+#[command]
+pub async fn ollama_chat_stream(
+    app: AppHandle,
+    model: String,
+    messages: Vec<OllamaChatMessage>,
+    context: Option<String>,
+    base_url: Option<String>,
+) -> Result<(), String> {
+    let message_id = format!("stream-{}", now_ts_millis());
+    let base = normalize_ollama_base(base_url.as_deref());
+
+    let mut all_messages = messages;
+    if let Some(ctx) = context {
+        all_messages.insert(0, OllamaChatMessage {
+            role: "system".to_string(),
+            content: format!(
+                "{}\n\nUse this codebase context to answer with concrete file-level guidance:\n\n{}\n\nBe precise and reference specific files/lines when helpful.",
+                LOCAL_OLLAMA_SYSTEM_PROMPT, ctx
+            ),
+        });
+    } else {
+        all_messages.insert(0, OllamaChatMessage {
+            role: "system".to_string(),
+            content: format!("{}\n\nWrite clean, practical answers for code tasks.", LOCAL_OLLAMA_SYSTEM_PROMPT),
+        });
+    }
+
+    #[derive(Clone, Serialize)]
+    struct StreamTokenPayload {
+        #[serde(rename = "messageId")]
+        message_id: String,
+        token: String,
+    }
+
+    #[derive(Clone, Serialize)]
+    struct StreamDonePayload {
+        #[serde(rename = "messageId")]
+        message_id: String,
+    }
+
+    #[derive(Clone, Serialize)]
+    struct StreamErrorPayload {
+        #[serde(rename = "messageId")]
+        message_id: String,
+        error: String,
+    }
+
+    let client = reqwest::Client::new();
+    let request = OllamaChatRequest {
+        model,
+        messages: all_messages,
+        stream: true,
+    };
+
+    let resp = match client
+        .post(format!("{}/api/chat", base))
+        .json(&request)
+        .send()
+        .await
+    {
+        Ok(r) if r.status().is_success() => r,
+        Ok(r) => {
+            let status = r.status();
+            let body = r.text().await.unwrap_or_default();
+            let _ = app.emit("ai-stream-error", StreamErrorPayload {
+                message_id,
+                error: format!("Ollama error ({}): {}", status, body_preview(body, 220)),
+            });
+            return Err("Stream request failed".to_string());
+        }
+        Err(e) => {
+            let _ = app.emit("ai-stream-error", StreamErrorPayload {
+                message_id,
+                error: format!("Connection failed: {}", e),
+            });
+            return Err(e.to_string());
+        }
+    };
+
+    let mut stream = resp.bytes_stream();
+    let mut buf = String::new();
+
+    while let Some(item) = stream.next().await {
+        let bytes = match item {
+            Ok(b) => b,
+            Err(e) => {
+                let _ = app.emit("ai-stream-error", StreamErrorPayload {
+                    message_id,
+                    error: format!("Stream read error: {}", e),
+                });
+                return Err(e.to_string());
+            }
+        };
+        buf.push_str(&String::from_utf8_lossy(&bytes));
+
+        while let Some(pos) = buf.find('\n') {
+            let line = buf[..pos].trim().to_string();
+            buf.drain(..=pos);
+            if line.is_empty() {
+                continue;
+            }
+            if let Ok(chunk) = serde_json::from_str::<OllamaResponse>(&line) {
+                let token = chunk
+                    .message
+                    .as_ref()
+                    .map(|m| m.content.clone())
+                    .or_else(|| chunk.response.clone())
+                    .unwrap_or_default();
+                if !token.is_empty() {
+                    let _ = app.emit("ai-stream-token", StreamTokenPayload {
+                        message_id: message_id.clone(),
+                        token,
+                    });
+                }
+                if chunk.done {
+                    let _ = app.emit("ai-stream-done", StreamDonePayload {
+                        message_id,
+                    });
+                    return Ok(());
+                }
+            }
+        }
+    }
+
+    // Stream ended without a done flag — emit done anyway
+    let _ = app.emit("ai-stream-done", StreamDonePayload { message_id });
+    Ok(())
+}
+
+/// Stream chat via gRPC — emits ai-stream-token, ai-stream-done, ai-stream-error events
+#[command]
+pub async fn grpc_stream_chat(
+    app: AppHandle,
+    model: String,
+    messages: Vec<OllamaChatMessage>,
+    provider: String,
+    api_key: Option<String>,
+    temperature: Option<f32>,
+    max_tokens: Option<i32>,
+) -> Result<(), String> {
+    use crate::grpc_client::{GrpcAiClient, ChatMessage};
+
+    let message_id = format!("grpc-stream-{}", now_ts_millis());
+    let client = GrpcAiClient::default_client();
+
+    match client.connect().await {
+        Ok(_) => {}
+        Err(e) => {
+            return Err(format!("Failed to connect to gRPC AI service: {}", e));
+        }
+    }
+
+    let chat_messages: Vec<ChatMessage> = messages
+        .into_iter()
+        .map(|m| ChatMessage { role: m.role, content: m.content })
+        .collect();
+
+    let result = client
+        .stream_chat(&app, message_id, model, chat_messages, provider, api_key, temperature, max_tokens)
+        .await;
+
+    client.disconnect().await;
+    result.map_err(|e| e.to_string())
+}
+
 /// Fetch available models from a provider via gRPC
 #[command]
 pub async fn grpc_fetch_models(
@@ -2962,4 +3176,424 @@ pub async fn grpc_fetch_models(
             Err(format!("gRPC fetch models error: {}", e))
         }
     }
+}
+
+fn parse_tool_calls(raw: &str) -> Vec<ToolCall> {
+    let json_str = extract_json_object(raw).unwrap_or_default();
+    if json_str.is_empty() {
+        return vec![];
+    }
+    // Try tool_calls array
+    if let Ok(resp) = serde_json::from_str::<ToolCallResponse>(&json_str) {
+        if !resp.tool_calls.is_empty() {
+            return resp.tool_calls;
+        }
+    }
+    // Try single tool call
+    if let Ok(tc) = serde_json::from_str::<ToolCall>(&json_str) {
+        if !tc.tool.is_empty() {
+            return vec![tc];
+        }
+    }
+    vec![]
+}
+
+fn run_agent_command(project_root: &str, cmd: &str) -> String {
+    let parts: Vec<&str> = cmd.splitn(2, ' ').collect();
+    let (prog, rest) = if parts.len() == 2 { (parts[0], parts[1]) } else { (cmd, "") };
+    let args: Vec<&str> = if rest.is_empty() { vec![] } else { rest.split_whitespace().collect() };
+
+    match std::process::Command::new(prog)
+        .args(&args)
+        .current_dir(project_root)
+        .output()
+    {
+        Ok(out) => {
+            let stdout = String::from_utf8_lossy(&out.stdout).to_string();
+            let stderr = String::from_utf8_lossy(&out.stderr).to_string();
+            if stdout.is_empty() && !stderr.is_empty() {
+                stderr
+            } else {
+                stdout
+            }
+        }
+        Err(e) => format!("Command error: {}", e),
+    }
+}
+
+fn compute_simple_diff(original: &str, new_content: &str) -> String {
+    let orig_lines: Vec<&str> = original.lines().collect();
+    let new_lines: Vec<&str> = new_content.lines().collect();
+    let mut diff = String::new();
+    let max = orig_lines.len().max(new_lines.len());
+    for i in 0..max {
+        match (orig_lines.get(i), new_lines.get(i)) {
+            (Some(o), Some(n)) if o != n => {
+                diff.push_str(&format!("- {}\n+ {}\n", o, n));
+            }
+            (Some(o), None) => diff.push_str(&format!("- {}\n", o)),
+            (None, Some(n)) => diff.push_str(&format!("+ {}\n", n)),
+            _ => {}
+        }
+    }
+    if diff.is_empty() { "(no changes)".to_string() } else { diff }
+}
+
+/// Run an agentic task with tool-call loop, step counter, and max-steps enforcement.
+/// Emits ai-agent-event, ai-agent-file-change, and ai-agent-confirm-required Tauri events.
+#[command]
+pub async fn run_agent_task(
+    app: AppHandle,
+    model: String,
+    messages: Vec<OllamaChatMessage>,
+    project_root: String,
+    max_steps: Option<usize>,
+) -> Result<String, String> {
+    use std::sync::{Arc, Mutex};
+    use tokio::sync::oneshot;
+    use tauri::Listener;
+
+    let max = max_steps.unwrap_or(20);
+    let mut history = messages.clone();
+    let mut change_history: Vec<AgentFileChange> = Vec::new();
+    let mut step = 0usize;
+
+    // System prompt for agent mode
+    let system_msg = OllamaChatMessage {
+        role: "system".to_string(),
+        content: format!(
+            "You are an autonomous coding agent. For each step, respond with a JSON object containing a 'tool_calls' array. \
+             Each tool call has 'tool' and 'args' fields. \
+             Available tools: read_file(path), write_file(path, content), create_file(path, content), \
+             delete_file(path), list_dir(path), search_code(query), run_command(cmd), finish(summary). \
+             Project root: {}. Always use relative paths.",
+            project_root
+        ),
+    };
+    if history.is_empty() || history[0].role != "system" {
+        history.insert(0, system_msg);
+    }
+
+    let base_url = OLLAMA_BASE.to_string();
+
+    loop {
+        if step >= max {
+            let partial = format!("Reached maximum steps ({}). Partial completion.", max);
+            let result = serde_json::json!({
+                "summary": partial,
+                "changes": change_history
+            });
+            return Ok(result.to_string());
+        }
+
+        // Call the model
+        let response = ollama_chat_direct(
+            &model,
+            history.clone(),
+            &base_url,
+        ).await?;
+
+        // Add assistant response to history
+        history.push(OllamaChatMessage {
+            role: "assistant".to_string(),
+            content: response.clone(),
+        });
+
+        // Parse tool calls
+        let tool_calls = parse_tool_calls(&response);
+        if tool_calls.is_empty() {
+            let result = serde_json::json!({
+                "summary": response,
+                "changes": change_history
+            });
+            return Ok(result.to_string());
+        }
+
+        let mut tool_results = Vec::new();
+
+        for tc in &tool_calls {
+            step += 1;
+            let tool_name = tc.tool.as_str();
+            let args = &tc.args;
+
+            let result_str: String = match tool_name {
+                "finish" => {
+                    let summary = args.get("summary")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("Task complete.")
+                        .to_string();
+                    let _ = app.emit("ai-agent-event", AgentStepEvent {
+                        step,
+                        tool: tool_name.to_string(),
+                        args: args.clone(),
+                        result: summary.clone(),
+                        ts: now_ts_millis(),
+                    });
+                    let result = serde_json::json!({
+                        "summary": summary,
+                        "changes": change_history
+                    });
+                    return Ok(result.to_string());
+                }
+
+                "read_file" => {
+                    let path = args.get("path").and_then(|v| v.as_str()).unwrap_or("");
+                    match resolve_path_in_root(&project_root, path) {
+                        Ok(full_path) => {
+                            std::fs::read_to_string(&full_path)
+                                .unwrap_or_else(|e| format!("Error reading file: {}", e))
+                        }
+                        Err(e) => format!("Error resolving path: {}", e),
+                    }
+                }
+
+                "list_dir" => {
+                    let path = args.get("path").and_then(|v| v.as_str());
+                    list_dir_preview(&project_root, path).unwrap_or_else(|e| e)
+                }
+
+                "search_code" => {
+                    let query = args.get("query").and_then(|v| v.as_str()).unwrap_or("");
+                    match search_with_unix_tools(&project_root, query) {
+                        Ok(hits) => hits.join("\n"),
+                        Err(e) => format!("Search error: {}", e),
+                    }
+                }
+
+                "run_command" => {
+                    let cmd = args.get("cmd").and_then(|v| v.as_str()).unwrap_or("");
+                    run_agent_command(&project_root, cmd)
+                }
+
+                "write_file" | "create_file" => {
+                    let path = args.get("path").and_then(|v| v.as_str()).unwrap_or("");
+                    let content = args.get("content").and_then(|v| v.as_str()).unwrap_or("");
+                    let action = if tool_name == "create_file" { "create" } else { "write" };
+
+                    match resolve_path_in_root_or_new(&project_root, path) {
+                        Ok(full_path) => {
+                            let original = std::fs::read_to_string(&full_path).ok();
+                            let diff = compute_simple_diff(
+                                original.as_deref().unwrap_or(""),
+                                content,
+                            );
+
+                            let confirm_id = format!("confirm-{}", now_ts_millis());
+                            let (tx, rx) = oneshot::channel::<bool>();
+                            let tx = Arc::new(Mutex::new(Some(tx)));
+
+                            let event_name = format!("ai-agent-confirm-{}", confirm_id);
+                            let tx_clone = tx.clone();
+                            let handler = app.listen(event_name.clone(), move |_event| {
+                                if let Some(sender) = tx_clone.lock().unwrap().take() {
+                                    let _ = sender.send(true);
+                                }
+                            });
+
+                            let _ = app.emit("ai-agent-confirm-required", AgentConfirmEvent {
+                                confirm_id: confirm_id.clone(),
+                                path: path.to_string(),
+                                diff,
+                                tool: tool_name.to_string(),
+                            });
+
+                            let confirmed = tokio::time::timeout(
+                                Duration::from_secs(60),
+                                rx,
+                            ).await.unwrap_or(Ok(false)).unwrap_or(false);
+
+                            app.unlisten(handler);
+
+                            if !confirmed {
+                                "Operation denied by user.".to_string()
+                            } else {
+                                if let Some(parent) = full_path.parent() {
+                                    let _ = std::fs::create_dir_all(parent);
+                                }
+                                match std::fs::write(&full_path, content) {
+                                    Ok(_) => {
+                                        change_history.push(AgentFileChange {
+                                            path: full_path.to_string_lossy().to_string(),
+                                            original_content: original,
+                                            action: action.to_string(),
+                                        });
+                                        let _ = app.emit("ai-agent-file-change", AgentFileChangeEvent {
+                                            path: path.to_string(),
+                                            content: content.to_string(),
+                                            action: action.to_string(),
+                                        });
+                                        format!("File written: {}", path)
+                                    }
+                                    Err(e) => format!("Error writing file: {}", e),
+                                }
+                            }
+                        }
+                        Err(e) => format!("Error resolving path: {}", e),
+                    }
+                }
+
+                "delete_file" => {
+                    let path = args.get("path").and_then(|v| v.as_str()).unwrap_or("");
+                    match resolve_path_in_root(&project_root, path) {
+                        Ok(full_path) => {
+                            let original = std::fs::read_to_string(&full_path).ok();
+                            let diff = format!("--- {}\n+++ /dev/null\n(file deleted)", path);
+
+                            let confirm_id = format!("confirm-{}", now_ts_millis());
+                            let (tx, rx) = oneshot::channel::<bool>();
+                            let tx = Arc::new(Mutex::new(Some(tx)));
+
+                            let event_name = format!("ai-agent-confirm-{}", confirm_id);
+                            let tx_clone = tx.clone();
+                            let handler = app.listen(event_name.clone(), move |_event| {
+                                if let Some(sender) = tx_clone.lock().unwrap().take() {
+                                    let _ = sender.send(true);
+                                }
+                            });
+
+                            let _ = app.emit("ai-agent-confirm-required", AgentConfirmEvent {
+                                confirm_id: confirm_id.clone(),
+                                path: path.to_string(),
+                                diff,
+                                tool: "delete_file".to_string(),
+                            });
+
+                            let confirmed = tokio::time::timeout(
+                                Duration::from_secs(60),
+                                rx,
+                            ).await.unwrap_or(Ok(false)).unwrap_or(false);
+
+                            app.unlisten(handler);
+
+                            if !confirmed {
+                                "Deletion denied by user.".to_string()
+                            } else {
+                                match std::fs::remove_file(&full_path) {
+                                    Ok(_) => {
+                                        change_history.push(AgentFileChange {
+                                            path: full_path.to_string_lossy().to_string(),
+                                            original_content: original,
+                                            action: "delete".to_string(),
+                                        });
+                                        let _ = app.emit("ai-agent-file-change", AgentFileChangeEvent {
+                                            path: path.to_string(),
+                                            content: String::new(),
+                                            action: "delete".to_string(),
+                                        });
+                                        format!("File deleted: {}", path)
+                                    }
+                                    Err(e) => format!("Error deleting file: {}", e),
+                                }
+                            }
+                        }
+                        Err(e) => format!("Error resolving path: {}", e),
+                    }
+                }
+
+                _ => format!("Unknown tool: {}", tool_name),
+            };
+
+            // Emit step event (for non-finish tools)
+            let _ = app.emit("ai-agent-event", AgentStepEvent {
+                step,
+                tool: tool_name.to_string(),
+                args: args.clone(),
+                result: result_str.clone(),
+                ts: now_ts_millis(),
+            });
+
+            tool_results.push(format!("Tool: {}\nResult: {}", tool_name, result_str));
+        }
+
+        // Feed tool results back to model
+        history.push(OllamaChatMessage {
+            role: "user".to_string(),
+            content: format!("Tool results:\n{}", tool_results.join("\n\n")),
+        });
+    }
+}
+
+/// Like resolve_path_in_root but allows paths that don't exist yet (for file creation)
+fn resolve_path_in_root_or_new(root_path: &str, requested: &str) -> Result<PathBuf, String> {
+    let root = root_path_buf(root_path)?;
+    let candidate = if Path::new(requested).is_absolute() {
+        PathBuf::from(requested)
+    } else {
+        root.join(requested)
+    };
+    // For new files, we can't canonicalize since they don't exist yet
+    // Just check the path doesn't escape the root
+    let normalized = candidate.components().fold(PathBuf::new(), |mut acc, c| {
+        match c {
+            std::path::Component::ParentDir => { acc.pop(); acc }
+            std::path::Component::CurDir => acc,
+            other => { acc.push(other); acc }
+        }
+    });
+    if !normalized.starts_with(&root) {
+        return Err("Path is outside the open project".to_string());
+    }
+    Ok(normalized)
+}
+
+// ── Prompt Template Management (Tasks 6.5, 6.6) ─────────────────────────────
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct PromptTemplate {
+    pub name: String,
+    pub content: String,
+}
+
+/// List all prompt templates from .kiro/prompts/*.md
+#[command]
+pub async fn list_prompt_templates(project_root: String) -> Result<Vec<PromptTemplate>, String> {
+    let prompts_dir = PathBuf::from(&project_root).join(".kiro").join("prompts");
+    if !prompts_dir.exists() {
+        return Ok(vec![]);
+    }
+    let entries = std::fs::read_dir(&prompts_dir)
+        .map_err(|e| format!("Failed to read prompts directory: {}", e))?;
+    let mut templates = Vec::new();
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|e| e.to_str()) == Some("md") {
+            let name = path
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .unwrap_or("")
+                .to_string();
+            if name.is_empty() {
+                continue;
+            }
+            match std::fs::read_to_string(&path) {
+                Ok(content) => templates.push(PromptTemplate { name, content }),
+                Err(e) => eprintln!("[PromptTemplates] Failed to read {:?}: {}", path, e),
+            }
+        }
+    }
+    templates.sort_by(|a, b| a.name.cmp(&b.name));
+    Ok(templates)
+}
+
+/// Save a prompt template to .kiro/prompts/<name>.md
+#[command]
+pub async fn save_prompt_template(
+    project_root: String,
+    name: String,
+    content: String,
+) -> Result<(), String> {
+    if name.is_empty() {
+        return Err("Template name cannot be empty".to_string());
+    }
+    // Sanitize name: only allow alphanumeric, hyphens, underscores
+    if !name.chars().all(|c| c.is_alphanumeric() || c == '-' || c == '_') {
+        return Err("Template name may only contain letters, numbers, hyphens, and underscores".to_string());
+    }
+    let prompts_dir = PathBuf::from(&project_root).join(".kiro").join("prompts");
+    std::fs::create_dir_all(&prompts_dir)
+        .map_err(|e| format!("Failed to create prompts directory: {}", e))?;
+    let file_path = prompts_dir.join(format!("{}.md", name));
+    std::fs::write(&file_path, &content)
+        .map_err(|e| format!("Failed to write template file: {}", e))?;
+    Ok(())
 }

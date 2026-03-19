@@ -4,9 +4,12 @@ import {
   Send, Trash2, Database, Zap, ChevronDown, ExternalLink,
   Eye, EyeOff, Undo2, Check, X, StopCircle, Cpu, RefreshCw,
   Terminal, FileCode, Sparkles, Plus, MessageSquare, ChevronLeft,
+  Bug, AlertTriangle, AlertCircle, Info, FileText, AtSign, Folder,
 } from "lucide-react";
 import { invoke } from "@tauri-apps/api/core";
+import { listen, emit } from "@tauri-apps/api/event";
 import { useAIStore } from "../../store/aiStore";
+import type { BugReport, BugEntry } from "../../store/aiStore";
 import { useEditorStore } from "../../store/editorStore";
 import { useUIStore } from "../../store/uiStore";
 import { useTerminalStore } from "../../store/terminalStore";
@@ -14,8 +17,17 @@ import { readTextFile } from "@tauri-apps/plugin-fs";
 import { DiffModal } from "./DiffModal";
 import { marked } from "marked";
 import DOMPurify from "dompurify";
+import { countThinkingSteps } from "../../utils/parseThinkingBlock";
 
 type FileSuggestion = { path: string; content: string; language: string };
+
+interface AgentStepEvent {
+  step: number;
+  tool: string;
+  args: Record<string, unknown>;
+  result: string;
+  ts: number;
+}
 
 const fileExistsCache = new Map<string, boolean>();
 async function checkFileExistsCached(path: string): Promise<boolean> {
@@ -137,9 +149,81 @@ function resolvePath(path: string, folder: string | null): string | null {
   return `${folder.replace(/[\\/]+$/, "")}/${n.replace(/^\.?\//, "")}`;
 }
 
+// ── Bug report helpers ───────────────────────────────────────
+const SEVERITY_ORDER: Record<BugEntry["severity"], number> = {
+  critical: 0, high: 1, medium: 2, low: 3,
+};
+
+const SEVERITY_ICON: Record<BugEntry["severity"], React.ReactNode> = {
+  critical: <AlertCircle size={11} />,
+  high: <AlertTriangle size={11} />,
+  medium: <AlertTriangle size={11} />,
+  low: <Info size={11} />,
+};
+
+interface BugReportViewProps {
+  report: BugReport;
+  openFolder: string | null;
+  onShowFix: (bug: BugEntry) => void;
+}
+
+function BugReportView({ report, openFolder, onShowFix }: BugReportViewProps) {
+  const sorted = [...report.bugs].sort(
+    (a, b) => SEVERITY_ORDER[a.severity] - SEVERITY_ORDER[b.severity]
+  );
+  const { summary } = report;
+  const total = summary.critical + summary.high + summary.medium + summary.low;
+
+  return (
+    <div className="bug-report">
+      {/* Summary bar (Req 5.5) */}
+      <div className="bug-report-summary">
+        {total === 0 ? (
+          <span className="bug-report-none">✓ No issues found</span>
+        ) : (
+          <>
+            <span className="bug-report-total">{total} issue{total !== 1 ? "s" : ""}</span>
+            {summary.critical > 0 && <span className="bug-badge critical">{summary.critical} critical</span>}
+            {summary.high > 0 && <span className="bug-badge high">{summary.high} high</span>}
+            {summary.medium > 0 && <span className="bug-badge medium">{summary.medium} medium</span>}
+            {summary.low > 0 && <span className="bug-badge low">{summary.low} low</span>}
+          </>
+        )}
+      </div>
+
+      {/* Bug cards sorted by severity (Req 5.3) */}
+      {sorted.map((bug, i) => (
+        <div key={i} className={`bug-card bug-card-${bug.severity}`}>
+          <div className="bug-card-header">
+            <span className={`bug-badge ${bug.severity}`}>
+              {SEVERITY_ICON[bug.severity]} {bug.severity}
+            </span>
+            <span className="bug-card-location">
+              <FileCode size={10} />
+              {bug.filePath}{bug.line > 0 ? `:${bug.line}` : ""}
+            </span>
+          </div>
+          <p className="bug-card-desc">{bug.description}</p>
+          {bug.fix && (
+            <div className="bug-card-actions">
+              {/* Show Fix wires to DiffModal (Req 5.4) */}
+              <button
+                className="aip-action-btn"
+                onClick={() => onShowFix(bug)}
+                title="View suggested fix"
+              >
+                <Eye size={11} /> Show Fix
+              </button>
+            </div>
+          )}
+        </div>
+      ))}
+    </div>
+  );
+}
+
 // ── Mode config ──────────────────────────────────────────────
-const MODES = [
-  { id: "chat",      label: "Chat",    emoji: null,  title: "Direct answers" },
+const MODES = [  { id: "chat",      label: "Chat",    emoji: null,  title: "Direct answers" },
   { id: "think",     label: "Think",   emoji: null,  title: "Step-by-step reasoning" },
   { id: "agent",     label: "Agent",   emoji: null,  title: "Plan + file-level actions" },
   { id: "bug_hunt",  label: "Bugs",    emoji: "🐛",  title: "Find bugs & vulnerabilities" },
@@ -156,11 +240,248 @@ export function AIPanel() {
   const [rollingBack, setRollingBack] = useState(false);
   const [input, setInput] = useState("");
   const [showModelSelect, setShowModelSelect] = useState(false);
+  const [agentSteps, setAgentSteps] = useState<AgentStepEvent[]>([]);
+  const [confirmPending, setConfirmPending] = useState<{
+    confirmId: string;
+    path: string;
+    diff: string;
+    tool: string;
+  } | null>(null);
   const [diffModalData, setDiffModalData] = useState<{
     isOpen: boolean; suggestionKey: string; originalPath: string;
     originalContent: string; modifiedContent: string; onAccept: () => void;
   }>({ isOpen: false, suggestionKey: "", originalPath: "", originalContent: "", modifiedContent: "", onAccept: () => {} });
 
+  // @-mention autocomplete state (Task 7.1)
+  const [mentionQuery, setMentionQuery] = useState<string | null>(null);
+  const [mentionDropdown, setMentionDropdown] = useState<string[]>([]);
+  const [mentionDropdownIdx, setMentionDropdownIdx] = useState(0);
+  const [mentionWarning, setMentionWarning] = useState<string | null>(null);
+  const mentionDropdownRef = useRef<HTMLDivElement>(null);
+
+  // Prompts panel state (Task 6.7)
+  const [showPromptsPanel, setShowPromptsPanel] = useState(false);
+  const [promptTemplates, setPromptTemplates] = useState<Array<{ name: string; content: string }>>([]);
+  const [selectedPromptName, setSelectedPromptName] = useState<string | null>(null);
+  const [promptEditorContent, setPromptEditorContent] = useState("");
+  const [newPromptName, setNewPromptName] = useState("");
+  const [savingPrompt, setSavingPrompt] = useState(false);
+
+  // Show Fix handler for bug report cards (Req 5.4)
+  const handleShowFix = async (bug: BugEntry) => {
+    const rp = resolvePath(bug.filePath, openFolder ?? null);
+    let originalContent = "";
+    if (rp) {
+      try { originalContent = await readTextFile(rp); } catch { /* file may not exist */ }
+    }
+    setDiffModalData({
+      isOpen: true,
+      suggestionKey: `bug-fix-${bug.filePath}-${bug.line}`,
+      originalPath: rp ?? bug.filePath,
+      originalContent,
+      modifiedContent: bug.fix,
+      onAccept: async () => {
+        if (!rp) { addToast("Open a project folder first.", "warning"); return; }
+        try {
+          await applyAIChangeToFile(rp, bug.fix, `Bug fix: ${bug.description}`);
+          addToast("Fix applied.", "success");
+        } catch (e) {
+          addToast(`Failed to apply fix: ${String(e)}`, "error");
+        }
+        setDiffModalData(p => ({ ...p, isOpen: false }));
+      },
+    });
+  };
+
+  // Prompts panel handlers (Task 6.7)
+  const loadPromptTemplates = async () => {
+    if (!openFolder) return;
+    try {
+      const templates = await invoke<Array<{ name: string; content: string }>>("list_prompt_templates", { projectRoot: openFolder });
+      setPromptTemplates(templates);
+    } catch (e) {
+      addToast(`Failed to load templates: ${String(e)}`, "error");
+    }
+  };
+
+  const handleOpenPromptsPanel = async () => {
+    setShowPromptsPanel(true);
+    await loadPromptTemplates();
+  };
+
+  const handleSelectPrompt = (name: string, content: string) => {
+    setSelectedPromptName(name);
+    setPromptEditorContent(content);
+    setNewPromptName("");
+  };
+
+  const handleSavePrompt = async () => {
+    if (!openFolder) { addToast("Open a project folder first.", "warning"); return; }
+    const name = newPromptName.trim() || selectedPromptName;
+    if (!name) { addToast("Enter a template name.", "warning"); return; }
+    setSavingPrompt(true);
+    try {
+      await invoke("save_prompt_template", { projectRoot: openFolder, name, content: promptEditorContent });
+      addToast(`Template "${name}" saved.`, "success");
+      setSelectedPromptName(name);
+      setNewPromptName("");
+      await loadPromptTemplates();
+    } catch (e) {
+      addToast(`Failed to save template: ${String(e)}`, "error");
+    } finally {
+      setSavingPrompt(false);
+    }
+  };
+
+  const handleNewTemplate = () => {
+    setSelectedPromptName(null);
+    setPromptEditorContent("");
+    setNewPromptName("");
+  };
+
+  // ── @-mention helpers (Task 7.1, 7.4, 7.5) ──────────────────────────────
+  const buildMentionSuggestions = async (query: string): Promise<string[]> => {
+    const special = ["@folder", "@errors"];
+    const suggestions: string[] = [];
+
+    // Special keywords
+    for (const s of special) {
+      if (s.startsWith(`@${query}`) || query === "") suggestions.push(s);
+    }
+
+    // Open tabs
+    for (const tab of tabs) {
+      const name = tab.fileName || tab.id;
+      if (!query || name.toLowerCase().includes(query.toLowerCase())) {
+        suggestions.push(tab.filePath || tab.fileName || tab.id);
+      }
+    }
+
+    // Project files from open folder
+    if (openFolder) {
+      try {
+        type FileEntry = { name: string; path: string; is_dir: boolean; children?: FileEntry[] };
+        const entries = await invoke<FileEntry[]>("read_dir_recursive", { path: openFolder, depth: 3 });
+        const flatten = (items: FileEntry[]): string[] =>
+          items.flatMap(e => e.is_dir ? flatten(e.children ?? []) : [e.path]);
+        const paths = flatten(entries);
+        for (const p of paths) {
+          const name = p.split(/[\\/]/).pop() || p;
+          if (!query || name.toLowerCase().includes(query.toLowerCase()) || p.toLowerCase().includes(query.toLowerCase())) {
+            if (!suggestions.includes(p)) suggestions.push(p);
+          }
+        }
+      } catch { /* ignore */ }
+    }
+
+    return suggestions.slice(0, 20);
+  };
+
+  const handleMentionSelect = async (value: string) => {
+    const { lastErrors } = useTerminalStore.getState();
+
+    if (value === "@errors") {
+      // Inject terminal errors (Req 7.6)
+      if (lastErrors.length === 0) {
+        setMentionWarning("No terminal errors detected.");
+      } else {
+        const errText = lastErrors.map(e => `${e.file}:${e.line} — ${e.message}`).join("\n");
+        // Add as a pseudo-file mention
+        useAIStore.getState().addMentionedFile("@errors").catch(() => {});
+        // Override with actual error content
+        useAIStore.setState(s => ({
+          mentionedFiles: [
+            ...s.mentionedFiles.filter(f => f.path !== "@errors"),
+            { path: "@errors", content: errText, truncated: false },
+          ],
+        }));
+      }
+    } else if (value === "@folder") {
+      // Inject directory listing (Req 7.4)
+      if (!openFolder) {
+        setMentionWarning("No project folder open.");
+      } else {
+        try {
+          type FileEntry = { name: string; path: string; is_dir: boolean; children?: FileEntry[] };
+          const entries = await invoke<FileEntry[]>("read_dir_recursive", { path: openFolder, depth: 2 });
+          const lines: string[] = [];
+          const walk = (items: FileEntry[], indent = "") => {
+            for (const e of items) {
+              lines.push(`${indent}${e.is_dir ? "📁" : "📄"} ${e.name}`);
+              if (e.is_dir && e.children) walk(e.children, indent + "  ");
+            }
+          };
+          walk(entries);
+          const listing = lines.join("\n");
+          useAIStore.setState(s => ({
+            mentionedFiles: [
+              ...s.mentionedFiles.filter(f => f.path !== "@folder"),
+              { path: "@folder", content: listing, truncated: listing.length > 6000 },
+            ],
+          }));
+        } catch (e) {
+          setMentionWarning(`Could not read folder: ${String(e)}`);
+        }
+      }
+    } else {
+      // Regular file mention (Req 7.2, 7.3)
+      const result = await addMentionedFile(value);
+      if (!result.ok) {
+        setMentionWarning(result.reason ?? "Could not add file.");
+      }
+    }
+
+    // Replace the @query in the input with nothing (pill handles display)
+    setInput(prev => prev.replace(/@[\w./\\-]*$/, ""));
+    setMentionQuery(null);
+    setMentionDropdown([]);
+    inputRef.current?.focus();
+  };
+
+  const handleInputChange = async (e: React.ChangeEvent<HTMLTextAreaElement>) => {
+    const val = e.target.value;
+    setInput(val);
+    setMentionWarning(null);
+
+    // Detect @-trigger: look for @ followed by optional word chars at end of text
+    const match = val.match(/@([\w./\\-]*)$/);
+    if (match) {
+      const query = match[1];
+      setMentionQuery(query);
+      setMentionDropdownIdx(0);
+      const suggestions = await buildMentionSuggestions(query);
+      setMentionDropdown(suggestions);
+    } else {
+      setMentionQuery(null);
+      setMentionDropdown([]);
+    }
+  };
+
+  const handleInputKeyDown = (e: React.KeyboardEvent<HTMLTextAreaElement>) => {
+    if (mentionQuery !== null && mentionDropdown.length > 0) {
+      if (e.key === "ArrowDown") {
+        e.preventDefault();
+        setMentionDropdownIdx(i => Math.min(i + 1, mentionDropdown.length - 1));
+        return;
+      }
+      if (e.key === "ArrowUp") {
+        e.preventDefault();
+        setMentionDropdownIdx(i => Math.max(i - 1, 0));
+        return;
+      }
+      if (e.key === "Enter" || e.key === "Tab") {
+        e.preventDefault();
+        handleMentionSelect(mentionDropdown[mentionDropdownIdx]);
+        return;
+      }
+      if (e.key === "Escape") {
+        setMentionQuery(null);
+        setMentionDropdown([]);
+        return;
+      }
+    }
+    handleKeyDown(e);
+  };
 
   const modelSelectorRef = useRef<HTMLDivElement>(null);
   const messagesEndRef = useRef<HTMLDivElement>(null);
@@ -175,6 +496,8 @@ export function AIPanel() {
     setAIMode, setShowThinking, indexCodebase, checkOllama, startOllama, setOpenFolder,
     sessions, activeSessionId, showSessionList,
     newChat, switchSession, deleteSession, toggleSessionList,
+    abortRequest, retryLastMessage, isStreaming, streamingMessageId,
+    mentionedFiles, addMentionedFile, removeMentionedFile, clearMentionedFiles,
   } = useAIStore();
 
   const {
@@ -207,6 +530,27 @@ export function AIPanel() {
     if (useRAG && openFolder && indexedChunks === 0 && !isIndexing) indexCodebase(openFolder);
   }, [useRAG, openFolder, indexedChunks, isIndexing, indexCodebase]);
 
+  // Agent event listeners (Task 3.7, 3.8)
+  useEffect(() => {
+    if (aiMode !== 'agent') return;
+
+    const unlistenStep = listen<AgentStepEvent>('ai-agent-event', (event) => {
+      setAgentSteps(prev => [...prev, event.payload]);
+    });
+
+    const unlistenConfirm = listen<{ confirmId: string; path: string; diff: string; tool: string }>(
+      'ai-agent-confirm-required',
+      (event) => {
+        setConfirmPending(event.payload);
+      }
+    );
+
+    return () => {
+      unlistenStep.then(fn => fn());
+      unlistenConfirm.then(fn => fn());
+    };
+  }, [aiMode]);
+
   // Check file existence for suggestions
   useEffect(() => {
     const allPaths = chatHistory.flatMap(msg =>
@@ -226,6 +570,14 @@ export function AIPanel() {
   const handleSend = async () => {
     const text = input.trim();
     if (!text || isThinking) return;
+    if (noModelConfigured) {
+      // Inline error — do not send (1.5)
+      return;
+    }
+    // Clear agent steps when starting a new task
+    if (aiMode === 'agent') {
+      setAgentSteps([]);
+    }
     let content = text;
     let activeFileContext: string | undefined;
     if (activeTabId && activeTab) {
@@ -234,6 +586,8 @@ export function AIPanel() {
       else activeFileContext = fileCode;
     }
     setInput("");
+    setMentionQuery(null);
+    setMentionDropdown([]);
     await sendMessage(content, activeFileContext);
   };
 
@@ -255,6 +609,9 @@ export function AIPanel() {
   const showOllamaWarn = selectedOllamaModels.length > 0 && !isOllamaRunning;
   const isOnline = !showOllamaWarn;
   const canSend = !((needsOllama && !isOllamaRunning) || isThinking || !input.trim());
+
+  // No model configured at all (1.5)
+  const noModelConfigured = selectedOllamaModels.length === 0 && selectedApiKeyIndices.length === 0;
 
   const renderMarkdown = (content: string) =>
     DOMPurify.sanitize(
@@ -291,6 +648,71 @@ export function AIPanel() {
                 </button>
               </div>
             ))}
+          </div>
+        </div>
+      )}
+
+      {/* ── Prompts panel overlay (Task 6.7) ── */}
+      {showPromptsPanel && (
+        <div className="aip-session-list">
+          <div className="aip-session-list-hdr">
+            <span>Prompt Templates</span>
+            <button className="aip-icon-btn" onClick={() => setShowPromptsPanel(false)} title="Close"><X size={13} /></button>
+          </div>
+          <div className="aip-prompts-toolbar">
+            <button className="aip-session-new-btn" onClick={handleNewTemplate}>
+              <Plus size={12} /> New Template
+            </button>
+          </div>
+          <div className="aip-session-items">
+            {promptTemplates.length === 0 && (
+              <div className="aip-session-empty">No templates yet. Create one below.</div>
+            )}
+            {promptTemplates.map(t => (
+              <div
+                key={t.name}
+                className={`aip-session-item ${selectedPromptName === t.name ? "active" : ""}`}
+                onClick={() => handleSelectPrompt(t.name, t.content)}
+                style={{ cursor: "pointer" }}
+              >
+                <div className="aip-session-item-info" style={{ padding: "4px 8px" }}>
+                  <span className="aip-session-item-title">{t.name}.md</span>
+                  <span className="aip-session-item-meta">{t.content.length} chars</span>
+                </div>
+              </div>
+            ))}
+          </div>
+          <div className="aip-prompts-editor">
+            {(selectedPromptName !== null || newPromptName !== undefined) && (
+              <>
+                <div className="aip-prompts-name-row">
+                  <input
+                    className="aip-prompts-name-input"
+                    placeholder={selectedPromptName ?? "template-name"}
+                    value={newPromptName}
+                    onChange={e => setNewPromptName(e.target.value)}
+                  />
+                  <span className="aip-prompts-name-ext">.md</span>
+                </div>
+                <textarea
+                  className="aip-prompts-textarea"
+                  value={promptEditorContent}
+                  onChange={e => setPromptEditorContent(e.target.value)}
+                  placeholder="Enter system prompt content (max 8000 chars)…"
+                  rows={8}
+                />
+                <div className="aip-prompts-footer">
+                  <span className="aip-prompts-charcount">{promptEditorContent.length}/8000</span>
+                  <button
+                    className="aip-btn-sm aip-btn-primary"
+                    onClick={handleSavePrompt}
+                    disabled={savingPrompt || (!selectedPromptName && !newPromptName.trim())}
+                  >
+                    {savingPrompt ? "Saving…" : "Save"}
+                  </button>
+                </div>
+              </>
+            )}
           </div>
         </div>
       )}
@@ -333,6 +755,9 @@ export function AIPanel() {
             <button className="aip-icon-btn" onClick={clearChat} title="Clear chat">
               <Trash2 size={13} />
             </button>
+            <button className="aip-icon-btn" onClick={handleOpenPromptsPanel} title="Prompt templates">
+              <FileText size={13} />
+            </button>
           </div>
         </div>
 
@@ -373,6 +798,18 @@ export function AIPanel() {
             <button className="aip-btn-sm aip-btn-primary" onClick={() => indexCodebase(openFolder)} disabled={isIndexing}>
               {isIndexing ? <><RefreshCw size={11} className="spin-icon" /> Indexing…</> : "Index Now"}
             </button>
+          </div>
+        </div>
+      )}
+
+      {/* ── No model configured inline error (Req 1.1 / 1.5) ── */}
+      {noModelConfigured && (
+        <div className="aip-banner aip-banner-warn">
+          <Zap size={13} />
+          <div className="aip-banner-body">
+            <strong>No model configured</strong>
+            <span>Select a model to start chatting.</span>
+            <button className="aip-btn-sm" onClick={() => { toggleSettingsPanel(); }}>Open Settings</button>
           </div>
         </div>
       )}
@@ -456,7 +893,53 @@ export function AIPanel() {
                     {new Date(msg.timestamp).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}
                   </span>
                 </div>
+
+                {/* Collapsible Reasoning section (Req 4.3, 4.4, 4.5, 4.6) */}
+                {msg.role === "assistant" && (msg.thinkingContent !== undefined) && (
+                  <details className="aip-reasoning">
+                    <summary className="aip-reasoning-toggle">
+                      Reasoning · {countThinkingSteps(msg.thinkingContent)} steps
+                      {isStreaming && streamingMessageId === msg.id && (
+                        <span className="aip-streaming-cursor" aria-hidden="true" />
+                      )}
+                    </summary>
+                    <div
+                      className="aip-reasoning-body"
+                      dangerouslySetInnerHTML={{ __html: renderMarkdown(msg.thinkingContent) }}
+                    />
+                  </details>
+                )}
+
                 <div className="aip-msg-body" dangerouslySetInnerHTML={{ __html: renderMarkdown(msg.content) }} />
+
+                {/* Bug report cards (Req 5.3, 5.4, 5.5) */}
+                {msg.role === "assistant" && msg.bugReport && (
+                  <BugReportView
+                    report={msg.bugReport}
+                    openFolder={openFolder ?? null}
+                    onShowFix={handleShowFix}
+                  />
+                )}                {/* Blinking cursor for streaming message */}
+                {isStreaming && streamingMessageId === msg.id && (
+                  <span className="aip-streaming-cursor" aria-hidden="true" />
+                )}
+                {/* Incomplete stream indicator */}
+                {msg.isIncomplete && !msg.isError && (
+                  <div className="aip-incomplete-notice">⚠ Response was cut off</div>
+                )}
+
+                {/* Retry button on error messages (Req 1.5) */}
+                {msg.isError && msg.retryContent && (
+                  <div className="aip-actions">
+                    <button
+                      className="aip-action-btn primary"
+                      disabled={isThinking}
+                      onClick={() => retryLastMessage()}
+                    >
+                      <RefreshCw size={11} /> Retry
+                    </button>
+                  </div>
+                )}
 
                 {/* Accept/Reject inline code suggestion */}
                 {canApprove && (
@@ -606,6 +1089,27 @@ export function AIPanel() {
           </div>
         )}
 
+        {/* Agent tool-call trace panel (Task 3.7) */}
+        {aiMode === 'agent' && agentSteps.length > 0 && (
+          <div className="agent-trace-panel">
+            <div className="agent-trace-header">Agent Steps ({agentSteps.length})</div>
+            {agentSteps.map((step, i) => (
+              <details key={i} className="agent-step-row">
+                <summary>
+                  <span className="agent-step-tool">{step.tool}</span>
+                  <span className="agent-step-num">Step {step.step}</span>
+                </summary>
+                <div className="agent-step-args">
+                  <strong>Args:</strong> {JSON.stringify(step.args).slice(0, 100)}
+                </div>
+                <div className="agent-step-result">
+                  <strong>Result:</strong> {step.result.slice(0, 200)}
+                </div>
+              </details>
+            ))}
+          </div>
+        )}
+
         {/* Thinking dots */}
         {isThinking && aiMode !== "agent" && (
           <div className="aip-msg aip-msg-assistant">
@@ -623,7 +1127,7 @@ export function AIPanel() {
             <span>Agent running</span>
             {agentEvents.length > 0 && <span className="aip-agent-step-count">{agentEvents.length} steps</span>}
           </div>
-          <button className="aip-stop-btn" onClick={() => setInput("")} title="Stop agent">
+          <button className="aip-stop-btn" onClick={() => abortRequest()} title="Stop agent">
             <StopCircle size={12} /> Stop
           </button>
         </div>
@@ -637,13 +1141,67 @@ export function AIPanel() {
             <span>{activeTab.fileName}</span>
           </div>
         )}
-        <div className="aip-input-row">
+        {/* @-mention pill badges (Task 7.6) */}
+        {mentionedFiles.length > 0 && (
+          <div className="aip-mention-pills">
+            {mentionedFiles.map(f => (
+              <span key={f.path} className="aip-mention-pill">
+                {f.path.startsWith("@") ? (
+                  <AtSign size={9} />
+                ) : f.path === "@folder" ? (
+                  <Folder size={9} />
+                ) : (
+                  <FileCode size={9} />
+                )}
+                <span className="aip-mention-pill-name">
+                  {f.path.startsWith("@") ? f.path : f.path.split(/[\\/]/).pop()}
+                </span>
+                {f.truncated && <span className="aip-mention-truncated" title="Truncated at 6000 chars">…</span>}
+                <button
+                  className="aip-mention-remove"
+                  onClick={() => removeMentionedFile(f.path)}
+                  title="Remove"
+                  aria-label={`Remove ${f.path}`}
+                >
+                  <X size={9} />
+                </button>
+              </span>
+            ))}
+          </div>
+        )}
+        {/* @-mention warning (Task 7.3) */}
+        {mentionWarning && (
+          <div className="aip-mention-warning">
+            <AlertTriangle size={11} /> {mentionWarning}
+          </div>
+        )}
+        <div className="aip-input-row" style={{ position: "relative" }}>
+          {/* @-mention autocomplete dropdown (Task 7.1) */}
+          {mentionQuery !== null && mentionDropdown.length > 0 && (
+            <div className="aip-mention-dropdown" ref={mentionDropdownRef}>
+              {mentionDropdown.map((item, idx) => (
+                <button
+                  key={item}
+                  className={`aip-mention-option ${idx === mentionDropdownIdx ? "active" : ""}`}
+                  onMouseDown={e => { e.preventDefault(); handleMentionSelect(item); }}
+                >
+                  {item === "@errors" ? (
+                    <><Terminal size={10} /> @errors</>
+                  ) : item === "@folder" ? (
+                    <><Folder size={10} /> @folder</>
+                  ) : (
+                    <><FileCode size={10} /> {item.split(/[\\/]/).pop()}<span className="aip-mention-path">{item}</span></>
+                  )}
+                </button>
+              ))}
+            </div>
+          )}
           <textarea
             ref={inputRef}
             value={input}
-            onChange={e => setInput(e.target.value)}
-            onKeyDown={handleKeyDown}
-            placeholder={`Ask AI… (${aiMode}${useRAG ? " + RAG" : ""})`}
+            onChange={handleInputChange}
+            onKeyDown={handleInputKeyDown}
+            placeholder={`Ask AI… (${aiMode}${useRAG ? " + RAG" : ""}) — type @ to mention files`}
             rows={3}
             disabled={(needsOllama && !isOllamaRunning) || isThinking}
             className="aip-textarea"
@@ -665,6 +1223,37 @@ export function AIPanel() {
           onReject={() => setDiffModalData(p => ({ ...p, isOpen: false }))}
           onClose={() => setDiffModalData(p => ({ ...p, isOpen: false }))}
         />
+      )}
+
+      {/* Agent confirmation dialog (Task 3.8) */}
+      {confirmPending && (
+        <div className="agent-confirm-overlay">
+          <div className="agent-confirm-dialog">
+            <h3>Confirm {confirmPending.tool === 'delete_file' ? 'Delete' : 'Write'} File</h3>
+            <p className="agent-confirm-path">{confirmPending.path}</p>
+            <pre className="agent-confirm-diff">{confirmPending.diff}</pre>
+            <div className="agent-confirm-actions">
+              <button
+                className="agent-confirm-approve"
+                onClick={() => {
+                  emit(`ai-agent-confirm-${confirmPending.confirmId}`, { confirmed: true });
+                  setConfirmPending(null);
+                }}
+              >
+                Approve
+              </button>
+              <button
+                className="agent-confirm-deny"
+                onClick={() => {
+                  emit(`ai-agent-confirm-${confirmPending.confirmId}`, { confirmed: false });
+                  setConfirmPending(null);
+                }}
+              >
+                Deny
+              </button>
+            </div>
+          </div>
+        </div>
       )}
     </div>
   );
