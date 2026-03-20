@@ -3582,12 +3582,19 @@ pub async fn save_prompt_template(
     name: String,
     content: String,
 ) -> Result<(), String> {
+    const MAX_TEMPLATE_CHARS: usize = 8000;
     if name.is_empty() {
         return Err("Template name cannot be empty".to_string());
     }
     // Sanitize name: only allow alphanumeric, hyphens, underscores
     if !name.chars().all(|c| c.is_alphanumeric() || c == '-' || c == '_') {
         return Err("Template name may only contain letters, numbers, hyphens, and underscores".to_string());
+    }
+    if content.chars().count() > MAX_TEMPLATE_CHARS {
+        return Err(format!(
+            "Template content exceeds {} characters",
+            MAX_TEMPLATE_CHARS
+        ));
     }
     let prompts_dir = PathBuf::from(&project_root).join(".kiro").join("prompts");
     std::fs::create_dir_all(&prompts_dir)
@@ -3596,4 +3603,109 @@ pub async fn save_prompt_template(
     std::fs::write(&file_path, &content)
         .map_err(|e| format!("Failed to write template file: {}", e))?;
     Ok(())
+}
+
+fn sanitize_session_export_filename(raw: &str) -> String {
+    let mut sanitized: String = raw
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.' {
+                c
+            } else {
+                '-'
+            }
+        })
+        .collect();
+
+    sanitized = sanitized.trim_matches('-').to_string();
+    if sanitized.is_empty() {
+        sanitized = "ncode-session".to_string();
+    }
+    if !sanitized.to_lowercase().ends_with(".md") {
+        sanitized.push_str(".md");
+    }
+    sanitized
+}
+
+fn resolve_downloads_directory() -> Result<PathBuf, String> {
+    let home = std::env::var("HOME").ok();
+
+    if let Ok(mut xdg_download) = std::env::var("XDG_DOWNLOAD_DIR") {
+        xdg_download = xdg_download.trim().trim_matches('"').to_string();
+        if let Some(h) = &home {
+            xdg_download = xdg_download.replace("$HOME", h);
+        }
+        if !xdg_download.is_empty() {
+            return Ok(PathBuf::from(xdg_download));
+        }
+    }
+
+    if let Ok(user_profile) = std::env::var("USERPROFILE") {
+        if !user_profile.trim().is_empty() {
+            return Ok(PathBuf::from(user_profile).join("Downloads"));
+        }
+    }
+
+    if let Some(h) = home {
+        return Ok(PathBuf::from(h).join("Downloads"));
+    }
+
+    Err("Could not resolve Downloads directory on this system".to_string())
+}
+
+fn ensure_unique_export_path(mut candidate: PathBuf) -> PathBuf {
+    if !candidate.exists() {
+        return candidate;
+    }
+
+    let stem = candidate
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("ncode-session")
+        .to_string();
+    let ext = candidate
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("md")
+        .to_string();
+    let parent = candidate
+        .parent()
+        .map(|p| p.to_path_buf())
+        .unwrap_or_else(|| PathBuf::from("."));
+
+    for i in 2..=9999 {
+        let next = parent.join(format!("{}-{}.{}", stem, i, ext));
+        if !next.exists() {
+            return next;
+        }
+    }
+
+    // Last-resort fallback with unix timestamp.
+    let ts = now_ts_millis();
+    candidate = parent.join(format!("{}-{}.{}", stem, ts, ext));
+    candidate
+}
+
+/// Export a chat session markdown document into the user's Downloads folder.
+#[command]
+pub async fn export_session_markdown(
+    markdown: String,
+    file_name: Option<String>,
+) -> Result<String, String> {
+    if markdown.trim().is_empty() {
+        return Err("Cannot export an empty session.".to_string());
+    }
+
+    let downloads_dir = resolve_downloads_directory()?;
+    std::fs::create_dir_all(&downloads_dir)
+        .map_err(|e| format!("Failed to create Downloads directory: {}", e))?;
+
+    let name = sanitize_session_export_filename(
+        file_name.as_deref().unwrap_or("ncode-session.md"),
+    );
+    let target = ensure_unique_export_path(downloads_dir.join(name));
+    std::fs::write(&target, markdown)
+        .map_err(|e| format!("Failed to write export file: {}", e))?;
+
+    Ok(target.to_string_lossy().to_string())
 }

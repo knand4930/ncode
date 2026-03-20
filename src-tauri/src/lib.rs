@@ -58,6 +58,7 @@ pub fn run() {
             // Prompt templates
             ai::list_prompt_templates,
             ai::save_prompt_template,
+            ai::export_session_markdown,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

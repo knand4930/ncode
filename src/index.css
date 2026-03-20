@@ -4671,6 +4671,30 @@ select:focus-visible {
   flex-shrink: 0;
 }
 .aip-session-new-btn:hover { background: rgba(0,122,204,0.22); border-color: rgba(0,122,204,0.5); }
+.aip-session-search-wrap {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin: 0 10px 6px;
+  padding: 0 8px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
+  background: var(--bg-input);
+  color: var(--text-muted);
+  height: 32px;
+  flex-shrink: 0;
+}
+.aip-session-search {
+  flex: 1;
+  border: none;
+  outline: none;
+  background: transparent;
+  color: var(--text-primary);
+  font-size: 12px;
+}
+.aip-session-search::placeholder {
+  color: var(--text-muted);
+}
 .aip-session-items {
   flex: 1;
   overflow-y: auto;
@@ -4737,7 +4761,31 @@ select:focus-visible {
   opacity: 0;
   transition: opacity var(--anim-fast), color var(--anim-fast), background var(--anim-fast);
 }
-.aip-session-item:hover .aip-session-del { opacity: 1; }
+.aip-session-item-actions {
+  display: flex;
+  align-items: center;
+  gap: 2px;
+  padding-right: 4px;
+}
+.aip-session-export {
+  background: none;
+  border: none;
+  color: var(--text-muted);
+  cursor: pointer;
+  padding: 6px 7px;
+  border-radius: 4px;
+  display: flex;
+  align-items: center;
+  flex-shrink: 0;
+  opacity: 0;
+  transition: opacity var(--anim-fast), color var(--anim-fast), background var(--anim-fast);
+}
+.aip-session-item:hover .aip-session-del,
+.aip-session-item:hover .aip-session-export { opacity: 1; }
+.aip-session-export:hover {
+  color: #4fc1ff;
+  background: rgba(0,122,204,0.12);
+}
 .aip-session-del:hover { color: var(--error); background: rgba(244,71,71,0.1); }
 
 /* Make ai-panel position relative for session overlay */

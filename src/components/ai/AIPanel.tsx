@@ -1,10 +1,11 @@
 // src/components/ai/AIPanel.tsx
-import { useState, useRef, useEffect } from "react";
+import { useState, useRef, useEffect, useMemo } from "react";
 import {
   Send, Trash2, Database, Zap, ChevronDown, ExternalLink,
   Eye, EyeOff, Undo2, Check, X, StopCircle, Cpu, RefreshCw,
   Terminal, FileCode, Sparkles, Plus, MessageSquare, ChevronLeft,
   Bug, AlertTriangle, AlertCircle, Info, FileText, AtSign, Folder,
+  Search, Download,
 } from "lucide-react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen, emit } from "@tauri-apps/api/event";
@@ -18,6 +19,7 @@ import { DiffModal } from "./DiffModal";
 import { marked } from "marked";
 import DOMPurify from "dompurify";
 import { countThinkingSteps } from "../../utils/parseThinkingBlock";
+import { validatePromptTemplateContent } from "../../utils/promptTemplateValidation";
 
 type FileSuggestion = { path: string; content: string; language: string };
 type ArchitectureSectionKey = "Structure" | "Metrics" | "Risks" | "Improvements";
@@ -322,6 +324,7 @@ export function AIPanel() {
   const [input, setInput] = useState("");
   const [showModelSelect, setShowModelSelect] = useState(false);
   const [agentSteps, setAgentSteps] = useState<AgentStepEvent[]>([]);
+  const [sessionSearch, setSessionSearch] = useState("");
   const [confirmPending, setConfirmPending] = useState<{
     confirmId: string;
     path: string;
@@ -400,6 +403,8 @@ export function AIPanel() {
     if (!openFolder) { addToast("Open a project folder first.", "warning"); return; }
     const name = newPromptName.trim() || selectedPromptName;
     if (!name) { addToast("Enter a template name.", "warning"); return; }
+    const validationError = validatePromptTemplateContent(promptEditorContent);
+    if (validationError) { addToast(validationError, "error"); return; }
     setSavingPrompt(true);
     try {
       await invoke("save_prompt_template", { projectRoot: openFolder, name, content: promptEditorContent });
@@ -578,7 +583,7 @@ export function AIPanel() {
     indexedChunks, isIndexing, sendMessage, clearChat, toggleRAG,
     setAIMode, setShowThinking, indexCodebase, checkOllama, startOllama, setOpenFolder,
     sessions, activeSessionId, showSessionList,
-    newChat, switchSession, deleteSession, toggleSessionList,
+    newChat, switchSession, deleteSession, exportSession, toggleSessionList,
     abortRequest, retryLastMessage, isStreaming, streamingMessageId,
     mentionedFiles, addMentionedFile, removeMentionedFile, clearMentionedFiles,
   } = useAIStore();
@@ -696,10 +701,28 @@ export function AIPanel() {
   // No model configured at all (1.5)
   const noModelConfigured = selectedOllamaModels.length === 0 && selectedApiKeyIndices.length === 0;
 
+  const filteredSessions = useMemo(() => {
+    const q = sessionSearch.trim().toLowerCase();
+    if (!q) return sessions;
+    return sessions.filter((s) =>
+      s.title.toLowerCase().includes(q) ||
+      s.messages.some((m) => m.content.toLowerCase().includes(q))
+    );
+  }, [sessions, sessionSearch]);
+
   const renderMarkdown = (content: string) =>
     DOMPurify.sanitize(
       marked.parse(content.replace(/<execute>[\s\S]*?<\/execute>/g, '<div class="ai-exec-badge">⚙ Executed</div>')) as string
     );
+
+  const handleExportSession = async (sessionId: string, title: string) => {
+    try {
+      const path = await exportSession(sessionId);
+      addToast(`Exported "${title}" to ${path}`, "success");
+    } catch (e) {
+      addToast(`Failed to export "${title}": ${String(e)}`, "error");
+    }
+  };
 
   return (
     <div className="ai-panel">
@@ -713,9 +736,21 @@ export function AIPanel() {
           <button className="aip-session-new-btn" onClick={() => { newChat(); toggleSessionList(); }}>
             <Plus size={12} /> New Chat
           </button>
+          <div className="aip-session-search-wrap">
+            <Search size={12} />
+            <input
+              className="aip-session-search"
+              placeholder="Search chats..."
+              value={sessionSearch}
+              onChange={(e) => setSessionSearch(e.target.value)}
+            />
+          </div>
           <div className="aip-session-items">
             {sessions.length === 0 && <div className="aip-session-empty">No saved chats yet</div>}
-            {sessions.map(s => (
+            {sessions.length > 0 && filteredSessions.length === 0 && (
+              <div className="aip-session-empty">No matching chats</div>
+            )}
+            {filteredSessions.map(s => (
               <div key={s.id} className={`aip-session-item ${s.id === activeSessionId ? "active" : ""}`}>
                 <button className="aip-session-item-btn" onClick={() => { switchSession(s.id); toggleSessionList(); }}>
                   <MessageSquare size={11} />
@@ -726,9 +761,21 @@ export function AIPanel() {
                     </span>
                   </div>
                 </button>
-                <button className="aip-session-del" onClick={() => deleteSession(s.id)} title="Delete">
-                  <X size={10} />
-                </button>
+                <div className="aip-session-item-actions">
+                  <button
+                    className="aip-session-export"
+                    onClick={(e) => {
+                      e.stopPropagation();
+                      handleExportSession(s.id, s.title || "New Chat");
+                    }}
+                    title="Export session markdown"
+                  >
+                    <Download size={10} />
+                  </button>
+                  <button className="aip-session-del" onClick={() => deleteSession(s.id)} title="Delete">
+                    <X size={10} />
+                  </button>
+                </div>
               </div>
             ))}
           </div>

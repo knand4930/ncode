@@ -112,6 +112,7 @@ const AI_CHAT_HISTORY_KEY = "NCode.ai.chatHistory.v1";
 const AI_SESSIONS_KEY = "NCode.ai.sessions.v1";
 export const INLINE_COMPLETION_DEBOUNCE_MS = 600;
 export const INLINE_COMPLETION_TIMEOUT_MS = 3000;
+export const CONTEXT_SUMMARIZATION_THRESHOLD = 0.9;
 
 type InlineCompletionSnapshot = {
   selectedProvider: "ollama" | "api";
@@ -165,6 +166,31 @@ export function createInlineCompletionDebouncer(
       }, debounceMs);
     });
   };
+}
+
+/**
+ * Lightweight token estimator used for budgeting decisions.
+ * Uses the common approximation of ~4 chars/token for English/code mix.
+ */
+export function estimateTokenCount(text: string): number {
+  if (!text) return 0;
+  return Math.ceil(text.length / 4);
+}
+
+export function estimateMessagesTokenCount(
+  messages: Array<Pick<ChatMessage, "content">>
+): number {
+  return messages.reduce((sum, m) => sum + estimateTokenCount(m.content || ""), 0);
+}
+
+export function shouldTriggerContextSummarization(
+  usedTokens: number,
+  maxContextTokens: number,
+  threshold = CONTEXT_SUMMARIZATION_THRESHOLD
+): boolean {
+  if (maxContextTokens <= 0) return false;
+  const ratio = usedTokens / maxContextTokens;
+  return ratio >= threshold;
 }
 
 async function requestInlineCompletionFromBackend(
@@ -263,20 +289,83 @@ export interface ChatSession {
   messages: ChatMessage[];
 }
 
+function formatSessionTimestamp(ts: number): string {
+  return new Date(ts).toLocaleString();
+}
+
+function sanitizeExportFileName(name: string): string {
+  const base = (name || "session")
+    .trim()
+    .replace(/[/\\?%*:|"<>]/g, "-")
+    .replace(/\s+/g, "-")
+    .replace(/-+/g, "-")
+    .replace(/^-|-$/g, "");
+  const safe = base || "session";
+  return safe.toLowerCase().endsWith(".md") ? safe : `${safe}.md`;
+}
+
+export function serializeSessions(sessions: ChatSession[]): string {
+  return JSON.stringify(sessions);
+}
+
+export function deserializeSessions(raw: string): ChatSession[] {
+  const parsed = JSON.parse(raw) as unknown;
+  return Array.isArray(parsed) ? (parsed as ChatSession[]) : [];
+}
+
+function formatSessionAsMarkdown(session: ChatSession): string {
+  const lines: string[] = [
+    `# ${session.title || "New Chat"}`,
+    "",
+    `- Created: ${formatSessionTimestamp(session.createdAt)}`,
+    `- Updated: ${formatSessionTimestamp(session.updatedAt)}`,
+    `- Messages: ${session.messages.length}`,
+    "",
+    "---",
+    "",
+  ];
+
+  session.messages.forEach((msg, idx) => {
+    const roleLabel =
+      msg.role === "assistant" ? "Assistant" : msg.role === "user" ? "User" : "System";
+    const providerLabel = msg.provider ? `${msg.provider}: ` : "";
+    const modelLabel = msg.model ? `${providerLabel}${msg.model}` : "";
+    lines.push(`## ${idx + 1}. ${roleLabel} · ${formatSessionTimestamp(msg.timestamp)}`);
+    if (modelLabel) lines.push(`**Model:** ${modelLabel}`);
+    if (msg.isError) lines.push(`**Status:** Error`);
+    lines.push("");
+    lines.push(msg.content || "_(empty)_");
+    lines.push("");
+    lines.push("---");
+    lines.push("");
+  });
+
+  return lines.join("\n").trimEnd() + "\n";
+}
+
 function loadSessions(): ChatSession[] {
   try {
     if (typeof window === "undefined") return [];
     const raw = window.localStorage.getItem(AI_SESSIONS_KEY);
     if (!raw) return [];
-    return JSON.parse(raw) as ChatSession[];
+    return deserializeSessions(raw);
   } catch { return []; }
 }
 
 function saveSessions(sessions: ChatSession[]) {
   try {
     if (typeof window === "undefined") return;
-    window.localStorage.setItem(AI_SESSIONS_KEY, JSON.stringify(sessions));
+    window.localStorage.setItem(AI_SESSIONS_KEY, serializeSessions(sessions));
   } catch { /* ignore */ }
+}
+
+let _saveSessionsTimer: ReturnType<typeof setTimeout> | null = null;
+function debouncedSaveSessions(sessions: ChatSession[]) {
+  if (_saveSessionsTimer) clearTimeout(_saveSessionsTimer);
+  _saveSessionsTimer = setTimeout(() => {
+    saveSessions(sessions);
+    _saveSessionsTimer = null;
+  }, 300);
 }
 
 function sessionTitle(messages: ChatMessage[]): string {
@@ -465,6 +554,7 @@ interface AIStore {
   newChat: () => void;
   switchSession: (id: string) => void;
   deleteSession: (id: string) => void;
+  exportSession: (id: string) => Promise<string>;
   toggleSessionList: () => void;
   addStreamToken: (messageId: string, token: string) => void;
   initStreamingMessage: (messageId: string, model?: string) => void;
@@ -480,7 +570,7 @@ interface AIStore {
   markCodebaseChanged: (filePath?: string) => void;
   projectContext: ProjectContext | null;
   setProjectContext: (ctx: ProjectContext | null) => void;
-  _syncSessionMessages: (messages: ChatMessage[]) => void;
+  _syncSessionMessages: (messages: ChatMessage[], options?: { debounced?: boolean }) => void;
 }
 
 export const useAIStore = create<AIStore>((set, get) => ({
@@ -938,8 +1028,8 @@ export const useAIStore = create<AIStore>((set, get) => ({
         };
         set((s) => {
           const updated = [...s.chatHistory, timeoutMsg];
-          saveChatHistory(updated);
-          get()._syncSessionMessages(updated);
+          debouncedSaveChatHistory(updated);
+          get()._syncSessionMessages(updated, { debounced: true });
           return { chatHistory: updated, isThinking: false, abortController: null };
         });
       }
@@ -1020,21 +1110,24 @@ export const useAIStore = create<AIStore>((set, get) => ({
           ? `Previously selected model(s) [${invalidOllamaModels.join(", ")}] are not installed. Available: ${availableModels.join(", ") || "none — is Ollama running?"}`
           : "No AI models selected. Please configure a model in Settings.";
         logAIError("NO_MODEL", hint);
-        set((s) => ({
-          chatHistory: [
-            ...s.chatHistory,
-            {
-              id: `msg-${Date.now()}-error`,
-              role: "assistant",
-              content: hint,
-              timestamp: Date.now(),
-              isError: true,
-              retryContent: content,
-            },
-          ],
-          isThinking: false,
-          abortController: null,
-        }));
+        set((s) => {
+          const noModelMsg: ChatMessage = {
+            id: `msg-${Date.now()}-error`,
+            role: "assistant",
+            content: hint,
+            timestamp: Date.now(),
+            isError: true,
+            retryContent: content,
+          };
+          const updated: ChatMessage[] = [...s.chatHistory, noModelMsg];
+          debouncedSaveChatHistory(updated);
+          get()._syncSessionMessages(updated, { debounced: true });
+          return {
+            chatHistory: updated,
+            isThinking: false,
+            abortController: null,
+          };
+        });
         clearTimeout(watchdogTimer);
         return;
       }
@@ -1198,9 +1291,9 @@ export const useAIStore = create<AIStore>((set, get) => ({
           const isDuplicate = s.chatHistory.some(m => m.role === assistantMsg.role && m.content === assistantMsg.content && (Date.now() - m.timestamp < 3000));
           const updated = isDuplicate ? s.chatHistory : [...s.chatHistory, assistantMsg];
           if (!isDuplicate) {
-            saveChatHistory(updated);
+            debouncedSaveChatHistory(updated);
             // Persist to active session
-            get()._syncSessionMessages(updated);
+            get()._syncSessionMessages(updated, { debounced: true });
           }
           return { chatHistory: updated };
         });
@@ -1259,13 +1352,12 @@ export const useAIStore = create<AIStore>((set, get) => ({
 
     } catch (e: any) {
       clearTimeout(watchdogTimer);
+      const wasUserAbort = e?.name === "AbortError";
       // Abort any in-flight request
       controller.abort();
 
       const isTimeout = e?.message === "REQUEST_TIMEOUT";
-      const isAborted = e?.name === "AbortError" || controller.signal.aborted;
-
-      if (isAborted && !isTimeout) {
+      if (wasUserAbort && !isTimeout) {
         // User manually aborted — just reset state, no error message
         set({ isThinking: false, abortController: null });
         return;
@@ -1301,7 +1393,10 @@ export const useAIStore = create<AIStore>((set, get) => ({
       set((s) => {
         const isDuplicate = s.chatHistory.some(m => m.role === errMsg.role && m.content === errMsg.content && (Date.now() - m.timestamp < 3000));
         const updated = isDuplicate ? s.chatHistory : [...s.chatHistory, errMsg];
-        if (!isDuplicate) saveChatHistory(updated);
+        if (!isDuplicate) {
+          debouncedSaveChatHistory(updated);
+          get()._syncSessionMessages(updated, { debounced: true });
+        }
         return { chatHistory: updated, isThinking: false, abortController: null };
       });
     }
@@ -1379,7 +1474,7 @@ export const useAIStore = create<AIStore>((set, get) => ({
     set((s) => {
       const updated = [...s.chatHistory, placeholder];
       debouncedSaveChatHistory(updated);
-      get()._syncSessionMessages(updated);
+      get()._syncSessionMessages(updated, { debounced: true });
       return { chatHistory: updated, isStreaming: true, streamingMessageId: messageId };
     });
   },
@@ -1453,24 +1548,57 @@ export const useAIStore = create<AIStore>((set, get) => ({
     }
   },
 
+  exportSession: async (id: string) => {
+    const { sessions, activeSessionId, chatHistory } = get();
+    const existing = sessions.find(s => s.id === id);
+    if (!existing) throw new Error("Session not found.");
+
+    const sessionForExport =
+      id === activeSessionId
+        ? {
+            ...existing,
+            messages: chatHistory,
+            updatedAt: Date.now(),
+            title: sessionTitle(chatHistory),
+          }
+        : existing;
+
+    const markdown = formatSessionAsMarkdown(sessionForExport);
+    const stamp = new Date(sessionForExport.updatedAt)
+      .toISOString()
+      .replace(/[:.]/g, "-");
+    const fileName = sanitizeExportFileName(`${sessionForExport.title || "chat-session"}-${stamp}.md`);
+
+    const filePath = await invoke<string>("export_session_markdown", {
+      markdown,
+      fileName,
+    });
+
+    return filePath;
+  },
+
   toggleSessionList: () => set(s => ({ showSessionList: !s.showSessionList })),
 
   // Internal: sync current chatHistory into the active session
-  _syncSessionMessages: (messages: ChatMessage[]) => {
+  _syncSessionMessages: (messages: ChatMessage[], options?: { debounced?: boolean }) => {
+    const persist = (sessions: ChatSession[]) => {
+      if (options?.debounced) debouncedSaveSessions(sessions);
+      else saveSessions(sessions);
+    };
     const { sessions, activeSessionId } = get();
     if (!activeSessionId) {
       // Auto-create first session
       const newId = `session-${Date.now()}`;
       const newSession: ChatSession = { id: newId, title: sessionTitle(messages), createdAt: Date.now(), updatedAt: Date.now(), messages };
       const updated = [newSession, ...sessions];
-      saveSessions(updated);
+      persist(updated);
       set({ sessions: updated, activeSessionId: newId });
       return;
     }
     const updated = sessions.map(s =>
       s.id === activeSessionId ? { ...s, messages, title: sessionTitle(messages), updatedAt: Date.now() } : s
     );
-    saveSessions(updated);
+    persist(updated);
     set({ sessions: updated });
   },
 
@@ -1627,7 +1755,12 @@ export const useAIStore = create<AIStore>((set, get) => ({
         timestamp: Date.now(),
         model,
       };
-      set((s) => ({ chatHistory: [...s.chatHistory, assistantMsg], isThinking: false }));
+      set((s) => {
+        const updated = [...s.chatHistory, assistantMsg];
+        debouncedSaveChatHistory(updated);
+        get()._syncSessionMessages(updated, { debounced: true });
+        return { chatHistory: updated, isThinking: false };
+      });
     } catch (e) {
       logAIError('AGENT_ERROR', String(e));
       const errMsg: ChatMessage = {
@@ -1637,7 +1770,12 @@ export const useAIStore = create<AIStore>((set, get) => ({
         timestamp: Date.now(),
         isError: true,
       };
-      set((s) => ({ chatHistory: [...s.chatHistory, errMsg], isThinking: false }));
+      set((s) => {
+        const updated = [...s.chatHistory, errMsg];
+        debouncedSaveChatHistory(updated);
+        get()._syncSessionMessages(updated, { debounced: true });
+        return { chatHistory: updated, isThinking: false };
+      });
     }
   },
 
@@ -1658,7 +1796,8 @@ export const useAIStore = create<AIStore>((set, get) => ({
         const updated = s.chatHistory.map((m) =>
           m.id === messageId ? { ...m, isStreaming: false } : m
         );
-        saveChatHistory(updated);
+        debouncedSaveChatHistory(updated);
+        useAIStore.getState()._syncSessionMessages(updated, { debounced: true });
         return {
           chatHistory: updated,
           isStreaming: false,
@@ -1691,7 +1830,8 @@ export const useAIStore = create<AIStore>((set, get) => ({
                 isIncomplete: true,
               },
             ];
-        saveChatHistory(final);
+        debouncedSaveChatHistory(final);
+        useAIStore.getState()._syncSessionMessages(final, { debounced: true });
         return {
           chatHistory: final,
           isStreaming: false,
