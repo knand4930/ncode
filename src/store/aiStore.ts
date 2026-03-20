@@ -13,6 +13,7 @@ export interface ChatMessage {
   id: string;
   role: "user" | "assistant" | "system";
   content: string;
+  mode?: AIMode;
   thinkingContent?: string;
   bugReport?: BugReport;
   sources?: Array<{ filePath: string; startLine: number; endLine: number }>;
@@ -470,6 +471,7 @@ interface AIStore {
   updateMessage: (id: string, content: string, metadata?: Partial<ChatMessage>) => void;
   indexCodebase: (path: string) => Promise<void>;
   toggleRAG: () => void;
+  setRAGEnabled: (enabled: boolean) => void;
   setAIMode: (mode: AIMode) => void;
   setShowThinking: (show: boolean) => void;
   persistSettings: () => void;
@@ -1182,6 +1184,7 @@ export const useAIStore = create<AIStore>((set, get) => ({
           id: `msg-${Date.now()}-${winner.model}`,
           role: "assistant",
           content: parsedContent,
+          mode: aiMode,
           thinkingContent,
           bugReport,
           sources: sourcesToAttach,
@@ -1288,6 +1291,7 @@ export const useAIStore = create<AIStore>((set, get) => ({
         id: `msg-${Date.now()}`,
         role: "assistant",
         content: errorContent,
+        mode: aiMode,
         timestamp: Date.now(),
         isError: true,
         retryContent: content,
@@ -1485,9 +1489,30 @@ export const useAIStore = create<AIStore>((set, get) => ({
     set((s) => ({ useRAG: !s.useRAG }));
     get().persistSettings();
   },
-  setAIMode: (aiMode) => {
-    set({ aiMode });
+  setRAGEnabled: (enabled) => {
+    set({ useRAG: enabled });
     get().persistSettings();
+  },
+  setAIMode: (aiMode) => {
+    let activatingArchitect = false;
+    const shouldEnableRAG = aiMode === "architect";
+    set((s) => {
+      activatingArchitect = aiMode === "architect" && s.aiMode !== "architect";
+      return {
+        aiMode,
+        useRAG: shouldEnableRAG ? true : s.useRAG,
+      };
+    });
+    get().persistSettings();
+
+    // Architect mode always tries to refresh RAG index so architecture
+    // responses have up-to-date structural/dependency context.
+    if (aiMode === "architect") {
+      const { openFolder, isIndexing, indexDirty, indexedChunks } = get();
+      if (openFolder && !isIndexing && (activatingArchitect || indexDirty || indexedChunks === 0)) {
+        void get().indexCodebase(openFolder);
+      }
+    }
   },
   setShowThinking: (showThinking) => {
     set({ showThinking });

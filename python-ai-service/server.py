@@ -20,7 +20,7 @@ import os
 import sys
 import time
 from concurrent import futures
-from typing import AsyncIterator, List, Dict, Optional
+from typing import AsyncIterator, List, Dict, Optional, Tuple
 
 try:
     import aiohttp
@@ -50,9 +50,21 @@ CORE_DEPS_AVAILABLE = AIOHTTP_AVAILABLE and PYDANTIC_AVAILABLE
 # Import AI modules for advanced reasoning and RAG
 try:
     from config import Settings
-    from prompts import get_system_prompt, SYSTEM_PROMPTS, AIMode, ISSUE_DETECTION_PROMPT
+    from prompts import (
+        get_system_prompt,
+        SYSTEM_PROMPTS,
+        AIMode,
+        ISSUE_DETECTION_PROMPT,
+        ARCHITECTURE_REVIEW_PROMPT,
+    )
     from reasoning import IssueDetector, ConfidenceScorer, ResponseValidator
-    from rag_advanced import AdvancedCodeChunker, SmartRetriever, ContextBuilder
+    from rag_advanced import (
+        AdvancedCodeChunker,
+        SmartRetriever,
+        ContextBuilder,
+        ArchitectureDependencyAnalyzer,
+        DependencyGraphAnalysis,
+    )
     MODULES_AVAILABLE = True
 except ImportError as e:
     MODULES_AVAILABLE = False
@@ -915,6 +927,45 @@ class AIServicer(AIServiceServicer if PROTOBUF_AVAILABLE else object):
             return await prov.fetch_models()
         finally:
             await prov.close()
+
+    def _infer_mode(self, request: PBChatRequest) -> "AIMode":
+        """Infer AI mode from explicit mode field or request text."""
+        mode_str = getattr(request, "mode", "") or ""
+        if mode_str:
+            try:
+                if mode_str.upper() in AIMode.__members__:
+                    return AIMode[mode_str.upper()]
+                return AIMode(mode_str.lower())
+            except (KeyError, ValueError):
+                pass
+
+        history_text = "\n".join(getattr(m, "content", "") for m in getattr(request, "history", []))
+        text = f"{request.prompt}\n{history_text}".lower()
+
+        if any(token in text for token in ["debug", "bug", "vulnerability", "bug hunt", "race condition"]):
+            return AIMode.BUG_HUNT
+        if any(token in text for token in ["architect mode", "architecture review", "system design", "scalability", "design patterns", "architecture"]):
+            return AIMode.ARCHITECT
+        if any(token in text for token in ["think", "reason", "step-by-step"]):
+            return AIMode.THINK
+        if any(token in text for token in ["analyze", "analyse", "review", "refactor", "code quality"]):
+            return AIMode.CODE
+
+        return AIMode.CHAT
+
+    def _build_architect_dependency_report(self, messages: List[Dict[str, str]]) -> Tuple[Optional[DependencyGraphAnalysis], str]:
+        """
+        Build dependency graph analysis from retrieved code context embedded in messages.
+        Returns both raw analysis and a formatted markdown report.
+        """
+        try:
+            text = "\n\n".join(m.get("content", "") for m in messages if m.get("content"))
+            analysis = ArchitectureDependencyAnalyzer.analyze_from_rag_context(text)
+            report = ArchitectureDependencyAnalyzer.format_for_prompt(analysis)
+            return analysis, report
+        except Exception as e:
+            logger.warning(f"Dependency graph analysis failed: {e}")
+            return None, ""
     
     async def Chat(self, request: PBChatRequest, context: grpc.aio.ServicerContext) -> ChatResponse:
         """Handle chat requests with advanced reasoning and issue detection"""
@@ -927,33 +978,28 @@ class AIServicer(AIServiceServicer if PROTOBUF_AVAILABLE else object):
             
             # Initialize system prompt
             system_prompt = "You are a helpful AI assistant."
+            mode = AIMode.CHAT if MODULES_AVAILABLE else None
+            dependency_report = ""
+            dependency_analysis: Optional[DependencyGraphAnalysis] = None
             
             # Use advanced prompting if available
             if MODULES_AVAILABLE:
                 try:
-                    # Prefer explicit mode field from request, fall back to heuristics
-                    mode_str = getattr(request, "mode", "") or ""
-                    if mode_str:
-                        mode = get_system_prompt.__module__ and AIMode.CHAT  # placeholder
-                        try:
-                            mode = AIMode[mode_str.upper()] if mode_str.upper() in AIMode.__members__ else AIMode(mode_str.lower())
-                        except (KeyError, ValueError):
-                            mode = AIMode.CHAT
-                    else:
-                        # Determine AI mode based on request context
-                        mode = AIMode.CHAT  # Default mode
-                        if "debug" in request.prompt.lower() or "bug" in request.prompt.lower():
-                            mode = AIMode.BUG_HUNT
-                        elif "analyze" in request.prompt.lower() or "review" in request.prompt.lower():
-                            mode = AIMode.CODE
-                        elif "think" in request.prompt.lower() or "reason" in request.prompt.lower():
-                            mode = AIMode.THINK
-                        elif "design" in request.prompt.lower() or "architecture" in request.prompt.lower():
-                            mode = AIMode.ARCHITECT
+                    mode = self._infer_mode(request)
 
                     # Use ISSUE_DETECTION_PROMPT for bug_hunt mode (Req 5.1)
                     if mode == AIMode.BUG_HUNT:
                         system_prompt = ISSUE_DETECTION_PROMPT
+                    elif mode == AIMode.ARCHITECT:
+                        # Req 10.2: architect mode must use architecture review prompt.
+                        system_prompt = ARCHITECTURE_REVIEW_PROMPT
+
+                        # Include default template if present to preserve project-wide guardrails.
+                        loader = _get_template_loader()
+                        if loader:
+                            default_tpl = loader.get("default")
+                            if default_tpl:
+                                system_prompt = f"{default_tpl}\n\n{system_prompt}"
                     else:
                         loader = _get_template_loader()
                         if loader:
@@ -980,6 +1026,16 @@ class AIServicer(AIServiceServicer if PROTOBUF_AVAILABLE else object):
             try:
                 # Prepare messages with system prompt
                 enhanced_messages = [{"role": "system", "content": system_prompt}] + messages
+
+                # Req 10.4 / 10.5: parse imports/requires and detect circular dependencies
+                # for architect mode; feed this into the model and append to response later.
+                if MODULES_AVAILABLE and mode == AIMode.ARCHITECT:
+                    dependency_analysis, dependency_report = self._build_architect_dependency_report(messages)
+                    if dependency_report:
+                        enhanced_messages = [
+                            {"role": "system", "content": system_prompt},
+                            {"role": "system", "content": dependency_report},
+                        ] + messages
 
                 # Enable Anthropic extended thinking when provider is anthropic and mode is think (Req 4.7)
                 extra_kwargs: Dict = {}
@@ -1030,6 +1086,14 @@ class AIServicer(AIServiceServicer if PROTOBUF_AVAILABLE else object):
                         issue_msg = getattr(issue, "message", None) or getattr(issue, "description", "")
                     issues_text += f"- {issue_type}: {issue_msg}\n"
                 response_content = response + issues_text
+
+            # Req 10.5: include explicit dependency map + circular dependency summary.
+            if MODULES_AVAILABLE and mode == AIMode.ARCHITECT and dependency_report:
+                if dependency_analysis and dependency_analysis.circular_dependencies:
+                    logger.info(
+                        f"Architect analysis detected {len(dependency_analysis.circular_dependencies)} circular dependency cycle(s)"
+                    )
+                response_content = f"{response_content}\n\n{dependency_report}"
             
             return ChatResponse(
                 content=response_content,
@@ -1055,18 +1119,19 @@ class AIServicer(AIServiceServicer if PROTOBUF_AVAILABLE else object):
             # Use advanced prompting if available
             if MODULES_AVAILABLE:
                 try:
-                    mode = AIMode.CHAT
-                    if "debug" in request.prompt.lower() or "bug" in request.prompt.lower():
-                        mode = AIMode.BUG_HUNT
-                    elif "analyze" in request.prompt.lower() or "review" in request.prompt.lower():
-                        mode = AIMode.CODE
-                    
-                    loader = _get_template_loader()
-                    if loader:
-                        system_prompt = loader.get_system_prompt(mode.value)
+                    mode = self._infer_mode(request)
+                    if mode == AIMode.BUG_HUNT:
+                        system_prompt = ISSUE_DETECTION_PROMPT
+                    elif mode == AIMode.ARCHITECT:
+                        system_prompt = ARCHITECTURE_REVIEW_PROMPT
                     else:
-                        system_prompt = get_system_prompt(mode)
-                    logger.info(f"Streaming with AI mode: {mode.value}")                except Exception as e:
+                        loader = _get_template_loader()
+                        if loader:
+                            system_prompt = loader.get_system_prompt(mode.value)
+                        else:
+                            system_prompt = get_system_prompt(mode)
+                    logger.info(f"Streaming with AI mode: {mode.value}")
+                except Exception as e:
                     logger.warning(f"Failed to get advanced prompt: {e}")
             
             # Get the provider

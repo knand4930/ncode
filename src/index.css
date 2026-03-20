@@ -4499,6 +4499,52 @@ select:focus-visible {
   border-radius: 3px;
 }
 
+/* ── Architect Mode Collapsible Sections ── */
+.aip-architecture {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  margin-bottom: 4px;
+}
+.aip-arch-section {
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  overflow: hidden;
+  background: rgba(255, 255, 255, 0.02);
+}
+.aip-arch-toggle {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 6px 10px;
+  cursor: pointer;
+  list-style: none;
+  user-select: none;
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--text-muted);
+  transition: background var(--anim-fast), color var(--anim-fast);
+}
+.aip-arch-toggle:hover {
+  background: rgba(255, 255, 255, 0.05);
+  color: var(--text-normal, #cccccc);
+}
+.aip-arch-toggle::-webkit-details-marker { display: none; }
+.aip-arch-toggle::before {
+  content: "▶";
+  font-size: 9px;
+  transition: transform var(--anim-fast);
+}
+.aip-arch-section[open] .aip-arch-toggle::before {
+  transform: rotate(90deg);
+}
+.aip-arch-body {
+  padding: 8px 10px;
+  border-top: 1px solid var(--border);
+  font-size: 12px;
+  line-height: 1.6;
+}
+
 /* Incomplete stream notice */
 .aip-incomplete-notice {
   font-size: 11px;

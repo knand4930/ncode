@@ -20,6 +20,14 @@ import DOMPurify from "dompurify";
 import { countThinkingSteps } from "../../utils/parseThinkingBlock";
 
 type FileSuggestion = { path: string; content: string; language: string };
+type ArchitectureSectionKey = "Structure" | "Metrics" | "Risks" | "Improvements";
+
+const ARCHITECTURE_SECTION_ORDER: ArchitectureSectionKey[] = [
+  "Structure",
+  "Metrics",
+  "Risks",
+  "Improvements",
+];
 
 interface AgentStepEvent {
   step: number;
@@ -138,6 +146,79 @@ function extractFileSuggestions(md: string): FileSuggestion[] {
     if (path) push(path, m[2], lang);
   }
   return out.slice(0, 12);
+}
+
+function detectArchitectureHeading(line: string): { key: ArchitectureSectionKey; trailing: string } | null {
+  const cleaned = line
+    .trim()
+    .replace(/^[-*]\s*/, "")
+    .replace(/^\d+\.\s*/, "")
+    .replace(/^#{1,6}\s*/, "")
+    .replace(/\*\*/g, "")
+    .replace(/`/g, "")
+    .replace(/^[^A-Za-z0-9]+/, "");
+
+  const match = cleaned.match(/^(structure|metrics?|risks?|improvements?)\s*[:\-]?\s*(.*)$/i);
+  if (!match) return null;
+
+  const raw = match[1].toLowerCase();
+  const trailing = (match[2] || "").trim();
+  const key: ArchitectureSectionKey =
+    raw.startsWith("structure")
+      ? "Structure"
+      : raw.startsWith("metric")
+        ? "Metrics"
+        : raw.startsWith("risk")
+          ? "Risks"
+          : "Improvements";
+
+  return { key, trailing };
+}
+
+function extractArchitectureSections(
+  markdown: string,
+  forceForArchitectMode = false
+): { sections: Record<ArchitectureSectionKey, string>; remainder: string } | null {
+  const buckets: Record<ArchitectureSectionKey, string[]> = {
+    Structure: [],
+    Metrics: [],
+    Risks: [],
+    Improvements: [],
+  };
+  const remainder: string[] = [];
+  let active: ArchitectureSectionKey | null = null;
+  let foundHeading = false;
+
+  for (const line of markdown.split("\n")) {
+    const heading = detectArchitectureHeading(line);
+    if (heading) {
+      active = heading.key;
+      foundHeading = true;
+      if (heading.trailing) buckets[heading.key].push(heading.trailing);
+      continue;
+    }
+
+    if (active) buckets[active].push(line);
+    else remainder.push(line);
+  }
+
+  if (!foundHeading && !forceForArchitectMode) return null;
+
+  const sections = ARCHITECTURE_SECTION_ORDER.reduce((acc, key) => {
+    const joined = buckets[key].join("\n").trim();
+    if (joined) acc[key] = joined;
+    else if (forceForArchitectMode && key === "Structure") acc[key] = markdown.trim();
+    else acc[key] = "_No explicit details provided._";
+    return acc;
+  }, {} as Record<ArchitectureSectionKey, string>);
+
+  const cleanedRemainder = remainder.join("\n").trim();
+  const hideRemainder = forceForArchitectMode && cleanedRemainder === markdown.trim();
+
+  return {
+    sections,
+    remainder: hideRemainder ? "" : cleanedRemainder,
+  };
 }
 
 function isAbsPath(p: string) { return p.startsWith("/") || /^[A-Za-z]:[\\/]/.test(p); }
@@ -385,7 +466,9 @@ export function AIPanel() {
       if (lastErrors.length === 0) {
         setMentionWarning("No terminal errors detected.");
       } else {
-        const errText = lastErrors.map(e => `${e.file}:${e.line} — ${e.message}`).join("\n");
+        const errText = lastErrors
+          .map((e) => `${e.file ?? "unknown"}:${e.line ?? 0} — ${e.title}: ${e.detail}`)
+          .join("\n");
         // Add as a pseudo-file mention
         useAIStore.getState().addMentionedFile("@errors").catch(() => {});
         // Override with actual error content
@@ -878,6 +961,10 @@ export function AIPanel() {
             const codeSuggestion = msg.role === "assistant" ? extractFirstCodeBlock(msg.content) : null;
             const fileSuggestions = msg.role === "assistant" ? extractFileSuggestions(msg.content) : [];
             const shellCmds = msg.role === "assistant" ? extractShellCommands(msg.content) : [];
+            const architectureSections =
+              msg.role === "assistant"
+                ? extractArchitectureSections(msg.content, msg.mode === "architect")
+                : null;
             const canApprove = !!codeSuggestion && !!activeTabId && !!activeTab && msg.role === "assistant" && fileSuggestions.length === 0 && !rejectedMsgIds.has(msg.id);
 
             return (
@@ -910,7 +997,24 @@ export function AIPanel() {
                   </details>
                 )}
 
-                <div className="aip-msg-body" dangerouslySetInnerHTML={{ __html: renderMarkdown(msg.content) }} />
+                {architectureSections ? (
+                  <div className="aip-architecture">
+                    {ARCHITECTURE_SECTION_ORDER.map((section) => (
+                      <details key={`${msg.id}-${section}`} className="aip-arch-section">
+                        <summary className="aip-arch-toggle">{section}</summary>
+                        <div
+                          className="aip-arch-body"
+                          dangerouslySetInnerHTML={{ __html: renderMarkdown(architectureSections.sections[section]) }}
+                        />
+                      </details>
+                    ))}
+                    {architectureSections.remainder && (
+                      <div className="aip-msg-body" dangerouslySetInnerHTML={{ __html: renderMarkdown(architectureSections.remainder) }} />
+                    )}
+                  </div>
+                ) : (
+                  <div className="aip-msg-body" dangerouslySetInnerHTML={{ __html: renderMarkdown(msg.content) }} />
+                )}
 
                 {/* Bug report cards (Req 5.3, 5.4, 5.5) */}
                 {msg.role === "assistant" && msg.bugReport && (

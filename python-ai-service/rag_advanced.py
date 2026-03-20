@@ -5,8 +5,9 @@ Provides sophisticated code retrieval, chunking, and context building.
 """
 
 import logging
+import posixpath
 import re
-from typing import Dict, List, Tuple, Optional
+from typing import Dict, List, Tuple, Optional, Set
 from dataclasses import dataclass, asdict
 from collections import defaultdict
 
@@ -415,3 +416,244 @@ class VectorRetrieval:
         
         scored.sort(key=lambda x: x[1], reverse=True)
         return [chunk for chunk, _ in scored[:top_k]]
+
+
+# ============================================================================
+# ARCHITECTURE DEPENDENCY ANALYSIS
+# ============================================================================
+
+@dataclass
+class DependencyGraphAnalysis:
+    """Dependency graph extracted from code context."""
+    dependency_map: Dict[str, List[str]]
+    circular_dependencies: List[List[str]]
+    import_count: int
+    internal_edge_count: int
+
+
+class ArchitectureDependencyAnalyzer:
+    """
+    Parses import/require statements from RAG code blocks and builds a file-level
+    dependency graph, including circular dependency detection.
+    """
+
+    FILE_BLOCK_RE = re.compile(
+        r"//\s*File:\s*(?P<file>[^\n(]+?)(?:\s*\(lines\s+\d+\s*-\s*\d+\))?\s*\n```[^\n]*\n(?P<code>[\s\S]*?)```",
+        re.MULTILINE,
+    )
+
+    IMPORT_PATTERNS = [
+        re.compile(r"^\s*import(?:\s+type)?(?:[\s\w{},*$]+from\s+)?['\"]([^'\"]+)['\"]", re.MULTILINE),
+        re.compile(r"^\s*export(?:[\s\w{},*$]+from\s+)?['\"]([^'\"]+)['\"]", re.MULTILINE),
+        re.compile(r"require\(\s*['\"]([^'\"]+)['\"]\s*\)"),
+        re.compile(r"import\(\s*['\"]([^'\"]+)['\"]\s*\)"),
+        re.compile(r"^\s*from\s+([A-Za-z0-9_\.]+)\s+import\s+", re.MULTILINE),
+        re.compile(r"^\s*import\s+([A-Za-z0-9_\.]+)", re.MULTILINE),
+    ]
+
+    FILE_EXTENSIONS = (".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs", ".py")
+
+    @staticmethod
+    def analyze_from_rag_context(context_text: str) -> DependencyGraphAnalysis:
+        file_blocks = ArchitectureDependencyAnalyzer._extract_file_blocks(context_text)
+        known_files = set(file_blocks.keys())
+
+        dependency_map: Dict[str, List[str]] = {}
+        import_count = 0
+        internal_edge_count = 0
+
+        for file_path, code in file_blocks.items():
+            specs = ArchitectureDependencyAnalyzer._extract_import_specs(code)
+            import_count += len(specs)
+
+            targets: List[str] = []
+            seen_targets: Set[str] = set()
+            for spec in specs:
+                resolved = ArchitectureDependencyAnalyzer._resolve_internal_target(
+                    source_file=file_path,
+                    specifier=spec,
+                    known_files=known_files,
+                )
+                if resolved and resolved not in seen_targets:
+                    seen_targets.add(resolved)
+                    targets.append(resolved)
+                    internal_edge_count += 1
+
+            dependency_map[file_path] = targets
+
+        circular_dependencies = ArchitectureDependencyAnalyzer._detect_cycles(dependency_map)
+
+        return DependencyGraphAnalysis(
+            dependency_map=dependency_map,
+            circular_dependencies=circular_dependencies,
+            import_count=import_count,
+            internal_edge_count=internal_edge_count,
+        )
+
+    @staticmethod
+    def format_for_prompt(analysis: DependencyGraphAnalysis, max_edges_per_file: int = 8) -> str:
+        lines: List[str] = [
+            "## Dependency Graph Analysis",
+            f"- Files analyzed: {len(analysis.dependency_map)}",
+            f"- Import/require statements parsed: {analysis.import_count}",
+            f"- Internal dependency edges: {analysis.internal_edge_count}",
+            "",
+            "### Dependency Map",
+        ]
+
+        if not analysis.dependency_map:
+            lines.append("- (no files parsed from retrieved context)")
+        else:
+            for file_path in sorted(analysis.dependency_map.keys()):
+                deps = analysis.dependency_map[file_path]
+                if not deps:
+                    lines.append(f"- {file_path} -> (no internal dependencies)")
+                    continue
+                shown = deps[:max_edges_per_file]
+                suffix = ""
+                if len(deps) > max_edges_per_file:
+                    suffix = f" ... (+{len(deps) - max_edges_per_file} more)"
+                lines.append(f"- {file_path} -> {', '.join(shown)}{suffix}")
+
+        lines.append("")
+        lines.append("### Circular Dependencies")
+        if analysis.circular_dependencies:
+            for cycle in analysis.circular_dependencies:
+                lines.append(f"- ⚠️ {' -> '.join(cycle)}")
+        else:
+            lines.append("- None detected")
+
+        return "\n".join(lines).strip()
+
+    @staticmethod
+    def _extract_file_blocks(context_text: str) -> Dict[str, str]:
+        blocks: Dict[str, str] = {}
+        for match in ArchitectureDependencyAnalyzer.FILE_BLOCK_RE.finditer(context_text or ""):
+            raw_file = match.group("file").strip()
+            code = match.group("code")
+            if not raw_file or raw_file in blocks:
+                continue
+            blocks[ArchitectureDependencyAnalyzer._normalize_path(raw_file)] = code
+        return blocks
+
+    @staticmethod
+    def _extract_import_specs(code: str) -> List[str]:
+        specs: List[str] = []
+        seen: Set[str] = set()
+        for pattern in ArchitectureDependencyAnalyzer.IMPORT_PATTERNS:
+            for match in pattern.finditer(code or ""):
+                spec = (match.group(1) or "").strip()
+                if spec and spec not in seen:
+                    seen.add(spec)
+                    specs.append(spec)
+        return specs
+
+    @staticmethod
+    def _resolve_internal_target(source_file: str, specifier: str, known_files: Set[str]) -> Optional[str]:
+        spec = specifier.strip()
+        if not spec:
+            return None
+
+        # Handle common absolute alias formats like "@/foo/bar"
+        alias_candidate = None
+        if spec.startswith("@/"):
+            alias_candidate = spec[2:]
+        elif spec.startswith("src/"):
+            alias_candidate = spec
+
+        source_dir = posixpath.dirname(source_file)
+        candidates: List[str] = []
+
+        if spec.startswith("."):
+            base = ArchitectureDependencyAnalyzer._normalize_path(posixpath.join(source_dir, spec))
+            candidates.extend(ArchitectureDependencyAnalyzer._expand_candidates(base))
+        elif spec.startswith("/"):
+            base = ArchitectureDependencyAnalyzer._normalize_path(spec)
+            candidates.extend(ArchitectureDependencyAnalyzer._expand_candidates(base))
+        elif alias_candidate:
+            base = ArchitectureDependencyAnalyzer._normalize_path(alias_candidate)
+            candidates.extend(ArchitectureDependencyAnalyzer._expand_candidates(base))
+        elif "." in spec:
+            # Python-style module import (e.g., package.module)
+            base = ArchitectureDependencyAnalyzer._normalize_path(spec.replace(".", "/"))
+            candidates.extend(ArchitectureDependencyAnalyzer._expand_candidates(base))
+        else:
+            # Likely third-party package
+            return None
+
+        for candidate in candidates:
+            direct = ArchitectureDependencyAnalyzer._match_known_file(candidate, known_files)
+            if direct:
+                return direct
+
+        return None
+
+    @staticmethod
+    def _expand_candidates(base_path: str) -> List[str]:
+        candidates = [base_path]
+        root, ext = posixpath.splitext(base_path)
+        if not ext:
+            for file_ext in ArchitectureDependencyAnalyzer.FILE_EXTENSIONS:
+                candidates.append(f"{base_path}{file_ext}")
+            for file_ext in ArchitectureDependencyAnalyzer.FILE_EXTENSIONS:
+                candidates.append(posixpath.join(base_path, f"index{file_ext}"))
+        return [ArchitectureDependencyAnalyzer._normalize_path(c) for c in candidates]
+
+    @staticmethod
+    def _match_known_file(candidate: str, known_files: Set[str]) -> Optional[str]:
+        if candidate in known_files:
+            return candidate
+
+        suffix = f"/{candidate.lstrip('./')}"
+        matches = [f for f in known_files if f.endswith(suffix)]
+        if len(matches) == 1:
+            return matches[0]
+        return None
+
+    @staticmethod
+    def _normalize_path(path: str) -> str:
+        normalized = (path or "").replace("\\", "/")
+        return posixpath.normpath(normalized)
+
+    @staticmethod
+    def _detect_cycles(graph: Dict[str, List[str]]) -> List[List[str]]:
+        state: Dict[str, int] = {}  # 0=unvisited, 1=visiting, 2=done
+        stack: List[str] = []
+        cycle_keys: Set[Tuple[str, ...]] = set()
+        cycles: List[List[str]] = []
+
+        def canonical_cycle(nodes: List[str]) -> Tuple[str, ...]:
+            core = nodes[:-1]
+            if not core:
+                return tuple()
+            rotations = [tuple(core[i:] + core[:i]) for i in range(len(core))]
+            reversed_core = list(reversed(core))
+            rotations += [tuple(reversed_core[i:] + reversed_core[:i]) for i in range(len(reversed_core))]
+            return min(rotations)
+
+        def dfs(node: str) -> None:
+            state[node] = 1
+            stack.append(node)
+
+            for neighbor in graph.get(node, []):
+                if neighbor not in state:
+                    dfs(neighbor)
+                elif state[neighbor] == 1:
+                    try:
+                        start_idx = stack.index(neighbor)
+                    except ValueError:
+                        continue
+                    cycle = stack[start_idx:] + [neighbor]
+                    key = canonical_cycle(cycle)
+                    if key and key not in cycle_keys:
+                        cycle_keys.add(key)
+                        cycles.append(list(key) + [key[0]])
+
+            stack.pop()
+            state[node] = 2
+
+        for node in sorted(graph.keys()):
+            if node not in state:
+                dfs(node)
+
+        return cycles
