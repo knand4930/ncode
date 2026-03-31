@@ -60,6 +60,46 @@ class AIServiceStub(object):
                 request_serializer=ai__service__pb2.HealthRequest.SerializeToString,
                 response_deserializer=ai__service__pb2.HealthResponse.FromString,
                 _registered_method=True)
+        self.TurboQuantStart = channel.unary_stream(
+                '/ai_service.AIService/TurboQuantStart',
+                request_serializer=ai__service__pb2.TurboQuantRequest.SerializeToString,
+                response_deserializer=ai__service__pb2.TurboQuantProgress.FromString,
+                _registered_method=True)
+        self.TurboQuantList = channel.unary_unary(
+                '/ai_service.AIService/TurboQuantList',
+                request_serializer=ai__service__pb2.TurboQuantListRequest.SerializeToString,
+                response_deserializer=ai__service__pb2.TurboQuantListResponse.FromString,
+                _registered_method=True)
+        self.TurboQuantDelete = channel.unary_unary(
+                '/ai_service.AIService/TurboQuantDelete',
+                request_serializer=ai__service__pb2.TurboQuantDeleteRequest.SerializeToString,
+                response_deserializer=ai__service__pb2.TurboQuantDeleteResponse.FromString,
+                _registered_method=True)
+        self.HFSearch = channel.unary_unary(
+                '/ai_service.AIService/HFSearch',
+                request_serializer=ai__service__pb2.HFSearchRequest.SerializeToString,
+                response_deserializer=ai__service__pb2.HFSearchResponse.FromString,
+                _registered_method=True)
+        self.HFDownload = channel.unary_stream(
+                '/ai_service.AIService/HFDownload',
+                request_serializer=ai__service__pb2.HFDownloadRequest.SerializeToString,
+                response_deserializer=ai__service__pb2.HFDownloadProgress.FromString,
+                _registered_method=True)
+        self.HFDownloadCancel = channel.unary_unary(
+                '/ai_service.AIService/HFDownloadCancel',
+                request_serializer=ai__service__pb2.HFDownloadCancelRequest.SerializeToString,
+                response_deserializer=ai__service__pb2.HFDownloadCancelResponse.FromString,
+                _registered_method=True)
+        self.HFLocalList = channel.unary_unary(
+                '/ai_service.AIService/HFLocalList',
+                request_serializer=ai__service__pb2.HFLocalListRequest.SerializeToString,
+                response_deserializer=ai__service__pb2.HFLocalListResponse.FromString,
+                _registered_method=True)
+        self.HFLocalDelete = channel.unary_unary(
+                '/ai_service.AIService/HFLocalDelete',
+                request_serializer=ai__service__pb2.HFLocalDeleteRequest.SerializeToString,
+                response_deserializer=ai__service__pb2.HFLocalDeleteResponse.FromString,
+                _registered_method=True)
 
 
 class AIServiceServicer(object):
@@ -94,6 +134,62 @@ class AIServiceServicer(object):
         context.set_details('Method not implemented!')
         raise NotImplementedError('Method not implemented!')
 
+    def TurboQuantStart(self, request, context):
+        """TurboQuant: start quantization, returns a stream of progress events
+        """
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+    def TurboQuantList(self, request, context):
+        """TurboQuant: list all quantized models in the cache
+        """
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+    def TurboQuantDelete(self, request, context):
+        """TurboQuant: delete a quantized model from the cache
+        """
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+    def HFSearch(self, request, context):
+        """HuggingFace Hub search
+        """
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+    def HFDownload(self, request, context):
+        """Download model from HF Hub — streams progress events
+        """
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+    def HFDownloadCancel(self, request, context):
+        """Cancel an in-progress download
+        """
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+    def HFLocalList(self, request, context):
+        """List locally downloaded models
+        """
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+    def HFLocalDelete(self, request, context):
+        """Delete a locally downloaded model
+        """
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
 
 def add_AIServiceServicer_to_server(servicer, server):
     rpc_method_handlers = {
@@ -116,6 +212,46 @@ def add_AIServiceServicer_to_server(servicer, server):
                     servicer.Health,
                     request_deserializer=ai__service__pb2.HealthRequest.FromString,
                     response_serializer=ai__service__pb2.HealthResponse.SerializeToString,
+            ),
+            'TurboQuantStart': grpc.unary_stream_rpc_method_handler(
+                    servicer.TurboQuantStart,
+                    request_deserializer=ai__service__pb2.TurboQuantRequest.FromString,
+                    response_serializer=ai__service__pb2.TurboQuantProgress.SerializeToString,
+            ),
+            'TurboQuantList': grpc.unary_unary_rpc_method_handler(
+                    servicer.TurboQuantList,
+                    request_deserializer=ai__service__pb2.TurboQuantListRequest.FromString,
+                    response_serializer=ai__service__pb2.TurboQuantListResponse.SerializeToString,
+            ),
+            'TurboQuantDelete': grpc.unary_unary_rpc_method_handler(
+                    servicer.TurboQuantDelete,
+                    request_deserializer=ai__service__pb2.TurboQuantDeleteRequest.FromString,
+                    response_serializer=ai__service__pb2.TurboQuantDeleteResponse.SerializeToString,
+            ),
+            'HFSearch': grpc.unary_unary_rpc_method_handler(
+                    servicer.HFSearch,
+                    request_deserializer=ai__service__pb2.HFSearchRequest.FromString,
+                    response_serializer=ai__service__pb2.HFSearchResponse.SerializeToString,
+            ),
+            'HFDownload': grpc.unary_stream_rpc_method_handler(
+                    servicer.HFDownload,
+                    request_deserializer=ai__service__pb2.HFDownloadRequest.FromString,
+                    response_serializer=ai__service__pb2.HFDownloadProgress.SerializeToString,
+            ),
+            'HFDownloadCancel': grpc.unary_unary_rpc_method_handler(
+                    servicer.HFDownloadCancel,
+                    request_deserializer=ai__service__pb2.HFDownloadCancelRequest.FromString,
+                    response_serializer=ai__service__pb2.HFDownloadCancelResponse.SerializeToString,
+            ),
+            'HFLocalList': grpc.unary_unary_rpc_method_handler(
+                    servicer.HFLocalList,
+                    request_deserializer=ai__service__pb2.HFLocalListRequest.FromString,
+                    response_serializer=ai__service__pb2.HFLocalListResponse.SerializeToString,
+            ),
+            'HFLocalDelete': grpc.unary_unary_rpc_method_handler(
+                    servicer.HFLocalDelete,
+                    request_deserializer=ai__service__pb2.HFLocalDeleteRequest.FromString,
+                    response_serializer=ai__service__pb2.HFLocalDeleteResponse.SerializeToString,
             ),
     }
     generic_handler = grpc.method_handlers_generic_handler(
@@ -227,6 +363,222 @@ class AIService(object):
             '/ai_service.AIService/Health',
             ai__service__pb2.HealthRequest.SerializeToString,
             ai__service__pb2.HealthResponse.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def TurboQuantStart(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_stream(
+            request,
+            target,
+            '/ai_service.AIService/TurboQuantStart',
+            ai__service__pb2.TurboQuantRequest.SerializeToString,
+            ai__service__pb2.TurboQuantProgress.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def TurboQuantList(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/ai_service.AIService/TurboQuantList',
+            ai__service__pb2.TurboQuantListRequest.SerializeToString,
+            ai__service__pb2.TurboQuantListResponse.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def TurboQuantDelete(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/ai_service.AIService/TurboQuantDelete',
+            ai__service__pb2.TurboQuantDeleteRequest.SerializeToString,
+            ai__service__pb2.TurboQuantDeleteResponse.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def HFSearch(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/ai_service.AIService/HFSearch',
+            ai__service__pb2.HFSearchRequest.SerializeToString,
+            ai__service__pb2.HFSearchResponse.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def HFDownload(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_stream(
+            request,
+            target,
+            '/ai_service.AIService/HFDownload',
+            ai__service__pb2.HFDownloadRequest.SerializeToString,
+            ai__service__pb2.HFDownloadProgress.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def HFDownloadCancel(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/ai_service.AIService/HFDownloadCancel',
+            ai__service__pb2.HFDownloadCancelRequest.SerializeToString,
+            ai__service__pb2.HFDownloadCancelResponse.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def HFLocalList(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/ai_service.AIService/HFLocalList',
+            ai__service__pb2.HFLocalListRequest.SerializeToString,
+            ai__service__pb2.HFLocalListResponse.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def HFLocalDelete(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/ai_service.AIService/HFLocalDelete',
+            ai__service__pb2.HFLocalDeleteRequest.SerializeToString,
+            ai__service__pb2.HFLocalDeleteResponse.FromString,
             options,
             channel_credentials,
             insecure,

@@ -1,0 +1,4 @@
+# file: /home/ubuntu/Projects/vscode-clone/python-ai-service/turbo_quant.py
+# hypothesis_version: 6.151.10
+
+[100, 128, 1024, '*', '-', '--outfile', '--outtype', '-f', '.', '.huggingface.co', '/', ':', 'Done.', 'Download complete.', 'GEMM', 'Modelfile', '\\', '__', 'awq', 'bits', 'create', 'created_at', 'done', 'downloading', 'error', 'file', 'ftp', 'gguf', 'gptq', 'http', 'https', 'huggingface.co', 'list', 'llama_cpp', 'local_path', 'metadata.json', 'method', 'model_id', 'ollama', 'ollama_name', 'pt', 'q4_0', 'q8_0', 'q_group_size', 'quantizing', 'size_mb', 'utf-8', 'version', 'w_bit', 'zero_point', '~/.cache/turbo_quant']

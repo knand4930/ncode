@@ -1,0 +1,4 @@
+# file: /home/ubuntu/Projects/vscode-clone/python-ai-service/hf_provider.py
+# hypothesis_version: 6.151.10
+
+[200, 401, 403, 429, 503, 512, '/', 'Authorization', 'Content-Type', '[DONE]', 'application/json', 'assistant', 'content', 'conversational', 'data:', 'generated_responses', 'generated_text', 'google/gemma-7b-it', 'inputs', 'max_new_tokens', 'microsoft/phi-2', 'parameters', 'past_user_inputs', 'replace', 'return_full_text', 'role', 'stream', 'system', 'text', 'text-generation', 'text/event-stream', 'token', 'user', 'utf-8']

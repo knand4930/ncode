@@ -52,6 +52,15 @@ pub fn run() {
             ai::start_grpc_service,
             ai::ollama_chat_stream,
             ai::run_agent_task,
+            // TurboQuant
+            ai::turbo_quant_start,
+            ai::turbo_quant_list,
+            ai::turbo_quant_delete,
+            // HF Local Models
+            ai::grpc_hf_search,
+            ai::grpc_hf_download,
+            ai::grpc_hf_local_list,
+            ai::grpc_hf_local_delete,
             // LSP
             lsp::start_lsp,
             lsp::lsp_request,

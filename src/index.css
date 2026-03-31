@@ -3810,6 +3810,15 @@ select:focus-visible {
 .aip-dot.on  { background: var(--success); box-shadow: 0 0 4px rgba(76,175,80,0.6); }
 .aip-dot.off { background: var(--error); }
 
+.aip-token-counter {
+  font-size: 10px;
+  color: var(--text-muted);
+  margin-left: auto;
+  margin-right: 4px;
+  opacity: 0.7;
+  white-space: nowrap;
+}
+
 /* Header actions */
 .aip-header-actions {
   display: flex;
@@ -3888,6 +3897,11 @@ select:focus-visible {
   background: rgba(244,71,71,0.08);
   border: 1px solid rgba(244,71,71,0.25);
   color: #ff8a8a;
+}
+.aip-banner-error {
+  background: rgba(244,71,71,0.12);
+  border: 1px solid rgba(244,71,71,0.4);
+  color: #ff6b6b;
 }
 .aip-banner-info {
   background: rgba(78,201,176,0.08);
@@ -4105,6 +4119,62 @@ select:focus-visible {
   transform: translateY(-1px);
 }
 
+/* First-run setup checklist (Req 12.5) */
+.aip-setup-checklist {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  padding: 24px 16px;
+  gap: 8px;
+}
+.aip-checklist {
+  list-style: none;
+  padding: 0;
+  margin: 8px 0 0;
+  width: 100%;
+  max-width: 320px;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+.aip-checklist-item {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  padding: 10px 12px;
+  background: var(--bg-secondary);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  font-size: 12px;
+}
+.aip-checklist-item.done {
+  opacity: 0.6;
+  border-color: rgba(78,201,176,0.4);
+}
+.aip-checklist-num {
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--text-accent);
+  min-width: 18px;
+  text-align: center;
+}
+.aip-checklist-body {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+.aip-checklist-body strong {
+  color: var(--text-primary);
+  font-size: 12px;
+}
+.aip-checklist-body span {
+  color: var(--text-secondary);
+  font-size: 11px;
+}
+.aip-checklist-body a {
+  color: var(--text-accent);
+}
+
 /* Message bubbles */
 .aip-msg {
   padding: 10px 14px;
@@ -4225,6 +4295,20 @@ select:focus-visible {
   color: #4fc1ff;
 }
 .aip-action-btn.primary:hover { background: rgba(0,122,204,0.25); border-color: rgba(0,122,204,0.6); }
+
+/* Auth error prompt (Req 12.3) */
+.aip-auth-error-prompt {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin-top: 6px;
+  padding: 6px 8px;
+  background: rgba(244,71,71,0.08);
+  border: 1px solid rgba(244,71,71,0.25);
+  border-radius: 4px;
+  color: #ff8a8a;
+  font-size: 11px;
+}
 
 /* File suggestions */
 .aip-file-suggestions {
@@ -4543,6 +4627,97 @@ select:focus-visible {
   border-top: 1px solid var(--border);
   font-size: 12px;
   line-height: 1.6;
+}
+
+/* ── Dependency Graph View ── */
+.aip-dep-graph {
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  margin-top: 6px;
+  background: rgba(255, 255, 255, 0.02);
+}
+.aip-dep-graph-toggle {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 6px 10px;
+  font-size: 12px;
+  font-weight: 500;
+  cursor: pointer;
+  color: var(--text-muted, #888);
+  list-style: none;
+  transition: background var(--anim-fast), color var(--anim-fast);
+}
+.aip-dep-graph-toggle:hover {
+  background: rgba(255, 255, 255, 0.05);
+  color: var(--text-normal, #cccccc);
+}
+.aip-dep-graph-toggle::-webkit-details-marker { display: none; }
+.aip-dep-graph-toggle::before {
+  content: "▶";
+  font-size: 9px;
+  transition: transform var(--anim-fast);
+}
+.aip-dep-graph[open] .aip-dep-graph-toggle::before {
+  transform: rotate(90deg);
+}
+.aip-dep-circular-badge {
+  margin-left: auto;
+  font-size: 10px;
+  color: var(--warning, #e5a550);
+  background: rgba(229, 165, 80, 0.12);
+  border-radius: 4px;
+  padding: 1px 6px;
+}
+.aip-dep-graph-body {
+  padding: 8px 10px;
+  border-top: 1px solid var(--border);
+  font-size: 11px;
+}
+.aip-dep-tree {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+.aip-dep-node {
+  padding: 2px 0;
+}
+.aip-dep-file {
+  font-family: var(--font-mono, monospace);
+  color: var(--text-normal, #cccccc);
+  font-size: 11px;
+}
+.aip-dep-children {
+  margin-left: 16px;
+  margin-top: 2px;
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+}
+.aip-dep-child {
+  font-family: var(--font-mono, monospace);
+  color: var(--text-muted, #888);
+  font-size: 10px;
+}
+.aip-dep-circular .aip-dep-file,
+.aip-dep-circular .aip-dep-child {
+  color: var(--error, #f44747);
+}
+.aip-dep-empty {
+  color: var(--text-muted, #888);
+  font-size: 11px;
+  font-style: italic;
+}
+.aip-dep-cycles {
+  margin-top: 8px;
+  padding-top: 8px;
+  border-top: 1px solid var(--border);
+  font-size: 11px;
+}
+.aip-dep-cycle {
+  color: var(--error, #f44747);
+  font-family: var(--font-mono, monospace);
+  margin-top: 3px;
 }
 
 /* Incomplete stream notice */

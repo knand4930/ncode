@@ -563,3 +563,14 @@ ERROR_PATTERNS: dict[str, list[str]] = {
     "injection":            ["query", "exec", "eval", "shell", "subprocess", "f\"SELECT"],
     "memory_leak":          ["malloc", "alloc", "new(", "Box::new", "Rc::new", "Arc::new"],
 }
+
+
+# ============================================================================
+# PROMPT ALIASES (for backward-compatible imports)
+# ============================================================================
+
+#: Alias for ARCHITECTURE_REVIEW_TEMPLATE — used by server.py for architect mode (Req 10.2)
+ARCHITECTURE_REVIEW_PROMPT = ARCHITECTURE_REVIEW_TEMPLATE
+
+#: Alias for the BUG_HUNT system prompt — used by server.py for bug_hunt mode (Req 5.1)
+ISSUE_DETECTION_PROMPT = SYSTEM_PROMPTS[AIMode.BUG_HUNT]

@@ -1,0 +1,4 @@
+# file: /home/ubuntu/Projects/vscode-clone/python-ai-service/hf_model_browser.py
+# hypothesis_version: 6.151.10
+
+[1000000000.0, 200, 429, 'Authorization', 'RATE_LIMIT', '_cached_results', '_from_cache', 'cardData', 'closed', 'description', 'downloads', 'gated', 'id', 'license', 'likes', 'limit', 'modelId', 'pipeline_tag', 'safetensors', 'search', 'sort', 'tags', 'text-generation', 'total']

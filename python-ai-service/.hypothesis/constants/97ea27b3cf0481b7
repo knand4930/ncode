@@ -1,0 +1,4 @@
+# file: /home/ubuntu/Projects/vscode-clone/python-ai-service/openai_compat_provider.py
+# hypothesis_version: 6.151.10
+
+[0.7, 200, 401, 403, 2000, '/', 'Authorization', 'Content-Type', 'application/json', 'choices', 'content', 'data', 'id', 'max_tokens', 'message', 'messages', 'model', 'openai_compat', 'temperature']

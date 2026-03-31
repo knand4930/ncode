@@ -1,0 +1,4 @@
+# file: /home/ubuntu/Projects/vscode-clone/python-ai-service/local_model_provider.py
+# hypothesis_version: 6.151.10
+
+[0.7, 512, 4096, '.gguf', 'choices', 'content', 'delta', 'oom', 'out of memory', 'pt']

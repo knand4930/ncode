@@ -14,7 +14,7 @@ _sym_db = _symbol_database.Default()
 
 
 
-DESCRIPTOR = _descriptor_pool.Default().AddSerializedFile(b'\n\x10\x61i_service.proto\x12\nai_service\"\x9e\x01\n\x0b\x43hatRequest\x12\r\n\x05model\x18\x01 \x01(\t\x12\x0e\n\x06prompt\x18\x02 \x01(\t\x12$\n\x07history\x18\x03 \x03(\x0b\x32\x13.ai_service.Message\x12\x10\n\x08provider\x18\x04 \x01(\t\x12\x0f\n\x07\x61pi_key\x18\x05 \x01(\t\x12\x13\n\x0btemperature\x18\x06 \x01(\x02\x12\x12\n\nmax_tokens\x18\x07 \x01(\x05\"(\n\x07Message\x12\x0c\n\x04role\x18\x01 \x01(\t\x12\x0f\n\x07\x63ontent\x18\x02 \x01(\t\"C\n\x0c\x43hatResponse\x12\x0f\n\x07\x63ontent\x18\x01 \x01(\t\x12\x13\n\x0btokens_used\x18\x02 \x01(\x05\x12\r\n\x05model\x18\x03 \x01(\t\",\n\rTokenResponse\x12\r\n\x05token\x18\x01 \x01(\t\x12\x0c\n\x04\x64one\x18\x02 \x01(\x08\"I\n\x12\x46\x65tchModelsRequest\x12\x10\n\x08provider\x18\x01 \x01(\t\x12\x0f\n\x07\x61pi_key\x18\x02 \x01(\t\x12\x10\n\x08\x62\x61se_url\x18\x03 \x01(\t\"4\n\x13\x46\x65tchModelsResponse\x12\x0e\n\x06models\x18\x01 \x03(\t\x12\r\n\x05\x65rror\x18\x02 \x01(\t\"\x0f\n\rHealthRequest\"1\n\x0eHealthResponse\x12\x0e\n\x06status\x18\x01 \x01(\t\x12\x0f\n\x07version\x18\x02 \x01(\t2\x9b\x02\n\tAIService\x12\x39\n\x04\x43hat\x12\x17.ai_service.ChatRequest\x1a\x18.ai_service.ChatResponse\x12\x42\n\nStreamChat\x12\x17.ai_service.ChatRequest\x1a\x19.ai_service.TokenResponse0\x01\x12N\n\x0b\x46\x65tchModels\x12\x1e.ai_service.FetchModelsRequest\x1a\x1f.ai_service.FetchModelsResponse\x12?\n\x06Health\x12\x19.ai_service.HealthRequest\x1a\x1a.ai_service.HealthResponseb\x06proto3')
+DESCRIPTOR = _descriptor_pool.Default().AddSerializedFile(b'\n\x10\x61i_service.proto\x12\nai_service\"\xb0\x01\n\x0b\x43hatRequest\x12\r\n\x05model\x18\x01 \x01(\t\x12\x0e\n\x06prompt\x18\x02 \x01(\t\x12$\n\x07history\x18\x03 \x03(\x0b\x32\x13.ai_service.Message\x12\x10\n\x08provider\x18\x04 \x01(\t\x12\x0f\n\x07\x61pi_key\x18\x05 \x01(\t\x12\x13\n\x0btemperature\x18\x06 \x01(\x02\x12\x12\n\nmax_tokens\x18\x07 \x01(\x05\x12\x10\n\x08\x62\x61se_url\x18\x08 \x01(\t\"(\n\x07Message\x12\x0c\n\x04role\x18\x01 \x01(\t\x12\x0f\n\x07\x63ontent\x18\x02 \x01(\t\"C\n\x0c\x43hatResponse\x12\x0f\n\x07\x63ontent\x18\x01 \x01(\t\x12\x13\n\x0btokens_used\x18\x02 \x01(\x05\x12\r\n\x05model\x18\x03 \x01(\t\",\n\rTokenResponse\x12\r\n\x05token\x18\x01 \x01(\t\x12\x0c\n\x04\x64one\x18\x02 \x01(\x08\"I\n\x12\x46\x65tchModelsRequest\x12\x10\n\x08provider\x18\x01 \x01(\t\x12\x0f\n\x07\x61pi_key\x18\x02 \x01(\t\x12\x10\n\x08\x62\x61se_url\x18\x03 \x01(\t\"4\n\x13\x46\x65tchModelsResponse\x12\x0e\n\x06models\x18\x01 \x03(\t\x12\r\n\x05\x65rror\x18\x02 \x01(\t\"\x0f\n\rHealthRequest\"1\n\x0eHealthResponse\x12\x0e\n\x06status\x18\x01 \x01(\t\x12\x0f\n\x07version\x18\x02 \x01(\t\"C\n\x11TurboQuantRequest\x12\x10\n\x08model_id\x18\x01 \x01(\t\x12\x0e\n\x06method\x18\x02 \x01(\t\x12\x0c\n\x04\x62its\x18\x03 \x01(\x05\"\x8b\x01\n\x12TurboQuantProgress\x12\r\n\x05stage\x18\x01 \x01(\t\x12\x0f\n\x07percent\x18\x02 \x01(\x05\x12\x0f\n\x07message\x18\x03 \x01(\t\x12\x0c\n\x04\x64one\x18\x04 \x01(\x08\x12\r\n\x05\x65rror\x18\x05 \x01(\t\x12\x12\n\nlocal_path\x18\x06 \x01(\t\x12\x13\n\x0bollama_name\x18\x07 \x01(\t\"\x17\n\x15TurboQuantListRequest\"H\n\x16TurboQuantListResponse\x12.\n\x06models\x18\x01 \x03(\x0b\x32\x1e.ai_service.QuantizedModelInfo\"\x92\x01\n\x12QuantizedModelInfo\x12\x10\n\x08model_id\x18\x01 \x01(\t\x12\x0e\n\x06method\x18\x02 \x01(\t\x12\x0c\n\x04\x62its\x18\x03 \x01(\x05\x12\x0f\n\x07size_mb\x18\x04 \x01(\x03\x12\x12\n\nlocal_path\x18\x05 \x01(\t\x12\x12\n\ncreated_at\x18\x06 \x01(\x03\x12\x13\n\x0bollama_name\x18\x07 \x01(\t\"I\n\x17TurboQuantDeleteRequest\x12\x10\n\x08model_id\x18\x01 \x01(\t\x12\x0e\n\x06method\x18\x02 \x01(\t\x12\x0c\n\x04\x62its\x18\x03 \x01(\x05\":\n\x18TurboQuantDeleteResponse\x12\x0f\n\x07success\x18\x01 \x01(\x08\x12\r\n\x05\x65rror\x18\x02 \x01(\t\"d\n\x0fHFSearchRequest\x12\r\n\x05query\x18\x01 \x01(\t\x12\x0c\n\x04task\x18\x02 \x01(\t\x12\r\n\x05limit\x18\x03 \x01(\x05\x12\x13\n\x0bmax_size_gb\x18\x04 \x01(\x02\x12\x10\n\x08hf_token\x18\x05 \x01(\t\"\x98\x01\n\x0bHFModelCard\x12\x10\n\x08model_id\x18\x01 \x01(\t\x12\x11\n\tdownloads\x18\x02 \x01(\x03\x12\r\n\x05likes\x18\x03 \x01(\x03\x12\x12\n\nsize_bytes\x18\x04 \x01(\x03\x12\x0f\n\x07license\x18\x05 \x01(\t\x12\x0c\n\x04tags\x18\x06 \x03(\t\x12\r\n\x05gated\x18\x07 \x01(\x08\x12\x13\n\x0b\x64\x65scription\x18\x08 \x01(\t\"J\n\x10HFSearchResponse\x12\'\n\x06models\x18\x01 \x03(\x0b\x32\x17.ai_service.HFModelCard\x12\r\n\x05\x65rror\x18\x02 \x01(\t\"7\n\x11HFDownloadRequest\x12\x10\n\x08model_id\x18\x01 \x01(\t\x12\x10\n\x08hf_token\x18\x02 \x01(\t\"\x93\x01\n\x12HFDownloadProgress\x12\x10\n\x08model_id\x18\x01 \x01(\t\x12\x12\n\nbytes_done\x18\x02 \x01(\x03\x12\x13\n\x0b\x62ytes_total\x18\x03 \x01(\x03\x12\x11\n\tspeed_bps\x18\x04 \x01(\x03\x12\x0c\n\x04\x64one\x18\x05 \x01(\x08\x12\r\n\x05\x65rror\x18\x06 \x01(\t\x12\x12\n\nlocal_path\x18\x07 \x01(\t\"+\n\x17HFDownloadCancelRequest\x12\x10\n\x08model_id\x18\x01 \x01(\t\"+\n\x18HFDownloadCancelResponse\x12\x0f\n\x07success\x18\x01 \x01(\x08\"\x14\n\x12HFLocalListRequest\"A\n\x13HFLocalListResponse\x12*\n\x06models\x18\x01 \x03(\x0b\x32\x1a.ai_service.LocalModelInfo\"\xab\x01\n\x0eLocalModelInfo\x12\x10\n\x08model_id\x18\x01 \x01(\t\x12\x12\n\nlocal_path\x18\x02 \x01(\t\x12\x12\n\nsize_bytes\x18\x03 \x01(\x03\x12\x15\n\rdownloaded_at\x18\x04 \x01(\x03\x12\x16\n\x0equantized_path\x18\x05 \x01(\t\x12\x18\n\x10quantized_method\x18\x06 \x01(\t\x12\x16\n\x0equantized_bits\x18\x07 \x01(\x05\"(\n\x14HFLocalDeleteRequest\x12\x10\n\x08model_id\x18\x01 \x01(\t\"7\n\x15HFLocalDeleteResponse\x12\x0f\n\x07success\x18\x01 \x01(\x08\x12\r\n\x05\x65rror\x18\x02 \x01(\t2\xc2\x07\n\tAIService\x12\x39\n\x04\x43hat\x12\x17.ai_service.ChatRequest\x1a\x18.ai_service.ChatResponse\x12\x42\n\nStreamChat\x12\x17.ai_service.ChatRequest\x1a\x19.ai_service.TokenResponse0\x01\x12N\n\x0b\x46\x65tchModels\x12\x1e.ai_service.FetchModelsRequest\x1a\x1f.ai_service.FetchModelsResponse\x12?\n\x06Health\x12\x19.ai_service.HealthRequest\x1a\x1a.ai_service.HealthResponse\x12R\n\x0fTurboQuantStart\x12\x1d.ai_service.TurboQuantRequest\x1a\x1e.ai_service.TurboQuantProgress0\x01\x12W\n\x0eTurboQuantList\x12!.ai_service.TurboQuantListRequest\x1a\".ai_service.TurboQuantListResponse\x12]\n\x10TurboQuantDelete\x12#.ai_service.TurboQuantDeleteRequest\x1a$.ai_service.TurboQuantDeleteResponse\x12\x45\n\x08HFSearch\x12\x1b.ai_service.HFSearchRequest\x1a\x1c.ai_service.HFSearchResponse\x12M\n\nHFDownload\x12\x1d.ai_service.HFDownloadRequest\x1a\x1e.ai_service.HFDownloadProgress0\x01\x12]\n\x10HFDownloadCancel\x12#.ai_service.HFDownloadCancelRequest\x1a$.ai_service.HFDownloadCancelResponse\x12N\n\x0bHFLocalList\x12\x1e.ai_service.HFLocalListRequest\x1a\x1f.ai_service.HFLocalListResponse\x12T\n\rHFLocalDelete\x12 .ai_service.HFLocalDeleteRequest\x1a!.ai_service.HFLocalDeleteResponseb\x06proto3')
 
 _globals = globals()
 _builder.BuildMessageAndEnumDescriptors(DESCRIPTOR, _globals)
@@ -22,21 +22,59 @@ _builder.BuildTopDescriptorsAndMessages(DESCRIPTOR, 'ai_service_pb2', _globals)
 if not _descriptor._USE_C_DESCRIPTORS:
   DESCRIPTOR._loaded_options = None
   _globals['_CHATREQUEST']._serialized_start=33
-  _globals['_CHATREQUEST']._serialized_end=191
-  _globals['_MESSAGE']._serialized_start=193
-  _globals['_MESSAGE']._serialized_end=233
-  _globals['_CHATRESPONSE']._serialized_start=235
-  _globals['_CHATRESPONSE']._serialized_end=302
-  _globals['_TOKENRESPONSE']._serialized_start=304
-  _globals['_TOKENRESPONSE']._serialized_end=348
-  _globals['_FETCHMODELSREQUEST']._serialized_start=350
-  _globals['_FETCHMODELSREQUEST']._serialized_end=423
-  _globals['_FETCHMODELSRESPONSE']._serialized_start=425
-  _globals['_FETCHMODELSRESPONSE']._serialized_end=477
-  _globals['_HEALTHREQUEST']._serialized_start=479
-  _globals['_HEALTHREQUEST']._serialized_end=494
-  _globals['_HEALTHRESPONSE']._serialized_start=496
-  _globals['_HEALTHRESPONSE']._serialized_end=545
-  _globals['_AISERVICE']._serialized_start=548
-  _globals['_AISERVICE']._serialized_end=831
+  _globals['_CHATREQUEST']._serialized_end=209
+  _globals['_MESSAGE']._serialized_start=211
+  _globals['_MESSAGE']._serialized_end=251
+  _globals['_CHATRESPONSE']._serialized_start=253
+  _globals['_CHATRESPONSE']._serialized_end=320
+  _globals['_TOKENRESPONSE']._serialized_start=322
+  _globals['_TOKENRESPONSE']._serialized_end=366
+  _globals['_FETCHMODELSREQUEST']._serialized_start=368
+  _globals['_FETCHMODELSREQUEST']._serialized_end=441
+  _globals['_FETCHMODELSRESPONSE']._serialized_start=443
+  _globals['_FETCHMODELSRESPONSE']._serialized_end=495
+  _globals['_HEALTHREQUEST']._serialized_start=497
+  _globals['_HEALTHREQUEST']._serialized_end=512
+  _globals['_HEALTHRESPONSE']._serialized_start=514
+  _globals['_HEALTHRESPONSE']._serialized_end=563
+  _globals['_TURBOQUANTREQUEST']._serialized_start=565
+  _globals['_TURBOQUANTREQUEST']._serialized_end=632
+  _globals['_TURBOQUANTPROGRESS']._serialized_start=635
+  _globals['_TURBOQUANTPROGRESS']._serialized_end=774
+  _globals['_TURBOQUANTLISTREQUEST']._serialized_start=776
+  _globals['_TURBOQUANTLISTREQUEST']._serialized_end=799
+  _globals['_TURBOQUANTLISTRESPONSE']._serialized_start=801
+  _globals['_TURBOQUANTLISTRESPONSE']._serialized_end=873
+  _globals['_QUANTIZEDMODELINFO']._serialized_start=876
+  _globals['_QUANTIZEDMODELINFO']._serialized_end=1022
+  _globals['_TURBOQUANTDELETEREQUEST']._serialized_start=1024
+  _globals['_TURBOQUANTDELETEREQUEST']._serialized_end=1097
+  _globals['_TURBOQUANTDELETERESPONSE']._serialized_start=1099
+  _globals['_TURBOQUANTDELETERESPONSE']._serialized_end=1157
+  _globals['_HFSEARCHREQUEST']._serialized_start=1159
+  _globals['_HFSEARCHREQUEST']._serialized_end=1259
+  _globals['_HFMODELCARD']._serialized_start=1262
+  _globals['_HFMODELCARD']._serialized_end=1414
+  _globals['_HFSEARCHRESPONSE']._serialized_start=1416
+  _globals['_HFSEARCHRESPONSE']._serialized_end=1490
+  _globals['_HFDOWNLOADREQUEST']._serialized_start=1492
+  _globals['_HFDOWNLOADREQUEST']._serialized_end=1547
+  _globals['_HFDOWNLOADPROGRESS']._serialized_start=1550
+  _globals['_HFDOWNLOADPROGRESS']._serialized_end=1697
+  _globals['_HFDOWNLOADCANCELREQUEST']._serialized_start=1699
+  _globals['_HFDOWNLOADCANCELREQUEST']._serialized_end=1742
+  _globals['_HFDOWNLOADCANCELRESPONSE']._serialized_start=1744
+  _globals['_HFDOWNLOADCANCELRESPONSE']._serialized_end=1787
+  _globals['_HFLOCALLISTREQUEST']._serialized_start=1789
+  _globals['_HFLOCALLISTREQUEST']._serialized_end=1809
+  _globals['_HFLOCALLISTRESPONSE']._serialized_start=1811
+  _globals['_HFLOCALLISTRESPONSE']._serialized_end=1876
+  _globals['_LOCALMODELINFO']._serialized_start=1879
+  _globals['_LOCALMODELINFO']._serialized_end=2050
+  _globals['_HFLOCALDELETEREQUEST']._serialized_start=2052
+  _globals['_HFLOCALDELETEREQUEST']._serialized_end=2092
+  _globals['_HFLOCALDELETERESPONSE']._serialized_start=2094
+  _globals['_HFLOCALDELETERESPONSE']._serialized_end=2149
+  _globals['_AISERVICE']._serialized_start=2152
+  _globals['_AISERVICE']._serialized_end=3114
 # @@protoc_insertion_point(module_scope)

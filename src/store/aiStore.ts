@@ -25,6 +25,7 @@ export interface ChatMessage {
   isError?: boolean;        // marks error/timeout messages
   isIncomplete?: boolean;   // stream was cut off
   retryContent?: string;    // original user message to re-send on retry
+  isAuthError?: boolean;    // marks 401/403 auth errors from AI providers
 }
 
 export interface BugReport {
@@ -96,8 +97,65 @@ export interface ApiKeyEntry {
   label?: string;
 }
 
+// describes an external LLM provider configuration saved by user
+export interface ApiKeyEntry {
+  provider: string;   // e.g. "openai"
+  apiKey: string;
+  model: string;      // model identifier the key should be used with
+  label?: string;
+  baseUrl?: string;   // required for "openai_compat", optional for HF custom endpoints
+}
+
+export interface QuantizedModelInfo {
+  modelId: string;
+  method: "gguf" | "gptq" | "awq";
+  bits: 4 | 8;
+  sizeMb: number;
+  localPath: string;
+  createdAt: number;
+  ollamaName?: string;
+}
+
+export interface HFModelCard {
+  modelId: string;
+  downloads: number;
+  likes: number;
+  sizeBytes: number;
+  license: string;
+  tags: string[];
+  gated: boolean;
+  description: string;
+}
+
+export interface DownloadQueueEntry {
+  modelId: string;
+  status: "queued" | "downloading" | "paused" | "done" | "error" | "cancelled";
+  bytesDone: number;
+  bytesTotal: number;
+  speedBps: number;
+  error: string | null;
+  localPath: string | null;
+  startedAt: number;
+}
+
+export interface LocalModelInfo {
+  modelId: string;
+  localPath: string;
+  sizeBytes: number;
+  downloadedAt: number;
+  quantizedPath: string | null;
+  quantizedMethod: "gguf" | "gptq" | "awq" | null;
+  quantizedBits: 4 | 8 | null;
+}
+
+export interface DownloadProgress {
+  bytesDone: number;
+  bytesTotal: number;
+  speedBps: number;
+}
+
 type PersistedAISettings = {
-  selectedProvider: "ollama" | "api";
+  selectedProvider: "ollama" | "api" | "huggingface" | "local";
   aiServiceMode: AIServiceMode;
   ollamaBaseUrl?: string;
   selectedOllamaModels: string[];
@@ -105,6 +163,11 @@ type PersistedAISettings = {
   useRAG: boolean;
   aiMode: AIMode;
   showThinking: boolean;
+  hfApiKey?: string;
+  hfBaseUrl?: string;
+  hfSelectedModel?: string;
+  hfLocalToken?: string;
+  selectedLocalModel?: string | null;
 };
 
 const AI_SETTINGS_KEY = "NCode.ai.settings.v1";
@@ -114,8 +177,17 @@ export const INLINE_COMPLETION_DEBOUNCE_MS = 600;
 export const INLINE_COMPLETION_TIMEOUT_MS = 3000;
 export const CONTEXT_SUMMARIZATION_THRESHOLD = 0.9;
 
+export const CONTEXT_LIMITS: Record<string, number> = {
+  'llama3': 8192,
+  'codellama': 16384,
+  'deepseek-coder': 16384,
+  'gpt-4o': 128000,
+  'claude-3-5-sonnet': 200000,
+  'gemma2': 8192,
+};
+
 type InlineCompletionSnapshot = {
-  selectedProvider: "ollama" | "api";
+  selectedProvider: "ollama" | "api" | "huggingface" | "local";
   aiServiceMode: AIServiceMode;
   selectedOllamaModels: string[];
   selectedApiKeyIndices: number[];
@@ -380,7 +452,7 @@ function loadAISettings(): PersistedAISettings | null {
     const raw = window.localStorage.getItem(AI_SETTINGS_KEY);
     if (!raw) return null;
     const parsed = JSON.parse(raw) as PersistedAISettings;
-    if (!parsed || (parsed.selectedProvider !== "ollama" && parsed.selectedProvider !== "api")) {
+    if (!parsed || (parsed.selectedProvider !== "ollama" && parsed.selectedProvider !== "api" && parsed.selectedProvider !== "huggingface" && parsed.selectedProvider !== "local")) {
       return null;
     }
     if (parsed.aiServiceMode !== "direct" && parsed.aiServiceMode !== "grpc") {
@@ -485,7 +557,7 @@ interface AIStore {
   selectedOllamaModels: string[];
 
   apiKeys: ApiKeyEntry[];
-  selectedProvider: "ollama" | "api";
+  selectedProvider: "ollama" | "api" | "huggingface" | "local";
   aiServiceMode: AIServiceMode;
   selectedApiKeyIndices: number[];
   apiProviderModels: Record<string, string[]>; // cache of models per provider
@@ -514,10 +586,34 @@ interface AIStore {
   activeSessionId: string | null;
   showSessionList: boolean;
 
-  // Abort controller for in-flight requests (Task 1.1)
+  // HuggingFace provider state
+  hfApiKey: string;
+  hfBaseUrl: string;
+  hfSelectedModel: string;
+  hfModels: string[];
+
+  // TurboQuant state
+  turboQuantStatus: "idle" | "downloading" | "quantizing" | "done" | "error";
+  turboQuantProgress: number;
+  turboQuantStage: string;
+  turboQuantError: string | null;
+  quantizedModels: QuantizedModelInfo[];
+
+  // HF Local Model Manager state
+  hfSearchResults: HFModelCard[];
+  hfSearchLoading: boolean;
+  hfSearchError: string | null;
+  downloadQueue: DownloadQueueEntry[];
+  activeDownloads: Record<string, DownloadProgress>;
+  localModels: LocalModelInfo[];
+  localModelsLoading: boolean;
+  selectedLocalModel: string | null;
+  hfLocalToken: string;
+
   abortController: AbortController | null;
   // Reconnect state (Task 1.2 / 12.2)
   reconnectAttempts: number;
+  ollamaReconnectFailed: boolean;
 
   // Agent change history for rollback (Task 3.6)
   aiChangeHistory: AgentFileChange[];
@@ -525,13 +621,18 @@ interface AIStore {
   // @-mention context (Task 7)
   mentionedFiles: MentionedFile[];
 
+  // Context window management (Task 9)
+  estimatedTokens: number;
+  contextLimitWarning: 'none' | 'yellow';
+
   checkOllama: () => Promise<void>;
   startOllama: () => Promise<void>;
+  startOllamaReconnect: () => void;
   toggleOllamaModel: (model: string) => void;
   addAPIKey: (entry: ApiKeyEntry) => void;
   removeAPIKey: (index: number) => void;
   toggleAPIKey: (index: number) => void;
-  setProvider: (provider: "ollama" | "api") => void;
+  setProvider: (provider: "ollama" | "api" | "huggingface") => void;
   setAIServiceMode: (mode: AIServiceMode) => void;
   checkGrpcService: () => Promise<void>;
   startGrpcService: () => Promise<void>;
@@ -540,6 +641,24 @@ interface AIStore {
   fetchOpenAIModels: (index?: number) => Promise<void>;
   fetchAnthropicModels: (index?: number) => Promise<void>;
   fetchGroqModels: (index?: number) => Promise<void>;
+  // HuggingFace actions
+  setHFApiKey: (key: string) => void;
+  setHFBaseUrl: (url: string) => void;
+  setHFModel: (model: string) => void;
+  fetchHFModels: () => Promise<void>;
+  // TurboQuant actions
+  startTurboQuant: (modelId: string, method: string, bits: number) => Promise<void>;
+  cancelTurboQuant: () => void;
+  listQuantizedModels: () => Promise<void>;
+  deleteQuantizedModel: (modelId: string, method: string, bits: number) => Promise<void>;
+  // HF Local Model Manager actions
+  searchHFModels: (query: string, task?: string, maxSizeGb?: number) => Promise<void>;
+  downloadModel: (modelId: string) => Promise<void>;
+  cancelDownload: (modelId: string) => void;
+  listLocalModels: () => Promise<void>;
+  deleteLocalModel: (modelId: string) => Promise<void>;
+  setSelectedLocalModel: (modelId: string | null) => void;
+  setHFLocalToken: (token: string) => void;
   sendMessage: (content: string, activeFileContext?: string) => Promise<void>;
   abortRequest: () => void;
   retryLastMessage: () => Promise<void>;
@@ -550,6 +669,8 @@ interface AIStore {
   addMentionedFile: (path: string) => Promise<{ ok: boolean; reason?: string }>;
   removeMentionedFile: (path: string) => void;
   clearMentionedFiles: () => void;
+  // Context window management (Task 9)
+  summarizeOldMessages: () => void;
   clearChat: () => void;
   newChat: () => void;
   switchSession: (id: string) => void;
@@ -572,6 +693,8 @@ interface AIStore {
   setProjectContext: (ctx: ProjectContext | null) => void;
   _syncSessionMessages: (messages: ChatMessage[], options?: { debounced?: boolean }) => void;
 }
+
+let _ollamaReconnectInterval: ReturnType<typeof setInterval> | null = null;
 
 export const useAIStore = create<AIStore>((set, get) => ({
   isOllamaRunning: false,
@@ -611,11 +734,38 @@ export const useAIStore = create<AIStore>((set, get) => ({
   activeSessionId: loadSessions()[0]?.id ?? null,
   showSessionList: false,
 
+  // HuggingFace provider state
+  hfApiKey: persisted?.hfApiKey || "",
+  hfBaseUrl: persisted?.hfBaseUrl || "https://api-inference.huggingface.co",
+  hfSelectedModel: persisted?.hfSelectedModel || "",
+  hfModels: [],
+
+  // TurboQuant state
+  turboQuantStatus: "idle" as const,
+  turboQuantProgress: 0,
+  turboQuantStage: "",
+  turboQuantError: null,
+  quantizedModels: [],
+
+  // HF Local Model Manager state
+  hfSearchResults: [],
+  hfSearchLoading: false,
+  hfSearchError: null,
+  downloadQueue: [],
+  activeDownloads: {},
+  localModels: [],
+  localModelsLoading: false,
+  selectedLocalModel: persisted?.selectedLocalModel ?? null,
+  hfLocalToken: persisted?.hfLocalToken ?? "",
+
   abortController: null,
   reconnectAttempts: 0,
+  ollamaReconnectFailed: false,
 
   aiChangeHistory: [],
   mentionedFiles: [],
+  estimatedTokens: 0,
+  contextLimitWarning: 'none' as const,
 
   setProjectContext: (ctx) => set({ projectContext: ctx }),
 
@@ -820,7 +970,7 @@ export const useAIStore = create<AIStore>((set, get) => ({
 
     try {
       const models = await invoke<string[]>("fetch_ollama_models", { baseUrl: ollamaBaseUrl });
-      set({ isOllamaRunning: true, availableModels: models, grpcStatusError: null });
+      set({ isOllamaRunning: true, availableModels: models, grpcStatusError: null, reconnectAttempts: 0, ollamaReconnectFailed: false });
 
       // Validate and clean stale model selections against actual available models
       const currentSelected = get().selectedOllamaModels;
@@ -885,8 +1035,15 @@ export const useAIStore = create<AIStore>((set, get) => ({
     get().persistSettings();
   },
 
-  addAPIKey: (entry) =>
-    set((s) => ({ apiKeys: [...s.apiKeys, entry] })),
+  addAPIKey: (entry) => {
+    if (entry.provider === "openai_compat") {
+      const url = entry.baseUrl || "";
+      if (!url || (!url.startsWith("http://") && !url.startsWith("https://"))) {
+        throw new Error("openai_compat entries require a baseUrl starting with http:// or https://");
+      }
+    }
+    set((s) => ({ apiKeys: [...s.apiKeys, entry] }));
+  },
 
   startOllama: async () => {
     try {
@@ -895,6 +1052,35 @@ export const useAIStore = create<AIStore>((set, get) => ({
     } catch (e) {
       console.error("startOllama failed", e);
     }
+  },
+
+  startOllamaReconnect: () => {
+    if (_ollamaReconnectInterval) {
+      clearInterval(_ollamaReconnectInterval);
+      _ollamaReconnectInterval = null;
+    }
+    set({ reconnectAttempts: 0, ollamaReconnectFailed: false });
+
+    _ollamaReconnectInterval = setInterval(async () => {
+      const currentAttempts = get().reconnectAttempts + 1;
+      set({ reconnectAttempts: currentAttempts });
+
+      await get().checkOllama();
+
+      if (get().isOllamaRunning) {
+        clearInterval(_ollamaReconnectInterval!);
+        _ollamaReconnectInterval = null;
+        set({ reconnectAttempts: 0, ollamaReconnectFailed: false });
+        return;
+      }
+
+      if (currentAttempts >= 3) {
+        clearInterval(_ollamaReconnectInterval!);
+        _ollamaReconnectInterval = null;
+        set({ ollamaReconnectFailed: true });
+        logAIError("OLLAMA_RECONNECT_FAILED", "Failed to reconnect to Ollama after 3 attempts");
+      }
+    }, 10_000);
   },
 
   removeAPIKey: (index) => {
@@ -967,7 +1153,338 @@ export const useAIStore = create<AIStore>((set, get) => ({
       useRAG: s.useRAG,
       aiMode: s.aiMode,
       showThinking: s.showThinking,
+      hfApiKey: s.hfApiKey,
+      hfBaseUrl: s.hfBaseUrl,
+      hfSelectedModel: s.hfSelectedModel,
+      hfLocalToken: s.hfLocalToken,
+      selectedLocalModel: s.selectedLocalModel,
     });
+  },
+
+  setHFApiKey: (key) => {
+    set({ hfApiKey: key });
+    get().persistSettings();
+  },
+
+  setHFBaseUrl: (url) => {
+    set({ hfBaseUrl: url });
+    get().persistSettings();
+  },
+
+  setHFModel: (model) => {
+    set({ hfSelectedModel: model });
+    get().persistSettings();
+  },
+
+  fetchHFModels: async () => {
+    const { hfApiKey, hfBaseUrl } = get();
+    try {
+      const models = await invoke<string[]>("grpc_fetch_models", {
+        provider: "huggingface",
+        apiKey: hfApiKey,
+        baseUrl: hfBaseUrl,
+      });
+      set({ hfModels: models });
+    } catch (e) {
+      console.error("Failed to fetch HuggingFace models:", e);
+    }
+  },
+
+  startTurboQuant: async (modelId, method, bits) => {
+    set({ turboQuantStatus: "downloading", turboQuantProgress: 0, turboQuantStage: "downloading", turboQuantError: null });
+    try {
+      const unlistenProgress = await listen<{ percent: number; stage: string; message: string }>("turbo-quant-progress", (event) => {
+        const { percent, stage } = event.payload;
+        set({ turboQuantProgress: percent, turboQuantStage: stage });
+        if (stage === "quantizing") {
+          set({ turboQuantStatus: "quantizing" });
+        }
+      });
+      const unlistenDone = await listen<{ localPath: string; ollamaName?: string }>("turbo-quant-done", () => {
+        set({ turboQuantStatus: "done", turboQuantProgress: 100 });
+        unlistenProgress();
+        unlistenDone();
+        unlistenError();
+        get().listQuantizedModels();
+      });
+      const unlistenError = await listen<{ error: string }>("turbo-quant-error", (event) => {
+        set({ turboQuantStatus: "error", turboQuantError: event.payload.error });
+        unlistenProgress();
+        unlistenDone();
+        unlistenError();
+      });
+      await invoke("turbo_quant_start", { modelId, method, bits });
+    } catch (e) {
+      set({ turboQuantStatus: "error", turboQuantError: String(e) });
+    }
+  },
+
+  cancelTurboQuant: () => {
+    set({ turboQuantStatus: "idle", turboQuantProgress: 0, turboQuantStage: "", turboQuantError: null });
+  },
+
+  listQuantizedModels: async () => {
+    try {
+      const models = await invoke<QuantizedModelInfo[]>("turbo_quant_list");
+      set({ quantizedModels: models });
+    } catch (e) {
+      console.error("Failed to list quantized models:", e);
+    }
+  },
+
+  deleteQuantizedModel: async (modelId, method, bits) => {
+    try {
+      await invoke("turbo_quant_delete", { modelId, method, bits });
+      await get().listQuantizedModels();
+    } catch (e) {
+      console.error("Failed to delete quantized model:", e);
+    }
+  },
+
+  // HF Local Model Manager actions
+  searchHFModels: async (query, task, maxSizeGb) => {
+    set({ hfSearchLoading: true, hfSearchError: null });
+    try {
+      const { hfLocalToken } = get();
+      const results = await invoke<unknown[]>("grpc_hf_search", {
+        query,
+        task: task ?? "text-generation",
+        limit: 20,
+        maxSizeGb: maxSizeGb ?? 0,
+        hfToken: hfLocalToken,
+      });
+      const cards: HFModelCard[] = results.map((r) => {
+        const item = r as Record<string, unknown>;
+        return {
+          modelId: (item.model_id ?? item.modelId ?? "") as string,
+          downloads: (item.downloads ?? 0) as number,
+          likes: (item.likes ?? 0) as number,
+          sizeBytes: (item.size_bytes ?? item.sizeBytes ?? 0) as number,
+          license: (item.license ?? "") as string,
+          tags: (item.tags ?? []) as string[],
+          gated: (item.gated ?? false) as boolean,
+          description: (item.description ?? "") as string,
+        };
+      });
+      set({ hfSearchResults: cards, hfSearchLoading: false });
+    } catch (e) {
+      set({ hfSearchError: String(e), hfSearchLoading: false });
+    }
+  },
+
+  downloadModel: async (modelId) => {
+    const { hfLocalToken, downloadQueue } = get();
+
+    // Req 5.9: block gated model without token
+    const card = get().hfSearchResults.find((c) => c.modelId === modelId);
+    if (card?.gated && !hfLocalToken) {
+      set({ hfSearchError: "This model requires a HuggingFace token. Add your token in the Local Models settings." });
+      return;
+    }
+
+    // Req 6.6: never re-queue a done entry
+    const existing = downloadQueue.find((e) => e.modelId === modelId);
+    if (existing?.status === "done") return;
+
+    // Req 6.1: add entry with status "queued"
+    const entry: DownloadQueueEntry = {
+      modelId,
+      status: "queued",
+      bytesDone: 0,
+      bytesTotal: 0,
+      speedBps: 0,
+      error: null,
+      localPath: null,
+      startedAt: Date.now(),
+    };
+    set((s) => ({
+      downloadQueue: existing
+        ? s.downloadQueue.map((e) => e.modelId === modelId ? entry : e)
+        : [...s.downloadQueue, entry],
+    }));
+
+    // Set up event listeners before invoking download
+    let unlistenProgress: (() => void) | null = null;
+    let unlistenDone: (() => void) | null = null;
+
+    const cleanup = () => {
+      unlistenProgress?.();
+      unlistenDone?.();
+      unlistenProgress = null;
+      unlistenDone = null;
+    };
+
+    try {
+      // Req 5.7 / 6.2 / 6.7: handle progress events
+      unlistenProgress = await listen<{
+        modelId: string;
+        bytesDone: number;
+        bytesTotal: number;
+        speedBps: number;
+        done: boolean;
+        error: string;
+        localPath: string;
+      }>("hf-download-progress", (event) => {
+        const p = event.payload;
+        if (p.modelId !== modelId) return;
+
+        if (p.error) {
+          // Req 6.5: transition to error
+          set((s) => ({
+            downloadQueue: s.downloadQueue.map((e) =>
+              e.modelId === modelId
+                ? { ...e, status: "error" as const, error: p.error }
+                : e
+            ),
+            activeDownloads: (() => {
+              const next = { ...s.activeDownloads };
+              delete next[modelId];
+              return next;
+            })(),
+          }));
+          cleanup();
+          return;
+        }
+
+        set((s) => {
+          const current = s.downloadQueue.find((e) => e.modelId === modelId);
+          // Req 6.6: never go back from done
+          if (current?.status === "done") return {};
+          // Req 6.2: transition queued → downloading on first progress
+          const newStatus = current?.status === "queued" ? "downloading" as const : current?.status ?? "downloading" as const;
+          return {
+            downloadQueue: s.downloadQueue.map((e) =>
+              e.modelId === modelId
+                ? { ...e, status: newStatus, bytesDone: p.bytesDone, bytesTotal: p.bytesTotal, speedBps: p.speedBps }
+                : e
+            ),
+            // Req 6.7: maintain activeDownloads while downloading
+            activeDownloads: newStatus === "downloading"
+              ? { ...s.activeDownloads, [modelId]: { bytesDone: p.bytesDone, bytesTotal: p.bytesTotal, speedBps: p.speedBps } }
+              : s.activeDownloads,
+          };
+        });
+      });
+
+      // Req 5.8 / 6.3: handle done event
+      unlistenDone = await listen<{ modelId: string; localPath: string }>("hf-download-done", (event) => {
+        const p = event.payload;
+        if (p.modelId !== modelId) return;
+
+        set((s) => {
+          const queueEntry = s.downloadQueue.find((e) => e.modelId === modelId);
+          // Req 6.6: never go back from done
+          if (queueEntry?.status === "done") return {};
+
+          const newLocalModel: LocalModelInfo = {
+            modelId,
+            localPath: p.localPath,
+            sizeBytes: queueEntry?.bytesTotal ?? 0,
+            downloadedAt: Date.now(),
+            quantizedPath: null,
+            quantizedMethod: null,
+            quantizedBits: null,
+          };
+
+          const nextActiveDownloads = { ...s.activeDownloads };
+          delete nextActiveDownloads[modelId];
+
+          return {
+            downloadQueue: s.downloadQueue.map((e) =>
+              e.modelId === modelId
+                ? { ...e, status: "done" as const, localPath: p.localPath }
+                : e
+            ),
+            activeDownloads: nextActiveDownloads,
+            localModels: s.localModels.some((m) => m.modelId === modelId)
+              ? s.localModels.map((m) => m.modelId === modelId ? { ...m, localPath: p.localPath } : m)
+              : [...s.localModels, newLocalModel],
+          };
+        });
+        cleanup();
+      });
+
+      // Fire-and-forget: grpc_hf_download streams progress via events
+      await invoke("grpc_hf_download", {
+        modelId,
+        hfToken: hfLocalToken,
+      });
+    } catch (e) {
+      // Req 6.5: transition to error on invoke failure
+      set((s) => ({
+        downloadQueue: s.downloadQueue.map((entry) =>
+          entry.modelId === modelId
+            ? { ...entry, status: "error" as const, error: String(e) }
+            : entry
+        ),
+        activeDownloads: (() => {
+          const next = { ...s.activeDownloads };
+          delete next[modelId];
+          return next;
+        })(),
+      }));
+      cleanup();
+    }
+  },
+
+  cancelDownload: (modelId) => {
+    // Req 6.4: transition to cancelled, remove from activeDownloads
+    invoke("grpc_hf_local_delete", { modelId }).catch(() => {/* best-effort cancel */});
+    set((s) => {
+      const nextActiveDownloads = { ...s.activeDownloads };
+      delete nextActiveDownloads[modelId];
+      return {
+        downloadQueue: s.downloadQueue.map((e) =>
+          e.modelId === modelId ? { ...e, status: "cancelled" as const } : e
+        ),
+        activeDownloads: nextActiveDownloads,
+      };
+    });
+  },
+
+  listLocalModels: async () => {
+    set({ localModelsLoading: true });
+    try {
+      const results = await invoke<unknown[]>("grpc_hf_local_list");
+      const models: LocalModelInfo[] = results.map((r) => {
+        const item = r as Record<string, unknown>;
+        return {
+          modelId: (item.model_id ?? item.modelId ?? "") as string,
+          localPath: (item.local_path ?? item.localPath ?? "") as string,
+          sizeBytes: (item.size_bytes ?? item.sizeBytes ?? 0) as number,
+          downloadedAt: (item.downloaded_at ?? item.downloadedAt ?? 0) as number,
+          quantizedPath: (item.quantized_path ?? item.quantizedPath ?? null) as string | null,
+          quantizedMethod: (item.quantized_method ?? item.quantizedMethod ?? null) as "gguf" | "gptq" | "awq" | null,
+          quantizedBits: (item.quantized_bits ?? item.quantizedBits ?? null) as 4 | 8 | null,
+        };
+      });
+      set({ localModels: models, localModelsLoading: false });
+    } catch (e) {
+      console.error("Failed to list local models:", e);
+      set({ localModelsLoading: false });
+    }
+  },
+
+  deleteLocalModel: async (modelId) => {
+    try {
+      await invoke("grpc_hf_local_delete", { modelId });
+      // Req 5.10: remove from localModels on success
+      set((s) => ({
+        localModels: s.localModels.filter((m) => m.modelId !== modelId),
+      }));
+    } catch (e) {
+      console.error("Failed to delete local model:", e);
+    }
+  },
+
+  setSelectedLocalModel: (modelId) => {
+    set({ selectedLocalModel: modelId });
+    get().persistSettings();
+  },
+
+  setHFLocalToken: (token) => {
+    set({ hfLocalToken: token });
+    get().persistSettings();
   },
 
   sendMessage: async (content: string, activeFileContext?: string) => {
@@ -985,7 +1502,43 @@ export const useAIStore = create<AIStore>((set, get) => ({
       indexDirty,
       isOllamaRunning,
       ollamaBaseUrl,
+      hfApiKey,
+      hfBaseUrl,
+      hfSelectedModel,
+      selectedLocalModel,
+      localModels,
     } = get();
+
+    // Req 10.1: Auto-enable RAG and trigger indexing when in architect mode
+    if (aiMode === 'architect') {
+      const { openFolder: folder, indexedChunks: chunks, isIndexing: indexing } = get();
+      if (!get().useRAG) {
+        set({ useRAG: true });
+        get().persistSettings();
+      }
+      if (folder && chunks === 0 && !indexing) {
+        void get().indexCodebase(folder);
+      }
+    }
+
+    // Context window management: auto-summarize at 90% threshold (Task 9.5)
+    {
+      const { chatHistory: currentHistory, selectedOllamaModels: currentModels, selectedApiKeyIndices: currentApiIdx, apiKeys: currentApiKeys } = get();
+      const activeModelName = currentModels[0] || (currentApiKeys[currentApiIdx[0]]?.model ?? '');
+      const modelKey = Object.keys(CONTEXT_LIMITS).find(k => activeModelName.toLowerCase().includes(k)) ?? '';
+      const limit = CONTEXT_LIMITS[modelKey] ?? 0;
+      if (limit > 0) {
+        const used = estimateMessagesTokenCount(currentHistory);
+        if (shouldTriggerContextSummarization(used, limit)) {
+          get().summarizeOldMessages();
+        }
+        // Update warning state
+        const ratio = used / limit;
+        set({ estimatedTokens: used, contextLimitWarning: ratio >= 0.75 ? 'yellow' : 'none' });
+      } else {
+        set({ estimatedTokens: estimateMessagesTokenCount(currentHistory) });
+      }
+    }
 
     const userMsg: ChatMessage = {
       id: `msg-${Date.now()}`,
@@ -1094,16 +1647,67 @@ export const useAIStore = create<AIStore>((set, get) => ({
         get().persistSettings();
       }
 
-      const activeModels: { isApi: boolean; provider: string; model: string; apiKey?: string }[] = [
+      const activeModels: { isApi: boolean; provider: string; model: string; apiKey?: string; baseUrl?: string }[] = [
         ...validOllamaModels.map((m) => ({ isApi: false, provider: "ollama", model: m })),
         ...selectedApiKeyIndices
           .map((i) => {
             const entry = apiKeys[i];
             if (!entry) return null;
-            return { isApi: true, provider: entry.provider, model: entry.model, apiKey: entry.apiKey };
+            return { isApi: true, provider: entry.provider, model: entry.model, apiKey: entry.apiKey, baseUrl: entry.baseUrl };
           })
-          .filter(Boolean) as { isApi: boolean; provider: string; model: string; apiKey: string }[],
+          .filter(Boolean) as { isApi: boolean; provider: string; model: string; apiKey: string; baseUrl?: string }[],
       ];
+
+      // HuggingFace provider: add directly or as Ollama fallback
+      if (selectedProvider === "huggingface") {
+        if (!hfApiKey) {
+          const errMsg: ChatMessage = {
+            id: `msg-${Date.now()}-error`,
+            role: "assistant",
+            content: "HuggingFace API key is not set. Please configure it in Settings.",
+            timestamp: Date.now(),
+            isError: true,
+            retryContent: content,
+          };
+          set((s) => {
+            const updated = [...s.chatHistory, errMsg];
+            debouncedSaveChatHistory(updated);
+            get()._syncSessionMessages(updated, { debounced: true });
+            return { chatHistory: updated, isThinking: false, abortController: null };
+          });
+          clearTimeout(watchdogTimer);
+          return;
+        }
+        activeModels.push({ isApi: true, provider: "huggingface", model: hfSelectedModel, apiKey: hfApiKey, baseUrl: hfBaseUrl });
+      } else if (selectedProvider === "local") {
+        // Req 5.6: resolve local model path
+        const localModelInfo = localModels.find((m) => m.modelId === selectedLocalModel);
+        const localPath = localModelInfo
+          ? (localModelInfo.quantizedPath ?? localModelInfo.localPath)
+          : selectedLocalModel ?? "";
+        if (!localPath) {
+          const errMsg: ChatMessage = {
+            id: `msg-${Date.now()}-error`,
+            role: "assistant",
+            content: "No local model selected. Please select a downloaded model in the Local Models tab.",
+            timestamp: Date.now(),
+            isError: true,
+            retryContent: content,
+          };
+          set((s) => {
+            const updated = [...s.chatHistory, errMsg];
+            debouncedSaveChatHistory(updated);
+            get()._syncSessionMessages(updated, { debounced: true });
+            return { chatHistory: updated, isThinking: false, abortController: null };
+          });
+          clearTimeout(watchdogTimer);
+          return;
+        }
+        activeModels.push({ isApi: true, provider: "local", model: localPath, apiKey: "" });
+      } else if (selectedProvider === "ollama" && !isOllamaRunning && hfApiKey) {
+        // Auto-fallback to HuggingFace when Ollama is down
+        activeModels.push({ isApi: true, provider: "huggingface", model: hfSelectedModel, apiKey: hfApiKey, baseUrl: hfBaseUrl });
+      }
 
       if (activeModels.length === 0) {
         const hint = invalidOllamaModels.length > 0
@@ -1216,12 +1820,53 @@ export const useAIStore = create<AIStore>((set, get) => ({
           })) : undefined;
 
           if (am.isApi) {
-            if (aiServiceMode === "grpc") {
+            // Req 5.6: local provider uses grpc_stream_chat with provider="local" and model=localPath
+            if (am.provider === "local") {
+              const messageId = `grpc-stream-${Date.now()}`;
+              let collectedTokens = "";
+              await new Promise<void>((resolve, reject) => {
+                let unlistenToken: (() => void) | null = null;
+                let unlistenDone: (() => void) | null = null;
+                let unlistenError: (() => void) | null = null;
+                const cleanup = () => {
+                  unlistenToken?.();
+                  unlistenDone?.();
+                  unlistenError?.();
+                };
+                Promise.all([
+                  listen<{ messageId: string; token: string }>("ai-stream-token", (ev) => {
+                    if (ev.payload.messageId === messageId) collectedTokens += ev.payload.token;
+                  }),
+                  listen<{ messageId: string }>("ai-stream-done", (ev) => {
+                    if (ev.payload.messageId === messageId) { cleanup(); resolve(); }
+                  }),
+                  listen<{ messageId: string; error: string }>("ai-stream-error", (ev) => {
+                    if (ev.payload.messageId === messageId) { cleanup(); reject(new Error(ev.payload.error)); }
+                  }),
+                ]).then(([ul1, ul2, ul3]) => {
+                  unlistenToken = ul1;
+                  unlistenDone = ul2;
+                  unlistenError = ul3;
+                  invoke("grpc_stream_chat", {
+                    model: am.model,
+                    messages: finalFullContextStr
+                      ? [{ role: "system", content: finalFullContextStr }, ...baseMessages]
+                      : baseMessages,
+                    provider: "local",
+                    apiKey: null,
+                    temperature: 0.7,
+                    maxTokens: 4000,
+                  }).catch((err) => { cleanup(); reject(err); });
+                }).catch(reject);
+              });
+              res = collectedTokens;
+            } else if (aiServiceMode === "grpc") {
               const grpcMessages = finalFullContextStr ? [{ role: "system", content: finalFullContextStr }, ...baseMessages] : baseMessages;
               try {
                 res = await invoke<string>("grpc_ai_chat", {
                   provider: am.provider, apiKey: am.apiKey, model: am.model,
                   messages: grpcMessages, temperature: 0.7, maxTokens: 4000,
+                  ...(am.baseUrl ? { baseUrl: am.baseUrl } : {}),
                 });
               } catch (err) {
                 res = await invoke<string>("api_chat", {
@@ -1379,6 +2024,8 @@ export const useAIStore = create<AIStore>((set, get) => ({
         ? "Request timed out after 60 seconds. The AI service did not respond in time."
         : `Error: ${e.toString()}. Make sure your LLM service is configured correctly.`;
 
+      const isAuthError = String(e).includes("AUTH_ERROR:");
+
       const errMsg: ChatMessage = {
         id: `msg-${Date.now()}`,
         role: "assistant",
@@ -1386,6 +2033,7 @@ export const useAIStore = create<AIStore>((set, get) => ({
         mode: aiMode,
         timestamp: Date.now(),
         isError: true,
+        isAuthError: isAuthError || undefined,
         retryContent: content,
         provider: selectedProvider === "ollama" ? "ollama" : (apiKeys[selectedApiKeyIndices[0]]?.provider as "openai" | "anthropic" | "groq" | "airllm" | "vllm" | undefined) || "openai",
         model: selectedProvider === "ollama" ? selectedOllamaModels[0] : apiKeys[selectedApiKeyIndices[0]]?.model,
@@ -1498,7 +2146,7 @@ export const useAIStore = create<AIStore>((set, get) => ({
       saveSessions(updated);
       set({ sessions: updated });
     }
-    set({ chatHistory: [], agentLiveOutput: "", agentEvents: [] });
+    set({ chatHistory: [], agentLiveOutput: "", agentEvents: [], estimatedTokens: 0, contextLimitWarning: 'none' as const });
   },
 
   newChat: () => {
@@ -1516,7 +2164,7 @@ export const useAIStore = create<AIStore>((set, get) => ({
     updatedSessions = [newSession, ...updatedSessions];
     saveSessions(updatedSessions);
     saveChatHistory([]);
-    set({ sessions: updatedSessions, activeSessionId: newId, chatHistory: [], agentLiveOutput: "", agentEvents: [] });
+    set({ sessions: updatedSessions, activeSessionId: newId, chatHistory: [], agentLiveOutput: "", agentEvents: [], estimatedTokens: 0, contextLimitWarning: 'none' as const });
   },
 
   switchSession: (id: string) => {
@@ -1723,6 +2371,27 @@ export const useAIStore = create<AIStore>((set, get) => ({
 
   clearMentionedFiles: () => {
     set({ mentionedFiles: [] });
+  },
+
+  summarizeOldMessages: () => {
+    const { chatHistory } = get();
+    if (chatHistory.length < 4) return;
+    // Summarize oldest 50% of messages into a single system message
+    const half = Math.floor(chatHistory.length / 2);
+    const toSummarize = chatHistory.slice(0, half);
+    const kept = chatHistory.slice(half);
+    const summaryText = toSummarize
+      .map(m => `[${m.role}]: ${m.content.slice(0, 300)}`)
+      .join('\n');
+    const summaryMsg: ChatMessage = {
+      id: `summary-${Date.now()}`,
+      role: 'system',
+      content: `[Conversation summary — older messages condensed]\n${summaryText}`,
+      timestamp: Date.now(),
+    };
+    const updated = [summaryMsg, ...kept];
+    saveChatHistory(updated);
+    set({ chatHistory: updated });
   },
 
   runAgentTask: async (content) => {

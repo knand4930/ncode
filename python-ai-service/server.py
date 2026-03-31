@@ -47,6 +47,43 @@ except ImportError as grpc_import_error:
 
 CORE_DEPS_AVAILABLE = AIOHTTP_AVAILABLE and PYDANTIC_AVAILABLE
 
+# Import new providers
+try:
+    from hf_provider import HuggingFaceProvider
+    HF_PROVIDER_AVAILABLE = True
+except ImportError:
+    HF_PROVIDER_AVAILABLE = False
+
+try:
+    from openai_compat_provider import OpenAICompatProvider
+    OPENAI_COMPAT_PROVIDER_AVAILABLE = True
+except ImportError:
+    OPENAI_COMPAT_PROVIDER_AVAILABLE = False
+
+try:
+    from turbo_quant import TurboQuantEngine, QuantProgress
+    TURBO_QUANT_AVAILABLE = True
+except ImportError:
+    TURBO_QUANT_AVAILABLE = False
+
+try:
+    from hf_model_browser import HFModelBrowser, HFModelCard as HFModelCardData
+    HF_BROWSER_AVAILABLE = True
+except ImportError:
+    HF_BROWSER_AVAILABLE = False
+
+try:
+    from local_model_downloader import LocalModelDownloader, DownloadProgress as DLProgress
+    LOCAL_DOWNLOADER_AVAILABLE = True
+except ImportError:
+    LOCAL_DOWNLOADER_AVAILABLE = False
+
+try:
+    from local_model_provider import LocalModelProvider
+    LOCAL_PROVIDER_AVAILABLE = True
+except ImportError:
+    LOCAL_PROVIDER_AVAILABLE = False
+
 # Import AI modules for advanced reasoning and RAG
 try:
     from config import Settings
@@ -81,6 +118,19 @@ try:
         HealthRequest,
         HealthResponse,
         Message,
+        TurboQuantRequest,
+        TurboQuantProgress,
+        TurboQuantListRequest,
+        TurboQuantListResponse,
+        QuantizedModelInfo as PBQuantizedModelInfo,
+        TurboQuantDeleteRequest,
+        TurboQuantDeleteResponse,
+        HFSearchRequest, HFSearchResponse, HFModelCard as PBHFModelCard,
+        HFDownloadRequest, HFDownloadProgress,
+        HFDownloadCancelRequest, HFDownloadCancelResponse,
+        HFLocalListRequest, HFLocalListResponse,
+        LocalModelInfo as PBLocalModelInfo,
+        HFLocalDeleteRequest, HFLocalDeleteResponse,
     )
     from ai_service_pb2_grpc import AIServiceServicer, add_AIServiceServicer_to_server
     PROTOBUF_AVAILABLE = True
@@ -476,6 +526,9 @@ class OpenAIProvider(LLMProvider):
                 if resp.status == 200:
                     data = await resp.json()
                     return [m["id"] for m in data.get("data", [])]
+                if resp.status in (401, 403):
+                    body = await resp.text()
+                    raise RuntimeError(f"AUTH_ERROR: Invalid or expired OpenAI API key. Please update your key in Settings. ({resp.status})")
                 body = await resp.text()
                 raise RuntimeError(f"OpenAI API error {resp.status}: {body[:300]}")
         except Exception as e:
@@ -504,6 +557,9 @@ class OpenAIProvider(LLMProvider):
                 if resp.status == 200:
                     data = await resp.json()
                     return data["choices"][0]["message"]["content"]
+                if resp.status in (401, 403):
+                    body = await resp.text()
+                    raise RuntimeError(f"AUTH_ERROR: Invalid or expired OpenAI API key. Please update your key in Settings. ({resp.status})")
                 body = await resp.text()
                 raise RuntimeError(f"OpenAI chat error {resp.status}: {body[:300]}")
         except Exception as e:
@@ -542,6 +598,9 @@ class AnthropicProvider(LLMProvider):
                 if resp.status == 200:
                     data = await resp.json()
                     return [m["id"] for m in data.get("data", [])]
+                if resp.status in (401, 403):
+                    body = await resp.text()
+                    raise RuntimeError(f"AUTH_ERROR: Invalid or expired Anthropic API key. Please update your key in Settings. ({resp.status})")
                 body = await resp.text()
                 raise RuntimeError(f"Anthropic API error {resp.status}: {body[:300]}")
         except Exception as e:
@@ -618,6 +677,9 @@ class AnthropicProvider(LLMProvider):
                         text_text = "\n".join(text_parts)
                         return f"<thinking>{thinking_text}</thinking>{text_text}"
                     return "\n".join(text_parts)
+                if resp.status in (401, 403):
+                    body = await resp.text()
+                    raise RuntimeError(f"AUTH_ERROR: Invalid or expired Anthropic API key. Please update your key in Settings. ({resp.status})")
                 body = await resp.text()
                 raise RuntimeError(f"Anthropic chat error {resp.status}: {body[:300]}")
         except Exception as e:
@@ -652,6 +714,9 @@ class GroqProvider(LLMProvider):
                 if resp.status == 200:
                     data = await resp.json()
                     return [m["id"] for m in data.get("data", [])]
+                if resp.status in (401, 403):
+                    body = await resp.text()
+                    raise RuntimeError(f"AUTH_ERROR: Invalid or expired Groq API key. Please update your key in Settings. ({resp.status})")
                 body = await resp.text()
                 raise RuntimeError(f"Groq API error {resp.status}: {body[:300]}")
         except Exception as e:
@@ -679,6 +744,9 @@ class GroqProvider(LLMProvider):
                 if resp.status == 200:
                     data = await resp.json()
                     return data.get("choices", [{}])[0].get("message", {}).get("content", "")
+                if resp.status in (401, 403):
+                    body = await resp.text()
+                    raise RuntimeError(f"AUTH_ERROR: Invalid or expired Groq API key. Please update your key in Settings. ({resp.status})")
                 body = await resp.text()
                 raise RuntimeError(f"Groq chat error {resp.status}: {body[:300]}")
         except Exception as e:
@@ -888,6 +956,9 @@ class AIServicer(AIServiceServicer if PROTOBUF_AVAILABLE else object):
         if PROTOBUF_AVAILABLE:
             super().__init__()
         self.providers: Dict[str, LLMProvider] = {}
+        self._hf_browser = HFModelBrowser() if HF_BROWSER_AVAILABLE else None
+        self._local_downloader = LocalModelDownloader() if LOCAL_DOWNLOADER_AVAILABLE else None
+        self._local_provider = LocalModelProvider() if LOCAL_PROVIDER_AVAILABLE else None
     
     async def initialize_providers(self):
         """Initialize all provider instances"""
@@ -906,6 +977,16 @@ class AIServicer(AIServiceServicer if PROTOBUF_AVAILABLE else object):
             return AnthropicProvider(api_key)
         elif provider == "groq":
             return GroqProvider(api_key)
+        elif provider == "huggingface":
+            return HuggingFaceProvider(
+                api_key=api_key or "",
+                base_url=base_url or "https://api-inference.huggingface.co",
+            )
+        elif provider == "openai_compat":
+            return OpenAICompatProvider(
+                api_key=api_key or "",
+                base_url=base_url or "",
+            )
         elif provider == "airllm":
             return AirLLMProvider(
                 base_url=base_url or os.getenv("AIRLLM_BASE_URL", "http://localhost:8000"),
@@ -916,6 +997,8 @@ class AIServicer(AIServiceServicer if PROTOBUF_AVAILABLE else object):
                 api_key=api_key or os.getenv("VLLM_API_KEY", ""),
                 base_url=base_url or os.getenv("VLLM_BASE_URL", "http://localhost:8000"),
             )
+        elif provider == "local":
+            return self._local_provider  # LocalModelProvider handles model_path directly
         else:
             raise ValueError(f"Unknown provider: {provider}")
     
@@ -1021,7 +1104,7 @@ class AIServicer(AIServiceServicer if PROTOBUF_AVAILABLE else object):
                     logger.warning(f"Issue detection failed: {e}")
             
             # Get the provider and send request
-            prov = self.get_provider(request.provider, request.api_key, None)
+            prov = self.get_provider(request.provider, request.api_key, request.base_url or None)
             await prov.init()
             try:
                 # Prepare messages with system prompt
@@ -1102,7 +1185,11 @@ class AIServicer(AIServiceServicer if PROTOBUF_AVAILABLE else object):
             )
         except Exception as e:
             logger.error(f"Chat error: {e}", exc_info=True)
-            await context.abort(grpc.StatusCode.INTERNAL, str(e))
+            err_msg = str(e)
+            if err_msg.startswith("AUTH_ERROR:"):
+                await context.abort(grpc.StatusCode.UNAUTHENTICATED, err_msg)
+            else:
+                await context.abort(grpc.StatusCode.INTERNAL, err_msg)
     
     async def StreamChat(self, request: PBChatRequest, context: grpc.aio.ServicerContext) -> AsyncIterator[TokenResponse]:
         """Handle streaming chat requests with advanced reasoning"""
@@ -1134,8 +1221,18 @@ class AIServicer(AIServiceServicer if PROTOBUF_AVAILABLE else object):
                 except Exception as e:
                     logger.warning(f"Failed to get advanced prompt: {e}")
             
+            # Special handling for local provider
+            if request.provider.lower().strip() == "local":
+                if self._local_provider is None:
+                    await context.abort(grpc.StatusCode.UNAVAILABLE, "LocalModelProvider not available")
+                    return
+                async for token in self._local_provider.stream_chat(request.model, messages):
+                    yield TokenResponse(token=token, done=False)
+                yield TokenResponse(token="", done=True)
+                return
+
             # Get the provider
-            prov = self.get_provider(request.provider, request.api_key, None)
+            prov = self.get_provider(request.provider, request.api_key, request.base_url or None)
             await prov.init()
             try:
                 # Prepare messages with system prompt
@@ -1155,7 +1252,11 @@ class AIServicer(AIServiceServicer if PROTOBUF_AVAILABLE else object):
                 await prov.close()
         except Exception as e:
             logger.error(f"StreamChat error: {e}", exc_info=True)
-            await context.abort(grpc.StatusCode.INTERNAL, str(e))
+            err_msg = str(e)
+            if err_msg.startswith("AUTH_ERROR:"):
+                await context.abort(grpc.StatusCode.UNAUTHENTICATED, err_msg)
+            else:
+                await context.abort(grpc.StatusCode.INTERNAL, err_msg)
     
     async def FetchModels(self, request: FetchModelsRequest, context: grpc.aio.ServicerContext) -> FetchModelsResponse:
         """Fetch models from provider"""
@@ -1189,6 +1290,207 @@ class AIServicer(AIServiceServicer if PROTOBUF_AVAILABLE else object):
         except Exception as e:
             logger.warning(f"Health check failure: {e}")
             return HealthResponse(status="unhealthy", version=SERVICE_VERSION)
+
+    async def TurboQuantStart(self, request: "TurboQuantRequest", context: grpc.aio.ServicerContext):
+        """Stream quantization progress for a model."""
+        if not TURBO_QUANT_AVAILABLE:
+            await context.abort(grpc.StatusCode.UNIMPLEMENTED, "TurboQuant engine not available")
+            return
+
+        engine = TurboQuantEngine()
+        queue: asyncio.Queue = asyncio.Queue()
+
+        def progress_cb(prog: "QuantProgress") -> None:
+            queue.put_nowait(prog)
+
+        async def run_quantize():
+            result = await engine.quantize(
+                model_id=request.model_id,
+                method=request.method,
+                bits=request.bits,
+                progress_cb=progress_cb,
+            )
+            queue.put_nowait(result)
+
+        task = asyncio.ensure_future(run_quantize())
+        try:
+            while True:
+                item = await queue.get()
+                # QuantProgress progress update
+                if isinstance(item, QuantProgress):
+                    yield TurboQuantProgress(
+                        stage=item.stage,
+                        percent=item.percent,
+                        message=item.message,
+                        done=False,
+                    )
+                else:
+                    # QuantResult — final item
+                    result = item
+                    if result.success:
+                        yield TurboQuantProgress(
+                            stage="done",
+                            percent=100,
+                            message="Quantization complete.",
+                            done=True,
+                            local_path=result.local_path or "",
+                            ollama_name=result.ollama_name or "",
+                        )
+                    else:
+                        yield TurboQuantProgress(
+                            stage="error",
+                            percent=0,
+                            message=result.error or "Unknown error",
+                            done=True,
+                            error=result.error or "",
+                        )
+                    break
+        except Exception as e:
+            logger.error(f"TurboQuantStart error: {e}", exc_info=True)
+            await context.abort(grpc.StatusCode.INTERNAL, str(e))
+        finally:
+            task.cancel()
+
+    async def TurboQuantList(self, request: "TurboQuantListRequest", context: grpc.aio.ServicerContext) -> "TurboQuantListResponse":
+        """List all quantized models in the cache."""
+        if not TURBO_QUANT_AVAILABLE:
+            return TurboQuantListResponse(models=[])
+
+        try:
+            engine = TurboQuantEngine()
+            infos = engine.list_quantized()
+            pb_models = [
+                PBQuantizedModelInfo(
+                    model_id=info.model_id,
+                    method=info.method,
+                    bits=info.bits,
+                    size_mb=int(info.size_mb),
+                    local_path=info.local_path,
+                    created_at=int(
+                        __import__("datetime").datetime.fromisoformat(info.created_at).timestamp()
+                        if info.created_at else 0
+                    ),
+                    ollama_name=info.ollama_name or "",
+                )
+                for info in infos
+            ]
+            return TurboQuantListResponse(models=pb_models)
+        except Exception as e:
+            logger.error(f"TurboQuantList error: {e}", exc_info=True)
+            return TurboQuantListResponse(models=[])
+
+    async def TurboQuantDelete(self, request: "TurboQuantDeleteRequest", context: grpc.aio.ServicerContext) -> "TurboQuantDeleteResponse":
+        """Delete a quantized model from the cache."""
+        if not TURBO_QUANT_AVAILABLE:
+            return TurboQuantDeleteResponse(success=False, error="TurboQuant engine not available")
+
+        try:
+            engine = TurboQuantEngine()
+            engine.delete_quantized(
+                model_id=request.model_id,
+                method=request.method,
+                bits=request.bits,
+            )
+            return TurboQuantDeleteResponse(success=True, error="")
+        except Exception as e:
+            logger.error(f"TurboQuantDelete error: {e}", exc_info=True)
+            return TurboQuantDeleteResponse(success=False, error=str(e))
+
+    async def HFSearch(self, request, context):
+        """Search HuggingFace Hub for models."""
+        if not HF_BROWSER_AVAILABLE or not self._hf_browser:
+            return HFSearchResponse(models=[], error="HFModelBrowser not available")
+        try:
+            self._hf_browser.hf_token = request.hf_token or ""
+            cards = await self._hf_browser.search(
+                query=request.query,
+                task=request.task or "text-generation",
+                limit=request.limit or 20,
+                max_size_gb=request.max_size_gb if request.max_size_gb > 0 else None,
+            )
+            pb_cards = [PBHFModelCard(
+                model_id=c.model_id, downloads=c.downloads, likes=c.likes,
+                size_bytes=c.size_bytes, license=c.license, tags=c.tags,
+                gated=c.gated, description=c.description,
+            ) for c in cards]
+            return HFSearchResponse(models=pb_cards, error="")
+        except Exception as e:
+            return HFSearchResponse(models=[], error=str(e))
+
+    async def HFDownload(self, request, context):
+        """Download a model from HF Hub, streaming progress events."""
+        if not LOCAL_DOWNLOADER_AVAILABLE or not self._local_downloader:
+            yield HFDownloadProgress(model_id=request.model_id, done=True, error="LocalModelDownloader not available")
+            return
+
+        queue: asyncio.Queue = asyncio.Queue()
+
+        def progress_cb(prog):
+            queue.put_nowait(prog)
+
+        self._local_downloader.hf_token = request.hf_token or None
+
+        async def run_download():
+            result = await asyncio.get_event_loop().run_in_executor(
+                None,
+                lambda: self._local_downloader.download(request.model_id, progress_cb)
+            )
+            queue.put_nowait(result)
+
+        task = asyncio.ensure_future(run_download())
+        try:
+            while True:
+                item = await queue.get()
+                if isinstance(item, DLProgress):
+                    yield HFDownloadProgress(
+                        model_id=item.model_id,
+                        bytes_done=item.bytes_done,
+                        bytes_total=item.bytes_total,
+                        speed_bps=item.speed_bps,
+                        done=item.done,
+                        error=item.error or "",
+                        local_path=item.local_path or "",
+                    )
+                    if item.done or item.error:
+                        break
+                else:
+                    # DownloadResult
+                    result = item
+                    if not result.success:
+                        yield HFDownloadProgress(model_id=request.model_id, done=True, error=result.error or "")
+                    break
+        finally:
+            task.cancel()
+
+    async def HFDownloadCancel(self, request, context):
+        """Cancel an in-progress download."""
+        if self._local_downloader:
+            self._local_downloader.cancel(request.model_id)
+        return HFDownloadCancelResponse(success=True)
+
+    async def HFLocalList(self, request, context):
+        """List locally downloaded models."""
+        if not self._local_downloader:
+            return HFLocalListResponse(models=[])
+        infos = self._local_downloader.list_downloaded()
+        pb_models = [PBLocalModelInfo(
+            model_id=i.model_id, local_path=i.local_path, size_bytes=i.size_bytes,
+            downloaded_at=int(__import__("datetime").datetime.fromisoformat(i.downloaded_at).timestamp()) if i.downloaded_at else 0,
+            quantized_path=i.quantized_path or "",
+            quantized_method=i.quantized_method or "",
+            quantized_bits=i.quantized_bits or 0,
+        ) for i in infos]
+        return HFLocalListResponse(models=pb_models)
+
+    async def HFLocalDelete(self, request, context):
+        """Delete a locally downloaded model."""
+        if not self._local_downloader:
+            return HFLocalDeleteResponse(success=False, error="LocalModelDownloader not available")
+        try:
+            self._local_downloader.delete(request.model_id)
+            return HFLocalDeleteResponse(success=True, error="")
+        except Exception as e:
+            return HFLocalDeleteResponse(success=False, error=str(e))
 
 
 async def run_server():

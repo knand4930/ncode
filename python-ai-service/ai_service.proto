@@ -15,16 +15,41 @@ service AIService {
   
   // Health check
   rpc Health(HealthRequest) returns (HealthResponse);
+
+  // TurboQuant: start quantization, returns a stream of progress events
+  rpc TurboQuantStart(TurboQuantRequest) returns (stream TurboQuantProgress);
+
+  // TurboQuant: list all quantized models in the cache
+  rpc TurboQuantList(TurboQuantListRequest) returns (TurboQuantListResponse);
+
+  // TurboQuant: delete a quantized model from the cache
+  rpc TurboQuantDelete(TurboQuantDeleteRequest) returns (TurboQuantDeleteResponse);
+
+  // HuggingFace Hub search
+  rpc HFSearch(HFSearchRequest) returns (HFSearchResponse);
+
+  // Download model from HF Hub — streams progress events
+  rpc HFDownload(HFDownloadRequest) returns (stream HFDownloadProgress);
+
+  // Cancel an in-progress download
+  rpc HFDownloadCancel(HFDownloadCancelRequest) returns (HFDownloadCancelResponse);
+
+  // List locally downloaded models
+  rpc HFLocalList(HFLocalListRequest) returns (HFLocalListResponse);
+
+  // Delete a locally downloaded model
+  rpc HFLocalDelete(HFLocalDeleteRequest) returns (HFLocalDeleteResponse);
 }
 
 message ChatRequest {
   string model = 1;
   string prompt = 2;
   repeated Message history = 3;
-  string provider = 4;  // "ollama", "openai", "anthropic", "groq"
+  string provider = 4;  // "ollama", "openai", "anthropic", "groq", "huggingface", "openai_compat"
   string api_key = 5;
   float temperature = 6;
   int32 max_tokens = 7;
+  string base_url = 8;  // for openai_compat and HuggingFace custom endpoints
 }
 
 message Message {
@@ -60,3 +85,108 @@ message HealthResponse {
   string status = 1;  // "healthy", "unhealthy"
   string version = 2;
 }
+
+// TurboQuant messages
+
+message TurboQuantRequest {
+  string model_id = 1;
+  string method = 2;   // "gguf" | "gptq" | "awq"
+  int32 bits = 3;      // 4 or 8
+}
+
+message TurboQuantProgress {
+  string stage = 1;
+  int32 percent = 2;
+  string message = 3;
+  bool done = 4;
+  string error = 5;
+  string local_path = 6;   // populated when done=true
+  string ollama_name = 7;  // populated when registered with Ollama
+}
+
+message TurboQuantListRequest {}
+
+message TurboQuantListResponse {
+  repeated QuantizedModelInfo models = 1;
+}
+
+message QuantizedModelInfo {
+  string model_id = 1;
+  string method = 2;
+  int32 bits = 3;
+  int64 size_mb = 4;
+  string local_path = 5;
+  int64 created_at = 6;
+  string ollama_name = 7;
+}
+
+message TurboQuantDeleteRequest {
+  string model_id = 1;
+  string method = 2;
+  int32 bits = 3;
+}
+
+message TurboQuantDeleteResponse {
+  bool success = 1;
+  string error = 2;
+}
+
+// HF Local Model Manager messages
+
+message HFSearchRequest {
+  string query = 1;
+  string task = 2;
+  int32 limit = 3;
+  float max_size_gb = 4;
+  string hf_token = 5;
+}
+
+message HFModelCard {
+  string model_id = 1;
+  int64 downloads = 2;
+  int64 likes = 3;
+  int64 size_bytes = 4;
+  string license = 5;
+  repeated string tags = 6;
+  bool gated = 7;
+  string description = 8;
+}
+
+message HFSearchResponse {
+  repeated HFModelCard models = 1;
+  string error = 2;
+}
+
+message HFDownloadRequest {
+  string model_id = 1;
+  string hf_token = 2;
+}
+
+message HFDownloadProgress {
+  string model_id = 1;
+  int64 bytes_done = 2;
+  int64 bytes_total = 3;
+  int64 speed_bps = 4;
+  bool done = 5;
+  string error = 6;
+  string local_path = 7;
+}
+
+message HFDownloadCancelRequest { string model_id = 1; }
+message HFDownloadCancelResponse { bool success = 1; }
+
+message HFLocalListRequest {}
+message HFLocalListResponse { repeated LocalModelInfo models = 1; }
+
+message LocalModelInfo {
+  string model_id = 1;
+  string local_path = 2;
+  int64 size_bytes = 3;
+  int64 downloaded_at = 4;
+  string quantized_path = 5;
+  string quantized_method = 6;
+  int32 quantized_bits = 7;
+}
+
+message HFLocalDeleteRequest { string model_id = 1; }
+message HFLocalDeleteResponse { bool success = 1; string error = 2; }

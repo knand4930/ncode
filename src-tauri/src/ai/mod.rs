@@ -2699,6 +2699,7 @@ pub async fn grpc_ai_chat(
     api_key: Option<String>,
     temperature: Option<f32>,
     max_tokens: Option<i32>,
+    base_url: Option<String>,
 ) -> Result<String, String> {
     use crate::grpc_client::{GrpcAiClient, ChatMessage};
 
@@ -2738,6 +2739,7 @@ pub async fn grpc_ai_chat(
         api_key,
         temperature,
         max_tokens,
+        base_url.unwrap_or_default(),
     )
     .await
     {
@@ -3123,6 +3125,7 @@ pub async fn grpc_stream_chat(
     api_key: Option<String>,
     temperature: Option<f32>,
     max_tokens: Option<i32>,
+    base_url: Option<String>,
 ) -> Result<(), String> {
     use crate::grpc_client::{GrpcAiClient, ChatMessage};
 
@@ -3142,7 +3145,7 @@ pub async fn grpc_stream_chat(
         .collect();
 
     let result = client
-        .stream_chat(&app, message_id, model, chat_messages, provider, api_key, temperature, max_tokens)
+        .stream_chat(&app, message_id, model, chat_messages, provider, api_key, temperature, max_tokens, base_url.unwrap_or_default())
         .await;
 
     client.disconnect().await;
@@ -3174,6 +3177,186 @@ pub async fn grpc_fetch_models(
         Err(e) => {
             client.disconnect().await;
             Err(format!("gRPC fetch models error: {}", e))
+        }
+    }
+}
+
+/// Start TurboQuant quantization — streams turbo-quant-progress, turbo-quant-done, turbo-quant-error events
+#[command]
+pub async fn turbo_quant_start(
+    app: AppHandle,
+    model_id: String,
+    method: String,
+    bits: i32,
+) -> Result<(), String> {
+    use crate::grpc_client::GrpcAiClient;
+
+    let client = GrpcAiClient::default_client();
+    match client.connect().await {
+        Ok(_) => {}
+        Err(e) => {
+            return Err(format!("Failed to connect to gRPC AI service: {}", e));
+        }
+    }
+
+    let result = client.turbo_quant_start(&app, model_id, method, bits).await;
+    client.disconnect().await;
+    result.map_err(|e| e.to_string())
+}
+
+/// List all quantized models in the TurboQuant cache
+#[command]
+pub async fn turbo_quant_list() -> Result<Vec<serde_json::Value>, String> {
+    use crate::grpc_client::GrpcAiClient;
+
+    let client = GrpcAiClient::default_client();
+    match client.connect().await {
+        Ok(_) => {}
+        Err(e) => {
+            return Err(format!("Failed to connect to gRPC AI service: {}", e));
+        }
+    }
+
+    match client.turbo_quant_list().await {
+        Ok(models) => {
+            client.disconnect().await;
+            Ok(models)
+        }
+        Err(e) => {
+            client.disconnect().await;
+            Err(format!("TurboQuant list error: {}", e))
+        }
+    }
+}
+
+/// Delete a quantized model from the TurboQuant cache
+#[command]
+pub async fn turbo_quant_delete(
+    model_id: String,
+    method: String,
+    bits: i32,
+) -> Result<(), String> {
+    use crate::grpc_client::GrpcAiClient;
+
+    let client = GrpcAiClient::default_client();
+    match client.connect().await {
+        Ok(_) => {}
+        Err(e) => {
+            return Err(format!("Failed to connect to gRPC AI service: {}", e));
+        }
+    }
+
+    match client.turbo_quant_delete(model_id, method, bits).await {
+        Ok(()) => {
+            client.disconnect().await;
+            Ok(())
+        }
+        Err(e) => {
+            client.disconnect().await;
+            Err(format!("TurboQuant delete error: {}", e))
+        }
+    }
+}
+
+/// Search HuggingFace Hub for models
+#[command]
+pub async fn grpc_hf_search(
+    query: String,
+    task: String,
+    limit: i32,
+    max_size_gb: f32,
+    hf_token: String,
+) -> Result<Vec<serde_json::Value>, String> {
+    use crate::grpc_client::GrpcAiClient;
+
+    let client = GrpcAiClient::default_client();
+    match client.connect().await {
+        Ok(_) => {}
+        Err(e) => {
+            return Err(format!("Failed to connect to gRPC AI service: {}", e));
+        }
+    }
+
+    match client.hf_search(query, task, limit, max_size_gb, hf_token).await {
+        Ok(models) => {
+            client.disconnect().await;
+            Ok(models)
+        }
+        Err(e) => {
+            client.disconnect().await;
+            Err(format!("HF search error: {}", e))
+        }
+    }
+}
+
+/// Download a model from HuggingFace Hub — streams hf-download-progress, hf-download-done, hf-download-error events
+#[command]
+pub async fn grpc_hf_download(
+    app: AppHandle,
+    model_id: String,
+    hf_token: String,
+) -> Result<(), String> {
+    use crate::grpc_client::GrpcAiClient;
+
+    let client = GrpcAiClient::default_client();
+    match client.connect().await {
+        Ok(_) => {}
+        Err(e) => {
+            return Err(format!("Failed to connect to gRPC AI service: {}", e));
+        }
+    }
+
+    let result = client.hf_download(&app, model_id, hf_token).await;
+    client.disconnect().await;
+    result.map_err(|e| e.to_string())
+}
+
+/// List locally downloaded HF models
+#[command]
+pub async fn grpc_hf_local_list() -> Result<Vec<serde_json::Value>, String> {
+    use crate::grpc_client::GrpcAiClient;
+
+    let client = GrpcAiClient::default_client();
+    match client.connect().await {
+        Ok(_) => {}
+        Err(e) => {
+            return Err(format!("Failed to connect to gRPC AI service: {}", e));
+        }
+    }
+
+    match client.hf_local_list().await {
+        Ok(models) => {
+            client.disconnect().await;
+            Ok(models)
+        }
+        Err(e) => {
+            client.disconnect().await;
+            Err(format!("HF local list error: {}", e))
+        }
+    }
+}
+
+/// Delete a locally downloaded HF model
+#[command]
+pub async fn grpc_hf_local_delete(model_id: String) -> Result<(), String> {
+    use crate::grpc_client::GrpcAiClient;
+
+    let client = GrpcAiClient::default_client();
+    match client.connect().await {
+        Ok(_) => {}
+        Err(e) => {
+            return Err(format!("Failed to connect to gRPC AI service: {}", e));
+        }
+    }
+
+    match client.hf_local_delete(model_id).await {
+        Ok(()) => {
+            client.disconnect().await;
+            Ok(())
+        }
+        Err(e) => {
+            client.disconnect().await;
+            Err(format!("HF local delete error: {}", e))
         }
     }
 }

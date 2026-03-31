@@ -9,7 +9,7 @@ import {
 } from "lucide-react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen, emit } from "@tauri-apps/api/event";
-import { useAIStore } from "../../store/aiStore";
+import { useAIStore, CONTEXT_LIMITS, estimateMessagesTokenCount } from "../../store/aiStore";
 import type { BugReport, BugEntry } from "../../store/aiStore";
 import { useEditorStore } from "../../store/editorStore";
 import { useUIStore } from "../../store/uiStore";
@@ -232,6 +232,141 @@ function resolvePath(path: string, folder: string | null): string | null {
   return `${folder.replace(/[\\/]+$/, "")}/${n.replace(/^\.?\//, "")}`;
 }
 
+// ── Architecture section icons ───────────────────────────────
+const ARCHITECTURE_SECTION_ICONS: Record<ArchitectureSectionKey, React.ReactNode> = {
+  Structure: <span aria-hidden="true">🏗️</span>,
+  Metrics: <span aria-hidden="true">📊</span>,
+  Risks: <span aria-hidden="true">⚠️</span>,
+  Improvements: <span aria-hidden="true">💡</span>,
+};
+
+interface ArchitectureSectionsViewProps {
+  sections: Record<ArchitectureSectionKey, string>;
+  remainder: string;
+  renderMarkdown: (content: string) => string;
+}
+
+function ArchitectureSectionsView({ sections, remainder, renderMarkdown }: ArchitectureSectionsViewProps) {
+  return (
+    <div className="aip-architecture">
+      {ARCHITECTURE_SECTION_ORDER.map((section) => (
+        <details key={section} className="aip-arch-section">
+          <summary className="aip-arch-toggle">
+            {ARCHITECTURE_SECTION_ICONS[section]} {section}
+          </summary>
+          <div
+            className="aip-arch-body"
+            dangerouslySetInnerHTML={{ __html: renderMarkdown(sections[section]) }}
+          />
+        </details>
+      ))}
+      {remainder && (
+        <div
+          className="aip-msg-body"
+          dangerouslySetInnerHTML={{ __html: renderMarkdown(remainder) }}
+        />
+      )}
+    </div>
+  );
+}
+
+// ── Dependency graph helpers ─────────────────────────────────
+
+interface DependencyMap {
+  dependency_map: Record<string, string[]>;
+  circular_dependencies: string[][];
+  import_count?: number;
+  internal_edge_count?: number;
+}
+
+function parseDependencyMap(content: string): DependencyMap | null {
+  // Look for ```json blocks containing dependency_map key
+  const jsonBlockRe = /```json\s*([\s\S]*?)```/gi;
+  let m: RegExpExecArray | null;
+  while ((m = jsonBlockRe.exec(content)) !== null) {
+    try {
+      const parsed = JSON.parse(m[1]) as unknown;
+      if (
+        parsed &&
+        typeof parsed === "object" &&
+        "dependency_map" in (parsed as object) &&
+        "circular_dependencies" in (parsed as object)
+      ) {
+        return parsed as DependencyMap;
+      }
+    } catch { /* not valid JSON */ }
+  }
+  return null;
+}
+
+interface DependencyGraphViewProps {
+  depMap: DependencyMap;
+}
+
+function DependencyGraphView({ depMap }: DependencyGraphViewProps) {
+  const { dependency_map, circular_dependencies } = depMap;
+
+  // Build a set of files involved in circular deps for quick lookup
+  const circularFiles = new Set<string>();
+  for (const cycle of circular_dependencies) {
+    for (const f of cycle) circularFiles.add(f);
+  }
+
+  const files = Object.keys(dependency_map).sort();
+
+  return (
+    <details className="aip-dep-graph">
+      <summary className="aip-dep-graph-toggle">
+        <span aria-hidden="true">🔗</span> Dependency Graph
+        {circular_dependencies.length > 0 && (
+          <span className="aip-dep-circular-badge" title="Circular dependencies detected">
+            ⚠ {circular_dependencies.length} circular
+          </span>
+        )}
+      </summary>
+      <div className="aip-dep-graph-body">
+        {files.length === 0 ? (
+          <div className="aip-dep-empty">No dependency data available.</div>
+        ) : (
+          <div className="aip-dep-tree">
+            {files.map((file) => {
+              const deps = dependency_map[file] || [];
+              const isCircular = circularFiles.has(file);
+              return (
+                <div key={file} className={`aip-dep-node ${isCircular ? "aip-dep-circular" : ""}`}>
+                  <span className="aip-dep-file" title={isCircular ? "Involved in circular dependency" : undefined}>
+                    {isCircular && <span aria-hidden="true">⚠ </span>}
+                    {file}
+                  </span>
+                  {deps.length > 0 && (
+                    <div className="aip-dep-children">
+                      {deps.map((dep) => (
+                        <div key={dep} className={`aip-dep-child ${circularFiles.has(dep) ? "aip-dep-circular" : ""}`}>
+                          └─ {dep}
+                        </div>
+                      ))}
+                    </div>
+                  )}
+                </div>
+              );
+            })}
+          </div>
+        )}
+        {circular_dependencies.length > 0 && (
+          <div className="aip-dep-cycles">
+            <strong>Circular Dependencies:</strong>
+            {circular_dependencies.map((cycle, i) => (
+              <div key={i} className="aip-dep-cycle">
+                ⚠ {cycle.join(" → ")}
+              </div>
+            ))}
+          </div>
+        )}
+      </div>
+    </details>
+  );
+}
+
 // ── Bug report helpers ───────────────────────────────────────
 const SEVERITY_ORDER: Record<BugEntry["severity"], number> = {
   critical: 0, high: 1, medium: 2, low: 3,
@@ -305,6 +440,14 @@ function BugReportView({ report, openFolder, onShowFix }: BugReportViewProps) {
   );
 }
 
+// ── Local Models helpers ─────────────────────────────────────
+function formatBytes(bytes: number): string {
+  if (bytes === 0) return "unknown";
+  if (bytes >= 1e9) return `${(bytes / 1e9).toFixed(1)} GB`;
+  if (bytes >= 1e6) return `${(bytes / 1e6).toFixed(0)} MB`;
+  return `${(bytes / 1e3).toFixed(0)} KB`;
+}
+
 // ── Mode config ──────────────────────────────────────────────
 const MODES = [  { id: "chat",      label: "Chat",    emoji: null,  title: "Direct answers" },
   { id: "think",     label: "Think",   emoji: null,  title: "Step-by-step reasoning" },
@@ -350,6 +493,31 @@ export function AIPanel() {
   const [promptEditorContent, setPromptEditorContent] = useState("");
   const [newPromptName, setNewPromptName] = useState("");
   const [savingPrompt, setSavingPrompt] = useState(false);
+
+  // HuggingFace inline error state (Task 10.1)
+  const [hfTokenError, setHfTokenError] = useState(false);
+
+  // Custom provider form state (Task 11.1)
+  const [customProviderName, setCustomProviderName] = useState("");
+  const [customProviderBaseUrl, setCustomProviderBaseUrl] = useState("");
+  const [customProviderApiKey, setCustomProviderApiKey] = useState("");
+  const [customProviderModel, setCustomProviderModel] = useState("");
+  const [customProviderUrlError, setCustomProviderUrlError] = useState("");
+  const [customProviderSuccess, setCustomProviderSuccess] = useState(false);
+
+  // TurboQuant panel state (Task 12.1)
+  const [showTurboQuant, setShowTurboQuant] = useState(false);
+  const [tqModelId, setTqModelId] = useState("");
+  const [tqMethod, setTqMethod] = useState<"GGUF" | "GPTQ" | "AWQ">("GGUF");
+  const [tqBits, setTqBits] = useState<4 | 8>(4);
+
+  // Local Models tab state
+  const [showLocalModels, setShowLocalModels] = useState(false);
+  const [localHfTokenVisible, setLocalHfTokenVisible] = useState(false);
+  const [localSearchQuery, setLocalSearchQuery] = useState("");
+  const [localSearchTask, setLocalSearchTask] = useState("text-generation");
+  const [localSearchMaxSize, setLocalSearchMaxSize] = useState("");
+  const [localSearchDebounceTimer, setLocalSearchDebounceTimer] = useState<ReturnType<typeof setTimeout> | null>(null);
 
   // Show Fix handler for bug report cards (Req 5.4)
   const handleShowFix = async (bug: BugEntry) => {
@@ -578,7 +746,7 @@ export function AIPanel() {
   const {
     chatHistory, isThinking, isOllamaRunning,
     availableModels, selectedOllamaModels, toggleOllamaModel,
-    apiKeys, selectedApiKeyIndices, toggleAPIKey,
+    apiKeys, selectedApiKeyIndices, toggleAPIKey, addAPIKey,
     useRAG, aiMode, agentLiveOutput, agentEvents, showThinking,
     indexedChunks, isIndexing, sendMessage, clearChat, toggleRAG,
     setAIMode, setShowThinking, indexCodebase, checkOllama, startOllama, setOpenFolder,
@@ -586,6 +754,18 @@ export function AIPanel() {
     newChat, switchSession, deleteSession, exportSession, toggleSessionList,
     abortRequest, retryLastMessage, isStreaming, streamingMessageId,
     mentionedFiles, addMentionedFile, removeMentionedFile, clearMentionedFiles,
+    estimatedTokens, contextLimitWarning, summarizeOldMessages,
+    isGrpcHealthy, grpcStatusError, grpcStarting, startGrpcService, aiServiceMode, checkGrpcService,
+    ollamaReconnectFailed, startOllamaReconnect, reconnectAttempts,
+    hfApiKey, hfBaseUrl, hfSelectedModel, hfModels, setHFApiKey, setHFBaseUrl, setHFModel, fetchHFModels,
+    selectedProvider, setProvider,
+    turboQuantStatus, turboQuantProgress, turboQuantStage, turboQuantError,
+    quantizedModels, startTurboQuant, cancelTurboQuant, listQuantizedModels, deleteQuantizedModel,
+    hfSearchResults, hfSearchLoading, hfSearchError,
+    downloadQueue, activeDownloads, localModels, localModelsLoading,
+    selectedLocalModel, hfLocalToken,
+    searchHFModels, downloadModel, cancelDownload,
+    listLocalModels, deleteLocalModel, setSelectedLocalModel, setHFLocalToken,
   } = useAIStore();
 
   const {
@@ -613,6 +793,10 @@ export function AIPanel() {
 
   useEffect(() => { checkOllama(); }, [checkOllama]);
   useEffect(() => { if (showModelSelect) checkOllama(); }, [showModelSelect, checkOllama]);
+  useEffect(() => { if (aiServiceMode === "grpc") checkGrpcService(); }, [aiServiceMode, checkGrpcService]);
+  useEffect(() => {
+    if (showLocalModels) listLocalModels();
+  }, [showLocalModels]);
   useEffect(() => { setOpenFolder(openFolder ?? null); }, [openFolder, setOpenFolder]);
   useEffect(() => {
     if (useRAG && openFolder && indexedChunks === 0 && !isIndexing) indexCodebase(openFolder);
@@ -658,6 +842,10 @@ export function AIPanel() {
   const handleSend = async () => {
     const text = input.trim();
     if (!text || isThinking) return;
+    if (selectedProvider === "huggingface" && !hfApiKey) {
+      setHfTokenError(true);
+      return;
+    }
     if (noModelConfigured) {
       // Inline error — do not send (1.5)
       return;
@@ -685,8 +873,15 @@ export function AIPanel() {
 
   // Model label
   const totalSelected = selectedOllamaModels.length + selectedApiKeyIndices.length;
+  const hfReady = selectedProvider === "huggingface" && !!hfApiKey;
+
+  // No model configured at all (1.5)
+  const noModelConfigured = selectedOllamaModels.length === 0 && selectedApiKeyIndices.length === 0 && !hfReady;
+
   let modelLabel = "Select Model";
-  if (totalSelected === 1) {
+  if (selectedProvider === "huggingface" && hfApiKey) {
+    modelLabel = `HuggingFace: ${hfSelectedModel || "no model"}`;
+  } else if (totalSelected === 1) {
     if (selectedOllamaModels.length === 1) modelLabel = selectedOllamaModels[0];
     else { const e = apiKeys[selectedApiKeyIndices[0]]; modelLabel = e ? `${e.provider}: ${e.model}` : "API"; }
   } else if (totalSelected > 1) {
@@ -696,10 +891,7 @@ export function AIPanel() {
   const needsOllama = aiMode === "agent" || useRAG || selectedOllamaModels.length > 0;
   const showOllamaWarn = selectedOllamaModels.length > 0 && !isOllamaRunning;
   const isOnline = !showOllamaWarn;
-  const canSend = !((needsOllama && !isOllamaRunning) || isThinking || !input.trim());
-
-  // No model configured at all (1.5)
-  const noModelConfigured = selectedOllamaModels.length === 0 && selectedApiKeyIndices.length === 0;
+  const canSend = !isThinking && !!input.trim() && (hfReady || (!needsOllama || isOllamaRunning) && !noModelConfigured);
 
   const filteredSessions = useMemo(() => {
     const q = sessionSearch.trim().toLowerCase();
@@ -757,7 +949,7 @@ export function AIPanel() {
                   <div className="aip-session-item-info">
                     <span className="aip-session-item-title">{s.title}</span>
                     <span className="aip-session-item-meta">
-                      {s.messages.length} msgs · {new Date(s.updatedAt).toLocaleDateString()}
+                      {s.messages.length} msgs · {new Date(s.createdAt).toLocaleDateString()}
                     </span>
                   </div>
                 </button>
@@ -856,6 +1048,11 @@ export function AIPanel() {
           <span className="aip-logo">✦</span>
           <span className="aip-title">AI Assistant</span>
           <span className={`aip-dot ${isOnline ? "on" : "off"}`} title={isOnline ? "Ollama connected" : "Ollama offline"} />
+          {estimatedTokens > 0 && (
+            <span className="aip-token-counter" title="Estimated token usage">
+              ~{estimatedTokens >= 1000 ? `${(estimatedTokens / 1000).toFixed(1)}k` : estimatedTokens} tokens
+            </span>
+          )}
           <div className="aip-header-actions">
             <button className="aip-icon-btn" onClick={newChat} title="New chat">
               <Plus size={13} />
@@ -908,13 +1105,65 @@ export function AIPanel() {
       </div>
 
       {/* ── Ollama warning ── */}
-      {showOllamaWarn && (
+      {showOllamaWarn && !ollamaReconnectFailed && (
         <div className="aip-banner aip-banner-warn">
           <Zap size={13} />
           <div className="aip-banner-body">
             <strong>Ollama not running</strong>
             <span>Run <code>ollama serve</code> to start it</span>
             <button className="aip-btn-sm" onClick={startOllama}>Start</button>
+            <button className="aip-btn-sm" onClick={startOllamaReconnect}>
+              <RefreshCw size={11} /> Reconnect{reconnectAttempts > 0 ? ` (${reconnectAttempts}/3)` : ""}
+            </button>
+          </div>
+        </div>
+      )}
+
+      {/* ── Ollama permanent error after failed reconnects ── */}
+      {ollamaReconnectFailed && (
+        <div className="aip-banner aip-banner-error">
+          <AlertCircle size={13} />
+          <div className="aip-banner-body">
+            <strong>Ollama is not responding after 3 reconnect attempts. Please start Ollama manually.</strong>
+            <button className="aip-btn-sm aip-btn-primary" onClick={startOllamaReconnect}>Try Again</button>
+          </div>
+        </div>
+      )}
+
+      {/* ── gRPC unavailable banner (Task 12.1) ── */}
+      {aiServiceMode === "grpc" && isGrpcHealthy === false && (
+        <div className="aip-banner aip-banner-error">
+          <AlertCircle size={13} />
+          <div className="aip-banner-body">
+            <strong>gRPC AI service unavailable</strong>
+            <span>{grpcStatusError || "Could not connect to the AI service."}</span>
+            <button
+              className="aip-btn-sm aip-btn-primary"
+              onClick={() => startGrpcService()}
+              disabled={grpcStarting}
+            >
+              {grpcStarting ? "Starting…" : "Start Service"}
+            </button>
+            <a
+              className="aip-btn-sm"
+              href="#"
+              onClick={(e) => { e.preventDefault(); invoke("open_file", { path: "SETUP_GRPC.md" }).catch(() => {}); }}
+            >
+              Setup Docs
+            </a>
+          </div>
+        </div>
+      )}
+
+      {/* Context window warning (Task 9.4) */}
+      {contextLimitWarning === 'yellow' && (
+        <div className="aip-banner aip-banner-warn">
+          <AlertTriangle size={13} />
+          <div className="aip-banner-body">
+            <strong>Conversation is getting long</strong>
+            <span>Consider starting a new chat or summarizing.</span>
+            <button className="aip-btn-sm" onClick={summarizeOldMessages}>Summarize</button>
+            <button className="aip-btn-sm" onClick={newChat}>New Chat</button>
           </div>
         </div>
       )}
@@ -952,8 +1201,29 @@ export function AIPanel() {
           <ChevronDown size={11} className={showModelSelect ? "rotated" : ""} />
         </button>
 
+        <button
+          className={`aip-model-btn aip-turbo-btn ${turboQuantStatus === "downloading" || turboQuantStatus === "quantizing" ? "active" : ""}`}
+          onClick={() => {
+            setShowTurboQuant(s => {
+              if (!s) listQuantizedModels();
+              return !s;
+            });
+          }}
+          title="TurboQuant — quantize models"
+        >
+          ⚡ TurboQuant
+        </button>
+
+        <button
+          className={`aip-model-btn ${showLocalModels ? "active" : ""}`}
+          onClick={() => setShowLocalModels(s => !s)}
+          title="Browse and manage local HuggingFace models"
+        >
+          <Download size={12} /> Local Models
+        </button>
+
         {showModelSelect && (
-          <div className="aip-model-dropdown">
+          <div className="aip-model-dropdown" id="aip-model-dropdown">
             <div className="aip-dropdown-section">Ollama Models</div>
             {availableModels.length === 0 && (
               <div className="aip-dropdown-empty">{isOllamaRunning ? "No models installed" : "Ollama not running"}</div>
@@ -982,27 +1252,557 @@ export function AIPanel() {
                 ))}
               </>
             )}
+
+            {/* HuggingFace section (Task 10.1) */}
+            <div className="aip-dropdown-section" style={{ marginTop: 4 }}>
+              HuggingFace
+              {selectedProvider === "huggingface" && <span className="aip-provider-active"> ✓ active</span>}
+            </div>
+            <div className="aip-dropdown-hf">
+              <label className="aip-dropdown-label">HF_Token</label>
+              <input
+                type="password"
+                className={`aip-dropdown-input ${hfTokenError && !hfApiKey ? "aip-input-error" : ""}`}
+                placeholder="hf_..."
+                value={hfApiKey}
+                onChange={e => { setHFApiKey(e.target.value); setHfTokenError(false); }}
+              />
+              {hfTokenError && !hfApiKey && (
+                <div className="aip-inline-error">HF_Token is required</div>
+              )}
+              <label className="aip-dropdown-label">Model</label>
+              {hfModels.length > 0 ? (
+                <select
+                  className="aip-dropdown-input"
+                  value={hfSelectedModel}
+                  onChange={e => setHFModel(e.target.value)}
+                >
+                  <option value="">Select model…</option>
+                  {hfModels.map(m => <option key={m} value={m}>{m}</option>)}
+                </select>
+              ) : (
+                <input
+                  type="text"
+                  className="aip-dropdown-input"
+                  placeholder="e.g. mistralai/Mistral-7B-v0.1"
+                  value={hfSelectedModel}
+                  onChange={e => setHFModel(e.target.value)}
+                />
+              )}
+              <label className="aip-dropdown-label">Base URL (optional)</label>
+              <input
+                type="text"
+                className="aip-dropdown-input"
+                placeholder="https://api-inference.huggingface.co"
+                value={hfBaseUrl}
+                onChange={e => setHFBaseUrl(e.target.value)}
+              />
+              <button
+                className={`aip-btn-sm aip-btn-primary ${selectedProvider === "huggingface" ? "aip-provider-selected" : ""}`}
+                style={{ marginTop: 6 }}
+                onClick={() => { setProvider("huggingface"); fetchHFModels(); }}
+              >
+                {selectedProvider === "huggingface" ? "✓ Using HuggingFace" : "Use HuggingFace"}
+              </button>
+            </div>
+
+            {/* Add Custom Provider section (Task 11.1) */}
+            <div className="aip-dropdown-section" style={{ marginTop: 4 }}>Add Custom Provider</div>
+            <div className="aip-dropdown-hf">
+              <label className="aip-dropdown-label">Name (label)</label>
+              <input
+                type="text"
+                className="aip-dropdown-input"
+                placeholder="My OpenAI-compat server"
+                value={customProviderName}
+                onChange={e => { setCustomProviderName(e.target.value); setCustomProviderSuccess(false); }}
+              />
+              <label className="aip-dropdown-label">Base URL</label>
+              <input
+                type="text"
+                className={`aip-dropdown-input ${customProviderUrlError ? "aip-input-error" : ""}`}
+                placeholder="https://my-server.example.com/v1"
+                value={customProviderBaseUrl}
+                onChange={e => { setCustomProviderBaseUrl(e.target.value); setCustomProviderUrlError(""); setCustomProviderSuccess(false); }}
+              />
+              {customProviderUrlError && (
+                <div className="aip-inline-error">{customProviderUrlError}</div>
+              )}
+              <label className="aip-dropdown-label">API Key</label>
+              <input
+                type="password"
+                className="aip-dropdown-input"
+                placeholder="sk-..."
+                value={customProviderApiKey}
+                onChange={e => { setCustomProviderApiKey(e.target.value); setCustomProviderSuccess(false); }}
+              />
+              <label className="aip-dropdown-label">Model</label>
+              <input
+                type="text"
+                className="aip-dropdown-input"
+                placeholder="gpt-3.5-turbo"
+                value={customProviderModel}
+                onChange={e => { setCustomProviderModel(e.target.value); setCustomProviderSuccess(false); }}
+              />
+              {customProviderSuccess && (
+                <div className="aip-inline-success">Provider added successfully!</div>
+              )}
+              <button
+                className="aip-btn-sm aip-btn-primary"
+                style={{ marginTop: 6 }}
+                onClick={() => {
+                  const url = customProviderBaseUrl.trim();
+                  if (!url.startsWith("http://") && !url.startsWith("https://")) {
+                    setCustomProviderUrlError("Base URL must start with http:// or https://");
+                    return;
+                  }
+                  addAPIKey({
+                    provider: "openai_compat",
+                    apiKey: customProviderApiKey,
+                    model: customProviderModel,
+                    label: customProviderName,
+                    baseUrl: url,
+                  });
+                  setCustomProviderName("");
+                  setCustomProviderBaseUrl("");
+                  setCustomProviderApiKey("");
+                  setCustomProviderModel("");
+                  setCustomProviderUrlError("");
+                  setCustomProviderSuccess(true);
+                }}
+              >
+                Add Provider
+              </button>
+            </div>
+
             <div className="aip-dropdown-footer">
               <button className="aip-btn-sm" onClick={() => setShowModelSelect(false)}>Close</button>
               <button className="aip-btn-sm" onClick={() => { setShowModelSelect(false); toggleSettingsPanel(); }}>Manage</button>
             </div>
           </div>
         )}
-      </div>
 
-      {/* ── Messages ── */}
-      <div className="aip-messages">
-        {chatHistory.length === 0 ? (
-          <div className="aip-welcome">
-            <div className="aip-welcome-icon">✦</div>
-            <p className="aip-welcome-title">AI Code Assistant</p>
-            <p className="aip-welcome-sub">Ask anything. Use <code>@file</code> to attach the current file.</p>
-            <div className="aip-chips">
-              {["Explain this function", "Find bugs in @file", "Refactor @file", "Write tests", "How does this work?"].map(s => (
-                <button key={s} className="aip-chip" onClick={() => setInput(s)}>{s}</button>
+        {/* TurboQuant panel (Task 12.1) */}
+        {showTurboQuant && (
+          <div className="aip-session-list aip-turbo-panel">
+            <div className="aip-session-list-hdr">
+              <span>⚡ TurboQuant</span>
+              <button className="aip-icon-btn" onClick={() => setShowTurboQuant(false)} title="Close"><X size={13} /></button>
+            </div>
+
+            {/* Quantize form */}
+            <div className="aip-dropdown-hf" style={{ padding: "8px 12px" }}>
+              <label className="aip-dropdown-label">Model ID</label>
+              <input
+                type="text"
+                className="aip-dropdown-input"
+                placeholder="e.g. mistralai/Mistral-7B-v0.1"
+                value={tqModelId}
+                onChange={e => setTqModelId(e.target.value)}
+              />
+              <label className="aip-dropdown-label">Method</label>
+              <select
+                className="aip-dropdown-input"
+                value={tqMethod}
+                onChange={e => setTqMethod(e.target.value as "GGUF" | "GPTQ" | "AWQ")}
+              >
+                <option value="GGUF">GGUF</option>
+                <option value="GPTQ">GPTQ</option>
+                <option value="AWQ">AWQ</option>
+              </select>
+              <label className="aip-dropdown-label">Bits</label>
+              <select
+                className="aip-dropdown-input"
+                value={tqBits}
+                onChange={e => setTqBits(Number(e.target.value) as 4 | 8)}
+              >
+                <option value={4}>4-bit</option>
+                <option value={8}>8-bit</option>
+              </select>
+              <button
+                className="aip-btn-sm aip-btn-primary"
+                style={{ marginTop: 6 }}
+                disabled={!tqModelId.trim() || turboQuantStatus === "downloading" || turboQuantStatus === "quantizing"}
+                onClick={() => {
+                  startTurboQuant(tqModelId.trim(), tqMethod, tqBits);
+                  setShowTurboQuant(false);
+                }}
+              >
+                Start
+              </button>
+            </div>
+
+            {/* Progress */}
+            {(turboQuantStatus === "downloading" || turboQuantStatus === "quantizing") && (
+              <div className="aip-turbo-progress">
+                <div className="aip-turbo-stage">{turboQuantStage}</div>
+                <div className="aip-progress-bar">
+                  <div className="aip-progress-fill" style={{ width: `${turboQuantProgress}%` }} />
+                </div>
+                <div className="aip-turbo-pct">{turboQuantProgress}%</div>
+                <button className="aip-btn-sm" onClick={cancelTurboQuant}>Cancel</button>
+              </div>
+            )}
+
+            {/* Done */}
+            {turboQuantStatus === "done" && (
+              <div className="aip-inline-success" style={{ margin: "8px 12px" }}>✓ Quantization complete!</div>
+            )}
+
+            {/* Error */}
+            {turboQuantStatus === "error" && turboQuantError && (
+              <div className="aip-turbo-error" style={{ margin: "8px 12px" }}>
+                <div className="aip-inline-error">{turboQuantError}</div>
+                {turboQuantError.includes("MISSING_DEPENDENCY:") && (
+                  <button
+                    className="aip-btn-sm"
+                    style={{ marginTop: 4 }}
+                    onClick={() => {
+                      const match = turboQuantError!.match(/MISSING_DEPENDENCY:\s*(.+)/);
+                      const cmd = match ? match[1].trim() : turboQuantError!;
+                      navigator.clipboard.writeText(cmd).then(() => addToast("Install command copied!", "success")).catch(() => {});
+                    }}
+                  >
+                    Copy install command
+                  </button>
+                )}
+              </div>
+            )}
+
+            {/* Quantized models list */}
+            {quantizedModels.length > 0 && (
+              <div className="aip-turbo-models">
+                <div className="aip-dropdown-section">Quantized Models</div>
+                {quantizedModels.map((qm, i) => (
+                  <div key={i} className="aip-turbo-model-row">
+                    <div className="aip-turbo-model-info">
+                      <span className="aip-turbo-model-id">{qm.modelId}</span>
+                      <span className="aip-turbo-model-meta">{qm.method} · {qm.bits}-bit · {qm.sizeMb}MB</span>
+                    </div>
+                    <button
+                      className="aip-session-del"
+                      onClick={() => deleteQuantizedModel(qm.modelId, qm.method, qm.bits)}
+                      title="Delete"
+                    >
+                      <X size={10} />
+                    </button>
+                  </div>
+                ))}
+              </div>
+            )}
+          </div>
+        )}
+
+        {/* Local Models panel (Req 9.1–9.9, 10.2, 10.3) */}
+        {showLocalModels && (
+          <div className="aip-session-list aip-local-models-panel">
+            <div className="aip-session-list-hdr">
+              <span>🤗 Local Models</span>
+              <button className="aip-icon-btn" onClick={() => setShowLocalModels(false)} title="Close"><X size={13} /></button>
+            </div>
+
+            {/* HF Token input (Req 10.2, 10.3) */}
+            <div className="aip-dropdown-hf" style={{ padding: "8px 12px", borderBottom: "1px solid var(--border)" }}>
+              <label className="aip-dropdown-label" style={{ display: "flex", alignItems: "center", gap: 4 }}>
+                HuggingFace Token
+                <span title="Only a read scope token is required" style={{ cursor: "help", opacity: 0.6 }}>ⓘ</span>
+              </label>
+              <div style={{ display: "flex", gap: 4 }}>
+                <input
+                  type={localHfTokenVisible ? "text" : "password"}
+                  className="aip-dropdown-input"
+                  placeholder="hf_..."
+                  value={hfLocalToken}
+                  onChange={e => setHFLocalToken(e.target.value)}
+                  style={{ flex: 1 }}
+                />
+                <button
+                  className="aip-icon-btn"
+                  onClick={() => setLocalHfTokenVisible(v => !v)}
+                  title={localHfTokenVisible ? "Hide token" : "Show token"}
+                >
+                  {localHfTokenVisible ? <EyeOff size={12} /> : <Eye size={12} />}
+                </button>
+              </div>
+              {hfLocalToken && !localHfTokenVisible && (
+                <div style={{ fontSize: 11, opacity: 0.5, marginTop: 2 }}>
+                  hf_{"*".repeat(Math.min(hfLocalToken.length - 3, 8))}
+                </div>
+              )}
+            </div>
+
+            {/* Search bar (Req 9.2, 9.8) */}
+            <div className="aip-dropdown-hf" style={{ padding: "8px 12px", borderBottom: "1px solid var(--border)" }}>
+              <label className="aip-dropdown-label">Search HuggingFace Hub</label>
+              <input
+                type="text"
+                className="aip-dropdown-input"
+                placeholder="e.g. mistral, llama, phi..."
+                value={localSearchQuery}
+                onChange={e => {
+                  const q = e.target.value;
+                  setLocalSearchQuery(q);
+                  // Req 9.8: 400ms debounce
+                  if (localSearchDebounceTimer) clearTimeout(localSearchDebounceTimer);
+                  const timer = setTimeout(() => {
+                    searchHFModels(q, localSearchTask, localSearchMaxSize ? parseFloat(localSearchMaxSize) : undefined);
+                  }, 400);
+                  setLocalSearchDebounceTimer(timer);
+                }}
+              />
+              <div style={{ display: "flex", gap: 4, marginTop: 4 }}>
+                <select
+                  className="aip-dropdown-input"
+                  value={localSearchTask}
+                  onChange={e => {
+                    setLocalSearchTask(e.target.value);
+                    searchHFModels(localSearchQuery, e.target.value, localSearchMaxSize ? parseFloat(localSearchMaxSize) : undefined);
+                  }}
+                  style={{ flex: 1 }}
+                >
+                  <option value="text-generation">text-generation</option>
+                  <option value="text2text-generation">text2text-generation</option>
+                  <option value="fill-mask">fill-mask</option>
+                  <option value="question-answering">question-answering</option>
+                  <option value="summarization">summarization</option>
+                  <option value="translation">translation</option>
+                </select>
+                <input
+                  type="number"
+                  className="aip-dropdown-input"
+                  placeholder="Max GB"
+                  value={localSearchMaxSize}
+                  onChange={e => setLocalSearchMaxSize(e.target.value)}
+                  style={{ width: 70 }}
+                  min={0}
+                  step={0.5}
+                />
+              </div>
+            </div>
+
+            {/* Search error */}
+            {hfSearchError && (
+              <div className="aip-inline-error" style={{ margin: "6px 12px" }}>{hfSearchError}</div>
+            )}
+
+            {/* Search results (Req 9.3, 9.6) */}
+            {hfSearchLoading && (
+              <div style={{ padding: "8px 12px", opacity: 0.6, fontSize: 12 }}>
+                <RefreshCw size={11} className="spin-icon" /> Searching…
+              </div>
+            )}
+            {!hfSearchLoading && hfSearchResults.length > 0 && (
+              <div className="aip-turbo-models">
+                <div className="aip-dropdown-section">Search Results</div>
+                {hfSearchResults.map((card) => {
+                  const isQueued = downloadQueue.some(e => e.modelId === card.modelId && (e.status === "queued" || e.status === "downloading"));
+                  const isDone = downloadQueue.some(e => e.modelId === card.modelId && e.status === "done") ||
+                    localModels.some(m => m.modelId === card.modelId);
+                  const isGatedNoToken = card.gated && !hfLocalToken;
+                  return (
+                    <div key={card.modelId} className="aip-turbo-model-row" style={{ flexDirection: "column", alignItems: "flex-start", gap: 2 }}>
+                      <div style={{ display: "flex", justifyContent: "space-between", width: "100%", alignItems: "center" }}>
+                        <div className="aip-turbo-model-info">
+                          <span className="aip-turbo-model-id" style={{ fontSize: 11 }}>{card.modelId}</span>
+                          <span className="aip-turbo-model-meta">
+                            ↓{card.downloads.toLocaleString()} · {formatBytes(card.sizeBytes)} · {card.license || "unknown"}
+                            {card.gated && <span className="aip-stale-badge" style={{ marginLeft: 4 }}>🔒 gated</span>}
+                          </span>
+                        </div>
+                        <button
+                          className="aip-btn-sm aip-btn-primary"
+                          disabled={isQueued || isDone || isGatedNoToken}
+                          title={isGatedNoToken ? "This model requires a HuggingFace token. Add your token above." : isDone ? "Already downloaded" : isQueued ? "Downloading…" : "Download"}
+                          onClick={() => downloadModel(card.modelId)}
+                          style={{ flexShrink: 0 }}
+                        >
+                          {isDone ? "✓" : isQueued ? <RefreshCw size={10} className="spin-icon" /> : <Download size={10} />}
+                        </button>
+                      </div>
+                      {/* Req 9.6: inline message for gated model without token */}
+                      {isGatedNoToken && (
+                        <div style={{ fontSize: 10, color: "var(--warning, #f59e0b)", paddingLeft: 2 }}>
+                          This model requires a HuggingFace token. Add your token in the Local Models settings.
+                        </div>
+                      )}
+                    </div>
+                  );
+                })}
+              </div>
+            )}
+
+            {/* Download queue (Req 9.4) */}
+            {downloadQueue.length > 0 && (
+              <div className="aip-turbo-models">
+                <div className="aip-dropdown-section">Downloads</div>
+                {downloadQueue.map((entry) => {
+                  const pct = entry.bytesTotal > 0 ? Math.round((entry.bytesDone / entry.bytesTotal) * 100) : 0;
+                  const speedMBs = (entry.speedBps / 1e6).toFixed(1);
+                  return (
+                    <div key={entry.modelId} className="aip-turbo-model-row" style={{ flexDirection: "column", alignItems: "flex-start", gap: 4 }}>
+                      <div style={{ display: "flex", justifyContent: "space-between", width: "100%", alignItems: "center" }}>
+                        <span className="aip-turbo-model-id" style={{ fontSize: 11 }}>{entry.modelId}</span>
+                        <div style={{ display: "flex", gap: 4, alignItems: "center" }}>
+                          <span style={{ fontSize: 10, opacity: 0.7 }}>{entry.status}</span>
+                          {(entry.status === "queued" || entry.status === "downloading") && (
+                            <button className="aip-session-del" onClick={() => cancelDownload(entry.modelId)} title="Cancel">
+                              <X size={10} />
+                            </button>
+                          )}
+                        </div>
+                      </div>
+                      {entry.status === "downloading" && (
+                        <>
+                          <div className="aip-progress-bar" style={{ width: "100%" }}>
+                            <div className="aip-progress-fill" style={{ width: `${pct}%` }} />
+                          </div>
+                          <div style={{ fontSize: 10, opacity: 0.6 }}>
+                            {formatBytes(entry.bytesDone)} / {formatBytes(entry.bytesTotal)} · {speedMBs} MB/s
+                          </div>
+                        </>
+                      )}
+                      {entry.status === "error" && entry.error && (
+                        <div className="aip-inline-error" style={{ fontSize: 10 }}>{entry.error}</div>
+                      )}
+                    </div>
+                  );
+                })}
+              </div>
+            )}
+
+            {/* Local models list (Req 9.5) */}
+            <div className="aip-turbo-models">
+              <div className="aip-dropdown-section">
+                Downloaded Models
+                {localModelsLoading && <RefreshCw size={10} className="spin-icon" style={{ marginLeft: 4 }} />}
+              </div>
+              {localModels.length === 0 && !localModelsLoading && (
+                <div style={{ padding: "6px 12px", fontSize: 11, opacity: 0.5 }}>No local models yet. Search and download above.</div>
+              )}
+              {localModels.map((model) => (
+                <div key={model.modelId} className="aip-turbo-model-row" style={{ flexDirection: "column", alignItems: "flex-start", gap: 4 }}>
+                  <div style={{ display: "flex", justifyContent: "space-between", width: "100%", alignItems: "center" }}>
+                    <div className="aip-turbo-model-info">
+                      <span className="aip-turbo-model-id" style={{ fontSize: 11 }}>{model.modelId}</span>
+                      <span className="aip-turbo-model-meta">
+                        {formatBytes(model.sizeBytes)} · {new Date(model.downloadedAt).toLocaleDateString()}
+                        {model.quantizedPath && (
+                          <span className="aip-stale-badge" style={{ marginLeft: 4, background: "var(--accent, #6366f1)", color: "#fff" }}>
+                            ⚡ {model.quantizedMethod} {model.quantizedBits}bit
+                          </span>
+                        )}
+                      </span>
+                    </div>
+                    <div style={{ display: "flex", gap: 4 }}>
+                      {/* Run (Quantized) button if quantized path exists (Req 7.4) */}
+                      {model.quantizedPath && (
+                        <button
+                          className="aip-btn-sm aip-btn-primary"
+                          title="Run quantized model"
+                          onClick={() => {
+                            setSelectedLocalModel(model.modelId);
+                            setProvider("local" as any);
+                            setShowLocalModels(false);
+                          }}
+                        >
+                          ▶ Run (Q)
+                        </button>
+                      )}
+                      {/* Run button */}
+                      <button
+                        className={`aip-btn-sm ${selectedLocalModel === model.modelId && !model.quantizedPath ? "aip-btn-primary" : ""}`}
+                        title="Use this model for chat"
+                        onClick={() => {
+                          setSelectedLocalModel(model.modelId);
+                          setProvider("local" as any);
+                          setShowLocalModels(false);
+                        }}
+                      >
+                        ▶ Run
+                      </button>
+                      {/* Quantize button (Req 7.5) */}
+                      <button
+                        className="aip-btn-sm"
+                        title="Quantize with TurboQuant"
+                        onClick={() => {
+                          setTqModelId(model.modelId);
+                          setTqMethod("GGUF");
+                          setTqBits(4);
+                          setShowLocalModels(false);
+                          setShowTurboQuant(true);
+                        }}
+                      >
+                        ⚡
+                      </button>
+                      {/* Delete button */}
+                      <button
+                        className="aip-session-del"
+                        title="Delete model"
+                        onClick={() => {
+                          if (window.confirm(`Delete ${model.modelId}? This will remove all downloaded files.`)) {
+                            deleteLocalModel(model.modelId);
+                          }
+                        }}
+                      >
+                        <X size={10} />
+                      </button>
+                    </div>
+                  </div>
+                </div>
               ))}
             </div>
           </div>
+        )}
+      </div>
+
+      {/* ── Messages ── */}      <div className="aip-messages">
+        {chatHistory.length === 0 ? (
+          noModelConfigured ? (
+            /* First-run setup checklist (Req 12.5) */
+            <div className="aip-setup-checklist">
+              <div className="aip-welcome-icon">✦</div>
+              <p className="aip-welcome-title">Get Started with AI</p>
+              <p className="aip-welcome-sub">Complete these steps to start chatting:</p>
+              <ol className="aip-checklist">
+                <li className={`aip-checklist-item ${isOllamaRunning ? "done" : ""}`}>
+                  <span className="aip-checklist-num">{isOllamaRunning ? "✓" : "1"}</span>
+                  <div className="aip-checklist-body">
+                    <strong>Install Ollama</strong>
+                    <span>Download and install Ollama from <a href="#" onClick={(e) => { e.preventDefault(); invoke("open_url", { url: "https://ollama.ai" }).catch(() => {}); }}>ollama.ai</a></span>
+                  </div>
+                </li>
+                <li className={`aip-checklist-item ${availableModels.length > 0 ? "done" : ""}`}>
+                  <span className="aip-checklist-num">{availableModels.length > 0 ? "✓" : "2"}</span>
+                  <div className="aip-checklist-body">
+                    <strong>Pull a model</strong>
+                    <span>Run <code>ollama pull deepseek-coder</code> in your terminal</span>
+                  </div>
+                </li>
+                <li className="aip-checklist-item">
+                  <span className="aip-checklist-num">3</span>
+                  <div className="aip-checklist-body">
+                    <strong>Select a model</strong>
+                    <span>Click the model selector above and choose a model</span>
+                    <button className="aip-btn-sm aip-btn-primary" style={{ marginTop: 4 }} onClick={() => setShowModelSelect(true)}>
+                      Select Model
+                    </button>
+                  </div>
+                </li>
+              </ol>
+            </div>
+          ) : (
+            /* Normal welcome screen */
+            <div className="aip-welcome">
+              <div className="aip-welcome-icon">✦</div>
+              <p className="aip-welcome-title">AI Code Assistant</p>
+              <p className="aip-welcome-sub">Ask anything. Use <code>@file</code> to attach the current file.</p>
+              <div className="aip-chips">
+                {["Explain this function", "Find bugs in @file", "Refactor @file", "Write tests", "How does this work?"].map(s => (
+                  <button key={s} className="aip-chip" onClick={() => setInput(s)}>{s}</button>
+                ))}
+              </div>
+            </div>
+          )
         ) : (
           chatHistory.map(msg => {
             const codeSuggestion = msg.role === "assistant" ? extractFirstCodeBlock(msg.content) : null;
@@ -1011,6 +1811,10 @@ export function AIPanel() {
             const architectureSections =
               msg.role === "assistant"
                 ? extractArchitectureSections(msg.content, msg.mode === "architect")
+                : null;
+            const dependencyMap =
+              msg.role === "assistant" && msg.mode === "architect"
+                ? parseDependencyMap(msg.content)
                 : null;
             const canApprove = !!codeSuggestion && !!activeTabId && !!activeTab && msg.role === "assistant" && fileSuggestions.length === 0 && !rejectedMsgIds.has(msg.id);
 
@@ -1045,23 +1849,17 @@ export function AIPanel() {
                 )}
 
                 {architectureSections ? (
-                  <div className="aip-architecture">
-                    {ARCHITECTURE_SECTION_ORDER.map((section) => (
-                      <details key={`${msg.id}-${section}`} className="aip-arch-section">
-                        <summary className="aip-arch-toggle">{section}</summary>
-                        <div
-                          className="aip-arch-body"
-                          dangerouslySetInnerHTML={{ __html: renderMarkdown(architectureSections.sections[section]) }}
-                        />
-                      </details>
-                    ))}
-                    {architectureSections.remainder && (
-                      <div className="aip-msg-body" dangerouslySetInnerHTML={{ __html: renderMarkdown(architectureSections.remainder) }} />
-                    )}
-                  </div>
+                  <ArchitectureSectionsView
+                    sections={architectureSections.sections}
+                    remainder={architectureSections.remainder}
+                    renderMarkdown={renderMarkdown}
+                  />
                 ) : (
                   <div className="aip-msg-body" dangerouslySetInnerHTML={{ __html: renderMarkdown(msg.content) }} />
                 )}
+
+                {/* Dependency graph view for architect mode (Req 10.4, 10.5) */}
+                {dependencyMap && <DependencyGraphView depMap={dependencyMap} />}
 
                 {/* Bug report cards (Req 5.3, 5.4, 5.5) */}
                 {msg.role === "assistant" && msg.bugReport && (
@@ -1088,6 +1886,37 @@ export function AIPanel() {
                       onClick={() => retryLastMessage()}
                     >
                       <RefreshCw size={11} /> Retry
+                    </button>
+                  </div>
+                )}
+
+                {/* OOM error — show Quantize Now shortcut (Req 7.5) */}
+                {msg.isError && msg.content.includes("OUT_OF_MEMORY:") && (
+                  <div className="aip-actions">
+                    <button
+                      className="aip-action-btn primary"
+                      onClick={() => {
+                        if (selectedLocalModel) setTqModelId(selectedLocalModel);
+                        setTqMethod("GGUF");
+                        setTqBits(4);
+                        setShowTurboQuant(true);
+                      }}
+                    >
+                      ⚡ Quantize Now
+                    </button>
+                  </div>
+                )}
+
+                {/* Auth error — prompt to update API key (Req 12.3) */}
+                {msg.isError && msg.isAuthError && (
+                  <div className="aip-auth-error-prompt">
+                    <AlertCircle size={11} />
+                    <span>API key is invalid or expired.</span>
+                    <button
+                      className="aip-action-btn primary"
+                      onClick={() => toggleSettingsPanel()}
+                    >
+                      Update Key in Settings
                     </button>
                   </div>
                 )}
@@ -1261,10 +2090,17 @@ export function AIPanel() {
           </div>
         )}
 
-        {/* Thinking dots */}
+        {/* Thinking dots / Loading model spinner */}
         {isThinking && aiMode !== "agent" && (
           <div className="aip-msg aip-msg-assistant">
-            <div className="aip-thinking"><span /><span /><span /></div>
+            {selectedProvider === "local" ? (
+              <div className="aip-thinking-local">
+                <RefreshCw size={12} className="spin-icon" />
+                <span style={{ fontSize: 12, opacity: 0.7 }}>Loading model…</span>
+              </div>
+            ) : (
+              <div className="aip-thinking"><span /><span /><span /></div>
+            )}
           </div>
         )}
         <div ref={messagesEndRef} />
