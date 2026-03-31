@@ -423,4 +423,6 @@ python3 -m pytest
 
 ## License
 
-MIT
+MIT License — Copyright (c) 2024 NCode Contributors
+
+See [LICENSE](LICENSE) for the full text.
