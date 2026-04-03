@@ -91,7 +91,8 @@ export const MenuBar = memo(function MenuBar() {
   } = useUIStore();
   const { setOpenFolder: setAIOpenFolder } = useAIStore();
   const {
-    runCommandInTerminal,
+    showAndRunCommand,
+    showTerminalTab,
     requestNewTerminal,
     requestSplitTerminal,
     requestClearTerminal,
@@ -140,8 +141,8 @@ export const MenuBar = memo(function MenuBar() {
     closeMenus();
   };
 
-  const ensureTerminalVisible = () => {
-    if (!showTerminal) toggleTerminal();
+  const ensureTerminalVisible = (tab: "terminal" | "problems" | "run" | "output" = "terminal") => {
+    showTerminalTab(tab);
   };
 
   const queueCommand = (command: string | null, missingMessage: string) => {
@@ -150,8 +151,7 @@ export const MenuBar = memo(function MenuBar() {
       return;
     }
 
-    ensureTerminalVisible();
-    runCommandInTerminal(command);
+    showAndRunCommand(command);
   };
 
   const copyToClipboard = async (value: string, successLabel: string) => {
@@ -722,12 +722,12 @@ export const MenuBar = memo(function MenuBar() {
             label: "Problems",
             shortcut: "Ctrl+Shift+M",
             onSelect: () => {
-              ensureTerminalVisible();
+              ensureTerminalVisible("problems");
               if (lastErrors.length === 0) addToast("No current problems in terminal diagnostics.", "info");
             },
           },
-          { id: "view-output", label: "Output", shortcut: "Ctrl+K Ctrl+H", onSelect: () => ensureTerminalVisible() },
-          { id: "view-debug-console", label: "Debug Console", shortcut: "Ctrl+Shift+Y", onSelect: () => ensureTerminalVisible() },
+          { id: "view-output", label: "Output", shortcut: "Ctrl+K Ctrl+H", onSelect: () => ensureTerminalVisible("output") },
+          { id: "view-debug-console", label: "Debug Console", shortcut: "Ctrl+Shift+Y", onSelect: () => ensureTerminalVisible("output") },
           { id: "view-terminal", label: "Terminal", shortcut: "Ctrl+`", checked: showTerminal, onSelect: () => toggleTerminal() },
           { id: "view-sep-5", label: "", disabled: true },
           { id: "view-word-wrap", label: "Word Wrap", shortcut: "Alt+Z", checked: wordWrap, onSelect: () => setWordWrap(!wordWrap) },

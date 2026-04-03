@@ -1,9 +1,9 @@
 // src/components/editor/CommandPalette.tsx
 import { useState, useEffect, useRef } from "react";
-import { invoke } from "@tauri-apps/api/core";
 import { useEditorStore } from "../../store/editorStore";
 import { useUIStore } from "../../store/uiStore";
 import { useAIStore } from "../../store/aiStore";
+import { useTerminalStore } from "../../store/terminalStore";
 import {
   getRunCommand,
   getTestCommand,
@@ -21,18 +21,24 @@ interface Command {
   action: () => void;
 }
 
-async function runInTerminal(cmd: string, cwd: string | null, addToast: (msg: string, type: "info"|"success"|"error"|"warning") => void) {
+function runInTerminal(
+  cmd: string,
+  cwd: string | null,
+  addToast: (msg: string, type: "info" | "success" | "error" | "warning") => void
+) {
   if (!cwd) {
     addToast("Open a project folder first.", "warning");
     return;
   }
-  try {
-    const out = await invoke<string>("run_command", { cmd, cwd });
-    const preview = out.length > 2000 ? `${out.slice(0, 2000)}\n…[truncated]` : out;
-    addToast(`✓ Command succeeded:\n\n$ ${cmd}\n\n${preview || "(no output)"}`, "success");
-  } catch (e) {
-    addToast(`✗ Command failed:\n\n$ ${cmd}\n\n${String(e)}`, "error");
-  }
+
+  const safeCwd = cwd.replace(/"/g, '\\"');
+  const terminalCommand = `cd "${safeCwd}" && ${cmd}`;
+  useTerminalStore.getState().showAndTrackCommand(terminalCommand, {
+    source: "manual",
+    analyzeWithAI: false,
+  });
+  useTerminalStore.getState().showTerminalTab("terminal");
+  addToast(`Queued in terminal: ${cmd}`, "info");
 }
 
 export function CommandPalette() {
@@ -57,6 +63,11 @@ export function CommandPalette() {
   const lang = activeTab?.language || "";
   const filePath = activeTab?.filePath || "";
   const fileName = activeTab?.fileName || "";
+
+  const ensureAIPanelOpen = () => {
+    const { showAIPanel, toggleAIPanel } = useUIStore.getState();
+    if (!showAIPanel) toggleAIPanel();
+  };
 
   const commands: Command[] = [
     // ── File ──
@@ -187,6 +198,7 @@ export function CommandPalette() {
       label: "AI: Review Current File",
       action: () => {
         if (activeTab) {
+          ensureAIPanelOpen();
           sendMessage(`Review this code for bugs, performance, and best practices:\n\n\`\`\`${activeTab.language}\n// ${activeTab.fileName}\n${activeTab.content.slice(0, 4000)}\n\`\`\``);
         }
       },
@@ -197,6 +209,7 @@ export function CommandPalette() {
       label: "AI: Debug Current File 🐛",
       action: () => {
         if (activeTab) {
+          ensureAIPanelOpen();
           setAIMode("bug_hunt");
           sendMessage(`Find all bugs in this file:\n\n\`\`\`${activeTab.language}\n// ${activeTab.fileName}\n${activeTab.content.slice(0, 4000)}\n\`\`\``);
         }
@@ -208,6 +221,7 @@ export function CommandPalette() {
       label: "AI: Explain Current File",
       action: () => {
         if (activeTab) {
+          ensureAIPanelOpen();
           sendMessage(`Explain this code in detail:\n\n\`\`\`${activeTab.language}\n// ${activeTab.fileName}\n${activeTab.content.slice(0, 4000)}\n\`\`\``);
         }
       },
@@ -218,6 +232,7 @@ export function CommandPalette() {
       label: "AI: Write Tests for Current File",
       action: () => {
         if (activeTab) {
+          ensureAIPanelOpen();
           sendMessage(`Write comprehensive unit tests for this code:\n\n\`\`\`${activeTab.language}\n// ${activeTab.fileName}\n${activeTab.content.slice(0, 4000)}\n\`\`\``);
         }
       },

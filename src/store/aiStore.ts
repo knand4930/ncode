@@ -53,10 +53,18 @@ export interface MentionedFile {
   truncated: boolean;
 }
 
-const MENTION_FILE_LIMIT = 5;
-const MENTION_CHAR_LIMIT = 6000;
+// ── Memory limits ─────────────────────────────────────────────────────────────
+// These caps prevent unbounded memory growth on low-end systems
+const MAX_CHAT_HISTORY = 100;        // messages per session
+const MAX_SESSIONS = 10;             // saved sessions
+const MAX_AGENT_EVENTS = 50;         // agent trace events
+const MAX_AGENT_LIVE_OUTPUT = 8000;  // chars of live agent output
+const MAX_RECENT_FILES = 20;         // recent file paths
 
-export type AIMode = "chat" | "think" | "agent" | "bug_hunt" | "architect";
+const MENTION_FILE_LIMIT = 50;
+const MENTION_CHAR_LIMIT = 50000;
+
+export type AIMode = "chat" | "think" | "agent" | "bug_hunt" | "architect" | "spec";
 export type AIServiceMode = "direct" | "grpc";
 
 export type AgentEvent = {
@@ -174,7 +182,7 @@ const AI_SETTINGS_KEY = "NCode.ai.settings.v1";
 const AI_CHAT_HISTORY_KEY = "NCode.ai.chatHistory.v1";
 const AI_SESSIONS_KEY = "NCode.ai.sessions.v1";
 export const INLINE_COMPLETION_DEBOUNCE_MS = 600;
-export const INLINE_COMPLETION_TIMEOUT_MS = 3000;
+export const INLINE_COMPLETION_TIMEOUT_MS = 0; // no timeout
 export const CONTEXT_SUMMARIZATION_THRESHOLD = 0.9;
 
 export const CONTEXT_LIMITS: Record<string, number> = {
@@ -304,7 +312,7 @@ async function requestInlineCompletionFromBackend(
     ].join("\n");
 
     const timeoutPromise = new Promise<string>((_, reject) =>
-      setTimeout(() => reject(new Error("INLINE_COMPLETION_TIMEOUT")), INLINE_COMPLETION_TIMEOUT_MS)
+      setTimeout(() => reject(new Error("INLINE_COMPLETION_TIMEOUT")), 30_000)
     );
 
     const completionPromise = (async (): Promise<string> => {
@@ -312,8 +320,7 @@ async function requestInlineCompletionFromBackend(
         const result = await invoke<string>("ollama_complete", {
           model: ollamaModel,
           prompt,
-          maxTokens: 100,
-          baseUrl: ollamaBaseUrl,
+          maxTokens: 500,
         });
         return result.trim();
       }
@@ -329,14 +336,14 @@ async function requestInlineCompletionFromBackend(
               model: keyEntry.model,
               messages: [{ role: "user", content: prompt }],
               temperature: 0.1,
-              maxTokens: 120,
+              maxTokens: 500,
             })
           : await invoke<string>("api_complete", {
               provider: keyEntry.provider,
               apiKey: keyEntry.apiKey,
               model: keyEntry.model,
               prompt,
-              maxTokens: 100,
+              maxTokens: 500,
             });
 
       return result.trim();
@@ -1249,7 +1256,7 @@ export const useAIStore = create<AIStore>((set, get) => ({
       const results = await invoke<unknown[]>("grpc_hf_search", {
         query,
         task: task ?? "text-generation",
-        limit: 20,
+        limit: 100,
         maxSizeGb: maxSizeGb ?? 0,
         hfToken: hfLocalToken,
       });
@@ -1547,11 +1554,9 @@ export const useAIStore = create<AIStore>((set, get) => ({
       timestamp: Date.now(),
     };
     const autoProjectReviewIntent =
-      selectedProvider === "ollama" &&
       !!openFolder &&
       /\b(project|projects|codebase|repo|repository|review|analy[sz]e|audit|architecture|one by one|each file|all files)\b/i.test(content);
     const autoProjectActionIntent =
-      selectedProvider === "ollama" &&
       !!openFolder &&
       /\b(generate|create|add|update|implement|build|scaffold)\b/i.test(content);
     const shouldUseAgenticReview = aiMode === "agent" || autoProjectReviewIntent || autoProjectActionIntent;
@@ -1566,29 +1571,7 @@ export const useAIStore = create<AIStore>((set, get) => ({
       return { chatHistory: updated, isThinking: true };
     });
 
-    // ── 90-second watchdog timer (Req 12.4) ──────────────────────────────
-    const watchdogTimer = setTimeout(() => {
-      const state = get();
-      if (state.isThinking) {
-        logAIError("WATCHDOG_TIMEOUT", "isThinking stuck for 90s — auto-resetting");
-        const timeoutMsg: ChatMessage = {
-          id: `msg-${Date.now()}-watchdog`,
-          role: "assistant",
-          content: "Request timed out after 90 seconds. The AI service may be unresponsive. Please try again.",
-          timestamp: Date.now(),
-          isError: true,
-          retryContent: content,
-        };
-        set((s) => {
-          const updated = [...s.chatHistory, timeoutMsg];
-          debouncedSaveChatHistory(updated);
-          get()._syncSessionMessages(updated, { debounced: true });
-          return { chatHistory: updated, isThinking: false, abortController: null };
-        });
-      }
-    }, 90_000);
-
-    // ── AbortController for in-flight requests (Req 1.7) ─────────────────
+    // ── AbortController for in-flight requests ───────────────────────────
     const controller = new AbortController();
     set({ abortController: controller });
 
@@ -1675,7 +1658,6 @@ export const useAIStore = create<AIStore>((set, get) => ({
             get()._syncSessionMessages(updated, { debounced: true });
             return { chatHistory: updated, isThinking: false, abortController: null };
           });
-          clearTimeout(watchdogTimer);
           return;
         }
         activeModels.push({ isApi: true, provider: "huggingface", model: hfSelectedModel, apiKey: hfApiKey, baseUrl: hfBaseUrl });
@@ -1700,7 +1682,6 @@ export const useAIStore = create<AIStore>((set, get) => ({
             get()._syncSessionMessages(updated, { debounced: true });
             return { chatHistory: updated, isThinking: false, abortController: null };
           });
-          clearTimeout(watchdogTimer);
           return;
         }
         activeModels.push({ isApi: true, provider: "local", model: localPath, apiKey: "" });
@@ -1732,7 +1713,6 @@ export const useAIStore = create<AIStore>((set, get) => ({
             abortController: null,
           };
         });
-        clearTimeout(watchdogTimer);
         return;
       }
 
@@ -1855,7 +1835,7 @@ export const useAIStore = create<AIStore>((set, get) => ({
                     provider: "local",
                     apiKey: null,
                     temperature: 0.7,
-                    maxTokens: 4000,
+                    maxTokens: 32000,
                   }).catch((err) => { cleanup(); reject(err); });
                 }).catch(reject);
               });
@@ -1865,7 +1845,7 @@ export const useAIStore = create<AIStore>((set, get) => ({
               try {
                 res = await invoke<string>("grpc_ai_chat", {
                   provider: am.provider, apiKey: am.apiKey, model: am.model,
-                  messages: grpcMessages, temperature: 0.7, maxTokens: 4000,
+                  messages: grpcMessages, temperature: 0.7, maxTokens: 32000,
                   ...(am.baseUrl ? { baseUrl: am.baseUrl } : {}),
                 });
               } catch (err) {
@@ -1900,14 +1880,10 @@ export const useAIStore = create<AIStore>((set, get) => ({
           return { res, sourcesToAttach, am };
         };
 
-        // Race: fastest model wins; also race against 60-second timeout (Req 1.4)
-        const timeoutPromise = new Promise<never>((_, reject) =>
-          setTimeout(() => reject(new Error("REQUEST_TIMEOUT")), 60_000)
+        // Race: fastest model wins
+        const { res, sourcesToAttach, am: winner } = await Promise.race(
+          activeModels.map(makeModelPromise)
         );
-        const { res, sourcesToAttach, am: winner } = await Promise.race([
-          ...activeModels.map(makeModelPromise),
-          timeoutPromise,
-        ]);
         response = res;
 
         // Parse <thinking> block for think mode (Req 4.2 / Property 5)
@@ -1947,7 +1923,6 @@ export const useAIStore = create<AIStore>((set, get) => ({
         if (unlisten) unlisten();
       }
 
-      clearTimeout(watchdogTimer);
       set({ isThinking: false, abortController: null });
       // Clear @-mentions after successful send
       set({ mentionedFiles: [] });
@@ -1996,20 +1971,17 @@ export const useAIStore = create<AIStore>((set, get) => ({
       }
 
     } catch (e: any) {
-      clearTimeout(watchdogTimer);
       const wasUserAbort = e?.name === "AbortError";
       // Abort any in-flight request
       controller.abort();
 
-      const isTimeout = e?.message === "REQUEST_TIMEOUT";
-      if (wasUserAbort && !isTimeout) {
+      if (wasUserAbort) {
         // User manually aborted — just reset state, no error message
         set({ isThinking: false, abortController: null });
         return;
       }
 
-      const errorType = isTimeout ? "REQUEST_TIMEOUT" : "SEND_ERROR";
-      logAIError(errorType, String(e));
+      logAIError("SEND_ERROR", String(e));
 
       if (shouldUseAgenticReview) {
         set((s) => ({
@@ -2020,9 +1992,7 @@ export const useAIStore = create<AIStore>((set, get) => ({
         }));
       }
 
-      const errorContent = isTimeout
-        ? "Request timed out after 60 seconds. The AI service did not respond in time."
-        : `Error: ${e.toString()}. Make sure your LLM service is configured correctly.`;
+      const errorContent = `Error: ${e.toString()}. Make sure your LLM service is configured correctly.`;
 
       const isAuthError = String(e).includes("AUTH_ERROR:");
 
@@ -2345,7 +2315,6 @@ export const useAIStore = create<AIStore>((set, get) => ({
   // @-mention: add a file to the mention context (Property 6 — truncate at 6000 chars)
   addMentionedFile: async (path: string) => {
     const { mentionedFiles } = get();
-    // Enforce 5-file limit (Req 7.3)
     if (mentionedFiles.length >= MENTION_FILE_LIMIT) {
       return { ok: false, reason: `Limit of ${MENTION_FILE_LIMIT} file mentions reached.` };
     }

@@ -5,7 +5,7 @@ import { useEditorStore } from "../../store/editorStore";
 import { useUIStore } from "../../store/uiStore";
 import { useAIStore } from "../../store/aiStore";
 import { useTerminalStore } from "../../store/terminalStore";
-import { AlertCircle, GitBranch, Terminal, Bot, Settings, Play, ListTodo } from "lucide-react";
+import { AlertCircle, AlertTriangle, GitBranch, Terminal, Bot, Settings, Play, ListTodo, Info } from "lucide-react";
 import { getRunCommand } from "../../utils/languageRunner";
 
 export const StatusBar = memo(function StatusBar() {
@@ -15,7 +15,6 @@ export const StatusBar = memo(function StatusBar() {
     toggleAIPanel,
     toggleSettingsPanel,
     openView,
-    showTerminal,
     tabSize,
     colorTheme,
   } = useUIStore();
@@ -26,7 +25,7 @@ export const StatusBar = memo(function StatusBar() {
     selectedApiKeyIndices,
     apiKeys,
   } = useAIStore();
-  const { runCommandInTerminal, lastErrors } = useTerminalStore();
+  const { lastErrors } = useTerminalStore();
 
   const activeTab = tabs.find((t) => t.id === activeTabId);
   const [branch, setBranch] = useState("main");
@@ -130,12 +129,11 @@ export const StatusBar = memo(function StatusBar() {
 
   const handleRunFile = () => {
     if (!runCmd) return;
-    if (!showTerminal) toggleTerminal();
-    runCommandInTerminal(runCmd);
+    useTerminalStore.getState().showAndRunCommand(runCmd);
   };
 
   const openProblems = () => {
-    if (!showTerminal) toggleTerminal();
+    useTerminalStore.getState().showTerminalTab("problems");
   };
 
   return (
@@ -156,12 +154,21 @@ export const StatusBar = memo(function StatusBar() {
           )}
         </button>
 
-        <button className="status-item" onClick={openProblems} title="Problems">
-          <AlertCircle size={13} />
-          <span>
-            {problemCounts.errors} Errors
-            {problemCounts.warnings > 0 ? `, ${problemCounts.warnings} Warnings` : ""}
-          </span>
+        <button className="status-item status-problems" onClick={openProblems} title="Problems (click to open)">
+          <AlertCircle size={13} className={problemCounts.errors > 0 ? "status-err-icon" : ""} />
+          <span>{problemCounts.errors}</span>
+          {problemCounts.warnings > 0 && (
+            <>
+              <AlertTriangle size={12} className="status-warn-icon" />
+              <span>{problemCounts.warnings}</span>
+            </>
+          )}
+          {problemCounts.info > 0 && (
+            <>
+              <Info size={11} className="status-info-icon" />
+              <span>{problemCounts.info}</span>
+            </>
+          )}
         </button>
 
         <button

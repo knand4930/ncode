@@ -1,7 +1,8 @@
-import { useState } from "react";
-import { invoke } from "@tauri-apps/api/core";
+import { useEffect, useState } from "react";
 import { ShieldAlert, Play, AlertTriangle, AlertCircle, Info, CheckCircle2 } from "lucide-react";
 import { useEditorStore } from "../../store/editorStore";
+import { useTerminalStore } from "../../store/terminalStore";
+import { analyzeFileContent, type DetectedError } from "../../utils/errorParser";
 
 type IssueSeverity = "critical" | "high" | "medium" | "low";
 
@@ -20,27 +21,83 @@ interface AnalysisResult {
   issues: CodeIssue[];
 }
 
+function matchesFile(error: DetectedError, filePath: string): boolean {
+  if (!error.file) return false;
+  const normalizedError = error.file.replace(/\\/g, "/");
+  const normalizedFile = filePath.replace(/\\/g, "/");
+  return (
+    normalizedError === normalizedFile ||
+    normalizedFile.endsWith(normalizedError) ||
+    normalizedError.endsWith(normalizedFile) ||
+    normalizedError.endsWith(`/${normalizedFile.split("/").pop() ?? normalizedFile}`)
+  );
+}
+
+function mapSeverity(error: DetectedError): IssueSeverity {
+  if (error.category === "security") return "critical";
+  if (error.severity === "error") return "high";
+  if (error.severity === "warning") return "medium";
+  return "low";
+}
+
+function toCodeIssue(error: DetectedError): CodeIssue {
+  const parts = [error.title, error.detail].filter(Boolean);
+  return {
+    type: error.category,
+    severity: mapSeverity(error),
+    line: error.line ?? 1,
+    message: parts.join(parts.length > 1 ? ": " : ""),
+    suggestion: error.suggestion ?? error.installCommand ?? error.updateCommand,
+  };
+}
+
 export function AIReviewPanel() {
   const { tabs, activeTabId } = useEditorStore();
+  const { lastErrors } = useTerminalStore();
   const [loading, setLoading] = useState(false);
   const [result, setResult] = useState<AnalysisResult | null>(null);
   const [error, setError] = useState<string | null>(null);
 
   const activeTab = tabs.find((t) => t.id === activeTabId);
 
+  useEffect(() => {
+    setResult(null);
+    setError(null);
+  }, [activeTabId]);
+
   const runAnalysis = async () => {
     if (!activeTab) return;
     setLoading(true);
     setError(null);
     try {
-      const res = await invoke<AnalysisResult>("analyze_issues", {
-        filePath: activeTab.filePath,
-        code: activeTab.content,
+      const staticIssues = analyzeFileContent(activeTab.content, activeTab.language, activeTab.filePath);
+      const terminalIssues = lastErrors.filter((issue) => matchesFile(issue, activeTab.filePath));
+      const mergedIssues = [...terminalIssues, ...staticIssues]
+        .filter((issue, index, all) => {
+          const key = `${issue.category}:${issue.title}:${issue.file ?? activeTab.filePath}:${issue.line ?? 0}`;
+          return all.findIndex((candidate) => {
+            const candidateKey = `${candidate.category}:${candidate.title}:${candidate.file ?? activeTab.filePath}:${candidate.line ?? 0}`;
+            return candidateKey === key;
+          }) === index;
+        })
+        .sort((left, right) => {
+          const severityRank = { critical: 0, high: 1, medium: 2, low: 3 };
+          return (
+            severityRank[mapSeverity(left)] - severityRank[mapSeverity(right)] ||
+            (left.line ?? 0) - (right.line ?? 0) ||
+            left.title.localeCompare(right.title)
+          );
+        })
+        .map(toCodeIssue);
+
+      setResult({
+        file: activeTab.filePath,
         language: activeTab.language,
+        total_issues: mergedIssues.length,
+        issues: mergedIssues,
       });
-      setResult(res);
     } catch (e) {
-      setError(String(e));
+      setError(`Review scan failed: ${String(e)}`);
     } finally {
       setLoading(false);
     }

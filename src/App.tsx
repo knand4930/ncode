@@ -1,5 +1,5 @@
 // src/App.tsx
-import { useEffect, useRef } from "react";
+import { useEffect, useRef, useState } from "react";
 import { PanelGroup, Panel, PanelResizeHandle, type ImperativePanelHandle } from "react-resizable-panels";
 import { ActivityBar } from "./components/sidebar/ActivityBar";
 import { Sidebar } from "./components/sidebar/Sidebar";
@@ -20,8 +20,20 @@ import { useUIStore } from "./store/uiStore";
 import { useAIStore } from "./store/aiStore";
 import "./index.css";
 
+type LayoutMode = "desktop" | "compact" | "narrow";
+
+function getLayoutMode(width: number): LayoutMode {
+  if (width < 900) return "narrow";
+  if (width < 1280) return "compact";
+  return "desktop";
+}
+
 export default function App() {
   const terminalPanelRef = useRef<ImperativePanelHandle | null>(null);
+  const [layoutMode, setLayoutMode] = useState<LayoutMode>(() => {
+    if (typeof window === "undefined") return "desktop";
+    return getLayoutMode(window.innerWidth);
+  });
   const {
     showActivityBar,
     showSidebar,
@@ -47,10 +59,18 @@ export default function App() {
     toggleAIPanel,
   } = useUIStore();
   const { activeTabId, closeTab, saveFile, saveAllFiles } = useEditorStore();
+  const useOverlayPanels = layoutMode !== "desktop";
 
   useEffect(() => {
     checkOllama();
   }, [checkOllama]);
+
+  useEffect(() => {
+    const handleResize = () => setLayoutMode(getLayoutMode(window.innerWidth));
+    handleResize();
+    window.addEventListener("resize", handleResize);
+    return () => window.removeEventListener("resize", handleResize);
+  }, []);
 
   useEffect(() => {
     document.documentElement.style.setProperty("--font-mono", editorFont);
@@ -65,7 +85,7 @@ export default function App() {
     } else {
       terminalPanelRef.current.collapse();
     }
-  }, [showTerminal]);
+  }, [layoutMode, showTerminal]);
 
   // Global keyboard shortcuts
   useEffect(() => {
@@ -172,8 +192,18 @@ export default function App() {
     toggleTerminal,
   ]);
 
+  const closeOverlayPanels = () => {
+    if (showSidebar) toggleSidebar();
+    if (showAIPanel) toggleAIPanel();
+  };
+
   return (
-    <div className="app-root" data-color-theme={colorTheme} data-icon-theme={iconTheme}>
+    <div
+      className="app-root"
+      data-color-theme={colorTheme}
+      data-icon-theme={iconTheme}
+      data-layout={layoutMode}
+    >
       {showQuickOpen && <QuickOpenPanel />}
       {/* Command Palette */}
       {showCommandPalette && <CommandPalette />}
@@ -190,70 +220,116 @@ export default function App() {
 
       {/* Main layout */}
       <TitleBar />
-      <div className="app-body">
-        {/* Activity Bar (left icons) */}
-        {showActivityBar && <ActivityBar />}
+      <div className="app-workbench">
+        <div className="app-body">
+          {/* Activity Bar (left icons) */}
+          {showActivityBar && <ActivityBar />}
 
-        <PanelGroup direction="horizontal" className="flex-1">
-          {/* Sidebar */}
-          {showSidebar && (
-            <>
-              <Panel defaultSize={18} minSize={10} maxSize={40} id="sidebar">
-                <Sidebar />
-              </Panel>
-
-              <PanelResizeHandle className="resize-handle-vertical" />
-            </>
-          )}
-
-          {/* Editor + Terminal */}
-          <Panel id="main">
-            <PanelGroup direction="vertical">
-              {/* Editor */}
-              <Panel id="editor" minSize={30}>
-                <div className="editor-container">
-                  <EditorTabs />
-                  <EditorBreadcrumbs />
-                  <ErrorBoundary fallbackLabel="Editor">
-                    <EditorArea />
-                  </ErrorBoundary>
-                </div>
-              </Panel>
-
-              {/* Terminal (toggleable) */}
+          <PanelGroup
+            direction="horizontal"
+            className="workbench-panels"
+            key={`workbench-${layoutMode}`}
+          >
+            {/* Sidebar */}
+            {showSidebar && !useOverlayPanels && (
               <>
-                <PanelResizeHandle
-                  className={`resize-handle-horizontal ${showTerminal ? "" : "resize-handle-hidden"}`}
-                />
                 <Panel
-                  ref={terminalPanelRef}
-                  defaultSize={25}
-                  minSize={15}
-                  maxSize={50}
-                  collapsible
-                  collapsedSize={0}
-                  id="terminal"
+                  defaultSize={18}
+                  minSize={10}
+                  maxSize={40}
+                  id="sidebar"
+                  className="workbench-sidebar-panel"
                 >
-                  <ErrorBoundary fallbackLabel="Terminal">
-                    <Terminal />
+                  <Sidebar />
+                </Panel>
+
+                <PanelResizeHandle className="resize-handle-vertical" />
+              </>
+            )}
+
+            {/* Editor + Terminal */}
+            <Panel id="main" className="workbench-main-panel">
+              <PanelGroup direction="vertical" className="workbench-main-stack">
+                {/* Editor */}
+                <Panel id="editor" minSize={showTerminal ? 30 : 20} className="workbench-editor-panel">
+                  <div className="editor-container">
+                    <EditorTabs />
+                    <EditorBreadcrumbs />
+                    <ErrorBoundary fallbackLabel="Editor">
+                      <EditorArea />
+                    </ErrorBoundary>
+                  </div>
+                </Panel>
+
+                {/* Terminal (toggleable) */}
+                <>
+                  <PanelResizeHandle
+                    className={`resize-handle-horizontal ${showTerminal ? "" : "resize-handle-hidden"}`}
+                  />
+                  <Panel
+                    ref={terminalPanelRef}
+                    defaultSize={25}
+                    minSize={15}
+                    maxSize={55}
+                    collapsible
+                    collapsedSize={0}
+                    id="terminal"
+                    className="workbench-terminal-panel"
+                  >
+                    <ErrorBoundary fallbackLabel="Terminal">
+                      <Terminal />
+                    </ErrorBoundary>
+                  </Panel>
+                </>
+              </PanelGroup>
+            </Panel>
+
+            {/* AI Panel (Cursor-like) */}
+            {showAIPanel && !useOverlayPanels && (
+              <>
+                <PanelResizeHandle className="resize-handle-vertical" />
+                <Panel
+                  defaultSize={28}
+                  minSize={20}
+                  maxSize={50}
+                  id="ai"
+                  className="workbench-ai-panel"
+                >
+                  <ErrorBoundary fallbackLabel="AI Panel">
+                    <AIPanel />
                   </ErrorBoundary>
                 </Panel>
               </>
-            </PanelGroup>
-          </Panel>
+            )}
+          </PanelGroup>
+        </div>
 
-          {/* AI Panel (Cursor-like) */}
-          {showAIPanel && (
-            <>
-              <PanelResizeHandle className="resize-handle-vertical" />
-              <Panel defaultSize={28} minSize={20} maxSize={50} id="ai">
+        {useOverlayPanels && (showSidebar || showAIPanel) && (
+          <>
+            <button
+              type="button"
+              className="workbench-overlay-scrim"
+              aria-label="Close open panels"
+              onClick={closeOverlayPanels}
+            />
+
+            {showSidebar && (
+              <aside className="workbench-drawer workbench-drawer-sidebar">
+                <ErrorBoundary fallbackLabel="Sidebar">
+                  <Sidebar />
+                </ErrorBoundary>
+              </aside>
+            )}
+
+            {showAIPanel && (
+              <aside className="workbench-drawer workbench-drawer-ai">
                 <ErrorBoundary fallbackLabel="AI Panel">
                   <AIPanel />
                 </ErrorBoundary>
-              </Panel>
-            </>
-          )}
-        </PanelGroup>
+              </aside>
+            )}
+          </>
+        )}
       </div>
 
       {/* Status Bar */}

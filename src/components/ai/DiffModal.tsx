@@ -1,88 +1,134 @@
-import React from "react";
+import React, { useEffect } from "react";
 import { DiffEditor } from "@monaco-editor/react";
-import { X, Check } from "lucide-react";
+import { ArrowRightLeft, Check, X } from "lucide-react";
+import { inferLanguageFromPath } from "../../utils/aiSuggestionParser";
 
-interface DiffModalProps {
-  isOpen: boolean;
-  onClose: () => void;
-  originalPath: string;
+interface DiffReviewPaneProps {
+  title: string;
+  description?: string;
+  sourcePath: string;
   originalContent: string;
   modifiedContent: string;
-  onAccept: () => void;
-  onReject: () => void;
+  onClose: () => void;
+  onAccept?: () => void;
+  onReject?: () => void;
   isAccepting?: boolean;
+  acceptLabel?: string;
+  rejectLabel?: string;
+  note?: string;
 }
 
-export const DiffModal: React.FC<DiffModalProps> = ({
-  isOpen,
-  onClose,
-  originalPath,
+export const DiffReviewPane: React.FC<DiffReviewPaneProps> = ({
+  title,
+  description,
+  sourcePath,
   originalContent,
   modifiedContent,
+  onClose,
   onAccept,
   onReject,
   isAccepting = false,
+  acceptLabel = "Accept Changes",
+  rejectLabel = "Reject Changes",
+  note = "Accepted changes are tracked in Change History for full rollback.",
 }) => {
-  if (!isOpen) return null;
+  const language = inferLanguageFromPath(sourcePath);
+
+  useEffect(() => {
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key === "Escape") onClose();
+      if ((event.ctrlKey || event.metaKey) && event.key === "Enter" && onAccept && !isAccepting) {
+        event.preventDefault();
+        onAccept();
+      }
+    };
+
+    document.addEventListener("keydown", onKeyDown);
+    return () => document.removeEventListener("keydown", onKeyDown);
+  }, [isAccepting, onAccept, onClose]);
 
   return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 backdrop-blur-sm">
-      <div className="bg-gray-900 border border-gray-700 shadow-2xl rounded-lg w-11/12 max-w-6xl h-5/6 flex flex-col overflow-hidden">
-        
-        {/* Header */}
-        <div className="flex items-center justify-between p-4 border-b border-gray-800 bg-gray-950">
-          <div className="flex flex-col">
-            <h3 className="text-lg font-semibold text-gray-200">Review AI Changes</h3>
-            <span className="text-xs text-gray-400 font-mono mt-1">{originalPath}</span>
+    <div className="diff-review-pane">
+      <div className="diff-review-header">
+        <div className="diff-review-header-main">
+          <div className="diff-review-title-row">
+            <div className="diff-review-badge">
+              <ArrowRightLeft size={14} />
+              <span>Diff Review</span>
+            </div>
+            <h3 className="diff-review-title">{title}</h3>
           </div>
+          <p className="diff-review-path" title={sourcePath}>{sourcePath}</p>
+          {description && <p className="diff-review-description">{description}</p>}
+        </div>
+
+        <div className="diff-review-toolbar">
           <button
             onClick={onClose}
-            className="p-1 hover:bg-gray-800 rounded transition"
-            title="Close Preview"
-          >
-            <X size={20} className="text-gray-400" />
-          </button>
-        </div>
-
-        {/* Diff Content */}
-        <div className="flex-1 bg-gray-950/50 p-2">
-          <DiffEditor
-            original={originalContent}
-            modified={modifiedContent}
-            theme="vs-dark"
-            options={{
-              renderSideBySide: true,
-              readOnly: true,
-              minimap: { enabled: false },
-              wordWrap: "on",
-              scrollBeyondLastLine: false,
-              hideCursorInOverviewRuler: true,
-            }}
-          />
-        </div>
-
-        {/* Footer Actions */}
-        <div className="flex items-center justify-end gap-3 p-4 border-t border-gray-800 bg-gray-950">
-          <button
-            onClick={onReject}
-            className="px-4 py-2 text-sm font-medium text-gray-300 hover:text-white bg-gray-800 hover:bg-gray-700 rounded transition flex items-center gap-2"
+            className="diff-review-btn ghost"
+            disabled={isAccepting}
+            title="Close review"
           >
             <X size={16} />
-            Reject Changes
+            Close
           </button>
-          <button
-            onClick={onAccept}
-            disabled={isAccepting}
-            className={`px-4 py-2 text-sm font-medium rounded transition flex items-center gap-2 ${
-              isAccepting 
-                ? "bg-blue-600/50 text-blue-200 cursor-not-allowed" 
-                : "bg-blue-600 hover:bg-blue-500 text-white"
-            }`}
-          >
-            <Check size={16} />
-            {isAccepting ? "Applying..." : "Accept Changes"}
-          </button>
+          {onReject && (
+            <button
+              onClick={onReject}
+              className="diff-review-btn ghost danger"
+              disabled={isAccepting}
+            >
+              <X size={16} />
+              {rejectLabel}
+            </button>
+          )}
+          {onAccept && (
+            <button
+              onClick={onAccept}
+              disabled={isAccepting}
+              className="diff-review-btn primary"
+            >
+              <Check size={16} />
+              {isAccepting ? "Applying..." : acceptLabel}
+            </button>
+          )}
         </div>
+      </div>
+
+      <div className="diff-review-body">
+        <DiffEditor
+          original={originalContent}
+          modified={modifiedContent}
+          language={language}
+          originalLanguage={language}
+          modifiedLanguage={language}
+          originalModelPath={sourcePath}
+          modifiedModelPath={`${sourcePath}.review`}
+          theme="vs-dark"
+          height="100%"
+          width="100%"
+          options={{
+            renderSideBySide: true,
+            useInlineViewWhenSpaceIsLimited: true,
+            readOnly: true,
+            minimap: { enabled: false },
+            wordWrap: "on",
+            scrollBeyondLastLine: false,
+            hideCursorInOverviewRuler: true,
+            renderOverviewRuler: false,
+            diffWordWrap: "on",
+            automaticLayout: true,
+          }}
+        />
+      </div>
+
+      <div className="diff-review-footer">
+        <span className="diff-review-meta">{note}</span>
+        {onAccept && (
+          <span className="diff-review-shortcut">
+            <kbd>Ctrl/Cmd+Enter</kbd> to apply
+          </span>
+        )}
       </div>
     </div>
   );

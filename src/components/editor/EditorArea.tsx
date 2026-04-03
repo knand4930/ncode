@@ -7,9 +7,12 @@ import { useEditorStore } from "../../store/editorStore";
 import { useUIStore } from "../../store/uiStore";
 import { useAIStore } from "../../store/aiStore";
 import { useTerminalStore } from "../../store/terminalStore";
+import { useReviewStore } from "../../store/reviewStore";
 import { formatShortcut } from "../../utils/os";
 import { getRunCommand, getTestCommand, getLintCommand } from "../../utils/languageRunner";
 import { EDITOR_WORKBENCH_EVENT, type EditorWorkbenchAction } from "../../utils/workbenchActions";
+import { analyzeFileContent } from "../../utils/errorParser";
+import { DiffReviewPane } from "../ai/DiffModal";
 
 export function EditorArea() {
   const {
@@ -40,6 +43,13 @@ export function EditorArea() {
   } = useUIStore();
   const { setOpenFolder: setAIOpenFolder } = useAIStore();
   const { runCommandInTerminal, lastErrors } = useTerminalStore();
+  const {
+    activeDiffReview,
+    closeDiffReview,
+    acceptDiffReview,
+    rejectDiffReview,
+    isApplyingDiffReview,
+  } = useReviewStore();
   
   const editorRef = useRef<Monaco.editor.IStandaloneCodeEditor | null>(null);
   const monacoRef = useRef<typeof Monaco | null>(null);
@@ -84,11 +94,11 @@ export function EditorArea() {
     const model = editorRef.current.getModel();
     if (!model) return;
 
-    // Build markers from lastErrors that have file/line info matching the active file
-    const markers: Monaco.editor.IMarkerData[] = lastErrors
+    // ── Terminal error markers ────────────────────────────────────────────
+    const terminalMarkers: Monaco.editor.IMarkerData[] = lastErrors
       .filter(e => {
         if (!e.line) return false;
-        if (!e.file) return true; // no file info — attach to active file
+        if (!e.file) return true;
         const normFile = e.file.replace(/\\/g, "/");
         const normActive = activeTab.filePath.replace(/\\/g, "/");
         return normActive.endsWith(normFile) || normFile.endsWith(normActive.split("/").pop() ?? "");
@@ -96,21 +106,46 @@ export function EditorArea() {
       .map(e => ({
         severity: e.severity === "warning"
           ? monaco.MarkerSeverity.Warning
-          : e.severity === "info"
+          : e.severity === "info" || e.severity === "hint"
             ? monaco.MarkerSeverity.Info
             : monaco.MarkerSeverity.Error,
         startLineNumber: e.line ?? 1,
         startColumn: e.column ?? 1,
-        endLineNumber: e.line ?? 1,
-        endColumn: (e.column ?? 1) + 20,
-        message: e.installCommand
-          ? `${e.title} — run: ${e.installCommand}`
-          : e.title,
-        source: "Terminal",
+        endLineNumber: e.endLine ?? e.line ?? 1,
+        endColumn: e.endColumn ?? (e.column ?? 1) + 30,
+        message: e.suggestion
+          ? `${e.title}\n${e.detail}\n💡 ${e.suggestion}`
+          : e.installCommand
+            ? `${e.title}\n${e.detail}\n🔧 Run: ${e.installCommand}`
+            : e.detail ? `${e.title}\n${e.detail}` : e.title,
+        source: e.source ?? "Terminal",
+        code: e.code,
       }));
 
-    monaco.editor.setModelMarkers(model, "terminal-errors", markers);
-  }, [lastErrors, activeTab?.filePath]);
+    // ── Static analysis markers (run on current file content) ─────────────
+    const staticDiags = analyzeFileContent(activeTab.content, activeTab.language, activeTab.filePath);
+    const staticMarkers: Monaco.editor.IMarkerData[] = staticDiags
+      .filter(e => e.line)
+      .map(e => ({
+        severity: e.severity === "error"
+          ? monaco.MarkerSeverity.Error
+          : e.severity === "warning"
+            ? monaco.MarkerSeverity.Warning
+            : monaco.MarkerSeverity.Hint,
+        startLineNumber: e.line!,
+        startColumn: e.column ?? 1,
+        endLineNumber: e.endLine ?? e.line!,
+        endColumn: e.endColumn ?? (e.column ?? 1) + 20,
+        message: e.suggestion
+          ? `${e.title}\n${e.detail}\n💡 ${e.suggestion}`
+          : e.detail ? `${e.title}\n${e.detail}` : e.title,
+        source: e.source ?? "Inspection",
+        code: e.code,
+      }));
+
+    monaco.editor.setModelMarkers(model, "terminal-errors", terminalMarkers);
+    monaco.editor.setModelMarkers(model, "static-analysis", staticMarkers);
+  }, [lastErrors, activeTab?.filePath, activeTab?.content, activeTab?.language]);
 
   const handleMount: OnMount = (editor, monaco) => {
     editorRef.current = editor;
@@ -152,10 +187,7 @@ export function EditorArea() {
         const tab = activeTabRef.current;
         if (!tab) return;
         const cmd = getRunCommand(tab.language, tab.filePath, tab.fileName);
-        if (cmd) {
-          if (!terminalStoreRef.current.showTerminal) terminalStoreRef.current.toggleTerminal();
-          terminalStoreRef.current.runCommandInTerminal(cmd);
-        }
+        if (cmd) useTerminalStore.getState().showAndRunCommand(cmd);
       }
     });
 
@@ -168,10 +200,7 @@ export function EditorArea() {
         const tab = activeTabRef.current;
         if (!tab) return;
         const cmd = getTestCommand(tab.language, tab.filePath, tab.fileName);
-        if (cmd) {
-          if (!terminalStoreRef.current.showTerminal) terminalStoreRef.current.toggleTerminal();
-          terminalStoreRef.current.runCommandInTerminal(cmd);
-        }
+        if (cmd) useTerminalStore.getState().showAndRunCommand(cmd);
       }
     });
 
@@ -184,10 +213,7 @@ export function EditorArea() {
         const tab = activeTabRef.current;
         if (!tab) return;
         const cmd = getLintCommand(tab.language, tab.filePath, tab.fileName);
-        if (cmd) {
-          if (!terminalStoreRef.current.showTerminal) terminalStoreRef.current.toggleTerminal();
-          terminalStoreRef.current.runCommandInTerminal(cmd);
-        }
+        if (cmd) useTerminalStore.getState().showAndRunCommand(cmd);
       }
     });
 
@@ -302,60 +328,70 @@ export function EditorArea() {
         const aiHistory = useEditorStore.getState().aiChangeHistory;
         const uriString = model.uri.toString();
         const activePath = uriString.replace("file://", "");
-        
-        // Find if this file has a recent AI change
-        const recentChange = aiHistory.find((h: any) => h.filePath === activePath);
+        // Only show lens for files with active AI-driven changes
+        const recentChange = aiHistory.find(
+          (h) => h.filePath === activePath && h.source === "ai" && !h.rolledBack
+        );
         if (recentChange) {
-           lenses.push({
-             range: { startLineNumber: 1, startColumn: 1, endLineNumber: 1, endColumn: 1 },
-             id: "ai-accept",
-             command: { id: "ncode.ai.accept", title: "✅ Accept AI Change" }
-           });
-           lenses.push({
-             range: { startLineNumber: 1, startColumn: 1, endLineNumber: 1, endColumn: 1 },
-             id: "ai-reject",
-             command: { id: "ncode.ai.reject", title: "❌ Reject AI Change" }
-           });
+          lenses.push({
+            range: { startLineNumber: 1, startColumn: 1, endLineNumber: 1, endColumn: 1 },
+            id: "ai-accept",
+            command: { id: "ncode.ai.accept", title: "✅ Accept AI Change" }
+          });
+          lenses.push({
+            range: { startLineNumber: 1, startColumn: 1, endLineNumber: 1, endColumn: 1 },
+            id: "ai-reject",
+            command: { id: "ncode.ai.reject", title: "❌ Reject AI Change" }
+          });
         }
         return { lenses, dispose: () => {} };
       },
-      resolveCodeLens: function (_model, codeLens, _token) {
-        return codeLens;
-      }
+      resolveCodeLens: function (_model, codeLens, _token) { return codeLens; }
     });
 
-    // Register commands for the code lenses
+    // Accept: mark all changes for this file as rolled-back (accepted = no longer pending)
     editor.addCommand(monaco.KeyMod.CtrlCmd | monaco.KeyMod.Alt | monaco.KeyCode.Enter, () => {
       const activePath = activeTabRef.current?.filePath;
-      if (activePath) {
-        const state = useEditorStore.getState();
-        useEditorStore.setState({ aiChangeHistory: state.aiChangeHistory.filter((h: any) => h.filePath !== activePath) });
-      }
-    });
-    
-    // We bind the custom internal ID to execute our commands
+        if (activePath) {
+          useEditorStore.setState((s) => ({
+            aiChangeHistory: s.aiChangeHistory.map((h) =>
+              h.filePath === activePath && h.source === "ai" ? { ...h, rolledBack: true } : h
+            ),
+          }));
+        }
+      });
+
     monaco.editor.addCommand({
-       id: "ncode.ai.accept",
-       run: () => {
-         const activePath = activeTabRef.current?.filePath;
-         if (activePath) {
-           const state = useEditorStore.getState();
-           useEditorStore.setState({ aiChangeHistory: state.aiChangeHistory.filter((h: any) => h.filePath !== activePath) });
-           useUIStore.getState().addToast("AI changes accepted", "success");
-         }
-       }
+      id: "ncode.ai.accept",
+      run: () => {
+        const activePath = activeTabRef.current?.filePath;
+          if (activePath) {
+            // Mark all changes for this file as accepted (rolledBack = true means "resolved")
+            useEditorStore.setState((s) => ({
+              aiChangeHistory: s.aiChangeHistory.map((h) =>
+                h.filePath === activePath && h.source === "ai" ? { ...h, rolledBack: true } : h
+              ),
+            }));
+            useUIStore.getState().addToast("AI changes accepted", "success");
+          }
+      }
     });
 
     monaco.editor.addCommand({
-       id: "ncode.ai.reject",
-       run: async () => {
-         const activePath = activeTabRef.current?.filePath;
-         if (!activePath) return;
-         // Rollback logic
-         const store = useEditorStore.getState();
-         await store.rollbackLastAIChange(); // Will rollback the exact top one usually.
-         useUIStore.getState().addToast("AI changes rejected & reverted", "info");
-       }
+      id: "ncode.ai.reject",
+      run: async () => {
+        const activePath = activeTabRef.current?.filePath;
+        if (!activePath) return;
+        const store = useEditorStore.getState();
+        // Find the most recent active change for this file and roll it back
+        const entry = store.aiChangeHistory.find(
+          (h) => h.filePath === activePath && h.source === "ai" && !h.rolledBack
+        );
+        if (entry) {
+          await store.rollbackChangeById(entry.id);
+          useUIStore.getState().addToast("AI changes rejected & reverted", "info");
+        }
+      }
     });
 
   };
@@ -562,6 +598,27 @@ export function EditorArea() {
     setAIOpenFolder(selected);
   };
 
+  if (activeDiffReview) {
+    return (
+      <div className="editor-area">
+        <DiffReviewPane
+          title={activeDiffReview.title}
+          description={activeDiffReview.description}
+          sourcePath={activeDiffReview.sourcePath}
+          originalContent={activeDiffReview.originalContent}
+          modifiedContent={activeDiffReview.modifiedContent}
+          onClose={closeDiffReview}
+          onAccept={activeDiffReview.onAccept ? () => { void acceptDiffReview(); } : undefined}
+          onReject={activeDiffReview.onReject ? () => { void rejectDiffReview(); } : undefined}
+          isAccepting={isApplyingDiffReview}
+          acceptLabel={activeDiffReview.acceptLabel}
+          rejectLabel={activeDiffReview.rejectLabel}
+          note={activeDiffReview.note}
+        />
+      </div>
+    );
+  }
+
   if (!activeTab) {
     return (
       <div className="editor-empty">
@@ -649,6 +706,7 @@ export function EditorArea() {
         onChange={handleChange}
         path={`file://${activeTab.filePath}`}
         options={{
+          automaticLayout: true,
           fontSize,
           fontFamily: "'JetBrains Mono', 'Fira Code', 'Cascadia Code', Consolas, monospace",
           fontLigatures: true,

@@ -20,6 +20,7 @@ import { GitPanel } from "./GitPanel";
 import { TaskPanel } from "./TaskPanel";
 import { AIReviewPanel } from "./AIReviewPanel";
 import { CodeGraphPanel } from "./CodeGraphPanel";
+import { ChangeHistoryPanel } from "./ChangeHistoryPanel";
 
 interface FileEntry {
   name: string;
@@ -114,8 +115,7 @@ function FileTree({
   onRefresh: () => Promise<void> | void;
 }) {
   const { openFile } = useEditorStore();
-  const { toggleTerminal } = useUIStore();
-  const { runCommandInTerminal } = useTerminalStore();
+  const { showAndRunCommand } = useTerminalStore();
   const [expanded, setExpanded] = useState<Set<string>>(new Set());
   const [contextMenu, setContextMenu] = useState<{ x: number; y: number; entry: FileEntry } | null>(null);
 
@@ -128,9 +128,8 @@ function FileTree({
   };
 
   const openInTerminal = (dirPath: string) => {
-    toggleTerminal();
     const cmd = `cd "${dirPath}"`;
-    runCommandInTerminal(cmd);
+    showAndRunCommand(cmd);
   };
 
   const copyPath = (path: string) => {
@@ -324,6 +323,7 @@ export function Sidebar() {
   if (activeView === "extensions") return <ExtensionsPanel />;
   if (activeView === "tasks") return <TaskPanel />;
   if (activeView === "review") return <AIReviewPanel />;
+  if (activeView === "history") return <ChangeHistoryPanel />;
 
   return (
     <div className="sidebar">

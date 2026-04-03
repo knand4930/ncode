@@ -3,8 +3,8 @@ import { memo, useMemo } from "react";
 import { save } from "@tauri-apps/plugin-dialog";
 import { X, Circle, Play, TestTube2 } from "lucide-react";
 import { useEditorStore } from "../../store/editorStore";
+import { useReviewStore } from "../../store/reviewStore";
 import { useTerminalStore } from "../../store/terminalStore";
-import { useUIStore } from "../../store/uiStore";
 import { hasRunSupport, getRunCommand, hasTestSupport, getTestCommand } from "../../utils/languageRunner";
 
 const LANGUAGE_ICONS: Record<string, string> = {
@@ -34,10 +34,10 @@ const LANGUAGE_ICONS: Record<string, string> = {
 
 export const EditorTabs = memo(function EditorTabs() {
   const { tabs, activeTabId, setActiveTab, closeTab, saveFile, saveFileAs, reorderTabs } = useEditorStore();
-  const { runCommandInTerminal } = useTerminalStore();
-  const { showTerminal, toggleTerminal } = useUIStore();
+  const { activeDiffReview, closeDiffReview } = useReviewStore();
 
   const activeTab = useMemo(() => tabs.find(t => t.id === activeTabId), [tabs, activeTabId]);
+  const isShowingDiffReview = !!activeDiffReview;
 
   // Memoize the tab rendering data to avoid unnecessary object allocations
   const tabData = useMemo(
@@ -45,25 +45,23 @@ export const EditorTabs = memo(function EditorTabs() {
       tabs.map((tab) => ({
         ...tab,
         icon: LANGUAGE_ICONS[tab.language] || LANGUAGE_ICONS.default,
-        isActive: tab.id === activeTabId,
+        isActive: !isShowingDiffReview && tab.id === activeTabId,
       })),
-    [tabs, activeTabId]
+    [tabs, activeTabId, isShowingDiffReview]
   );
 
   const handleRun = () => {
     if (!activeTab) return;
     const cmd = getRunCommand(activeTab.language, activeTab.filePath, activeTab.fileName);
     if (!cmd) return;
-    if (!showTerminal) toggleTerminal();
-    runCommandInTerminal(cmd);
+    useTerminalStore.getState().showAndRunCommand(cmd);
   };
 
   const handleTest = () => {
     if (!activeTab) return;
     const cmd = getTestCommand(activeTab.language, activeTab.filePath, activeTab.fileName);
     if (!cmd) return;
-    if (!showTerminal) toggleTerminal();
-    runCommandInTerminal(cmd);
+    useTerminalStore.getState().showAndRunCommand(cmd);
   };
 
   // Drag and drop handlers
@@ -85,11 +83,30 @@ export const EditorTabs = memo(function EditorTabs() {
     reorderTabs(dragIndex, dropIndex);
   };
 
-  if (tabs.length === 0) return null;
+  if (tabs.length === 0 && !activeDiffReview) return null;
 
   return (
     <div className="editor-tabs" style={{ display: 'flex', justifyContent: 'space-between' }}>
       <div className="tabs-scroll" style={{ flex: 1, overflowX: 'auto', display: 'flex' }}>
+        {activeDiffReview && (
+          <div
+            className="tab tab-active tab-review"
+            onClick={() => undefined}
+            title={activeDiffReview.sourcePath}
+          >
+            <span className="tab-icon">⇄</span>
+            <span className="tab-name">{activeDiffReview.title}</span>
+            <button
+              className="tab-close"
+              onClick={(e) => {
+                e.stopPropagation();
+                closeDiffReview();
+              }}
+            >
+              <X size={12} />
+            </button>
+          </div>
+        )}
         {tabData.map((tab, index) => (
           <div
             key={tab.id}
@@ -98,7 +115,10 @@ export const EditorTabs = memo(function EditorTabs() {
             onDragStart={(e) => handleDragStart(e, index)}
             onDragOver={handleDragOver}
             onDrop={(e) => handleDrop(e, index)}
-            onClick={() => setActiveTab(tab.id)}
+            onClick={() => {
+              if (activeDiffReview) closeDiffReview();
+              setActiveTab(tab.id);
+            }}
             onAuxClick={(e) => {
               if (e.button === 1) closeTab(tab.id); // Middle click closes
             }}
@@ -142,7 +162,7 @@ export const EditorTabs = memo(function EditorTabs() {
         ))}
       </div>
       
-      {activeTab && (
+      {!isShowingDiffReview && activeTab && (
         <div style={{ display: 'flex', alignItems: 'center', padding: '0 8px', gap: '4px', flexShrink: 0 }}>
           {hasTestSupport(activeTab.language) && (
             <button 

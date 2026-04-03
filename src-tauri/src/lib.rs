@@ -27,6 +27,8 @@ pub fn run() {
             terminal_commands::resize_terminal,
             terminal_commands::kill_terminal,
             process_commands::run_command,
+            process_commands::run_command_stream,
+            process_commands::kill_command_run,
             // AI
             ai::ollama_complete,
             ai::ollama_chat,

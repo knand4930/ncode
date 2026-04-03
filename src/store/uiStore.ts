@@ -2,7 +2,7 @@
 import { create } from "zustand";
 import { persist } from "zustand/middleware";
 
-type SidebarView = "explorer" | "search" | "search-replace" | "symbols" | "keybindings" | "git" | "extensions" | "ai" | "tasks" | "review" | "code-graph";
+type SidebarView = "explorer" | "search" | "search-replace" | "symbols" | "keybindings" | "git" | "extensions" | "ai" | "tasks" | "review" | "code-graph" | "history";
 export type ColorTheme = "dark" | "light" | "high-contrast" | "solarized-dark" | "monokai" | "github" | "dracula";
 type IconTheme = "default" | "noto" | "simple";
 

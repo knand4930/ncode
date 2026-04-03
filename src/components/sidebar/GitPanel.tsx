@@ -3,7 +3,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { GitBranch, RefreshCw } from "lucide-react";
 import { useEditorStore } from "../../store/editorStore";
 import { useUIStore } from "../../store/uiStore";
-import { DiffModal } from "../ai/DiffModal";
+import { useReviewStore } from "../../store/reviewStore";
 
 type GitStatusEntry = {
   code: string;
@@ -24,12 +24,12 @@ function parseGitStatus(output: string): GitStatusEntry[] {
 export function GitPanel() {
   const { openFolder } = useEditorStore();
   const { addToast } = useUIStore();
+  const { openDiffReview } = useReviewStore();
   const [branch, setBranch] = useState<string>("(no repo)");
   const [status, setStatus] = useState<GitStatusEntry[]>([]);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string>("");
   const [commitMsg, setCommitMsg] = useState("");
-  const [diffState, setDiffState] = useState<{ isOpen: boolean; path: string; original: string; modified: string } | null>(null);
 
   const loadGit = async () => {
     if (!openFolder) {
@@ -170,7 +170,16 @@ export function GitPanel() {
                            modified = await invoke<string>('read_file', { path: `${openFolder}/${entry.path}` }).catch(() => "");
                         }
                         
-                        setDiffState({ isOpen: true, path: entry.path, original, modified });
+                        openDiffReview({
+                          title: "Git Diff Review",
+                          description: isStaged
+                            ? "Comparing HEAD with the staged version of this file."
+                            : "Comparing the staged version with your current working tree changes.",
+                          sourcePath: entry.path,
+                          originalContent: original,
+                          modifiedContent: modified,
+                          note: "This is a read-only review of your Git diff.",
+                        });
                       } catch(e:any){ addToast(String(e), "error"); }
                     }}>Diff</button>
                     <button className="btn-sm danger" onClick={async () => { 
@@ -191,18 +200,6 @@ export function GitPanel() {
                 Staged: {grouped.staged.length} | Unstaged: {grouped.unstaged.length}
               </div>
             ) : null}
-
-            {diffState && diffState.isOpen && (
-               <DiffModal
-                 isOpen={diffState.isOpen}
-                 originalContent={diffState.original}
-                 modifiedContent={diffState.modified}
-                 originalPath={diffState.path}
-                 onClose={() => setDiffState(null)}
-                 onAccept={() => setDiffState(null)}
-                 onReject={() => setDiffState(null)}
-               />
-            )}
           </>
         )}
       </div>

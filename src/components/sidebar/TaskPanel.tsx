@@ -8,7 +8,6 @@ import {
 import { invoke } from "@tauri-apps/api/core";
 import { useAIStore } from "../../store/aiStore";
 import { useEditorStore } from "../../store/editorStore";
-import { useUIStore } from "../../store/uiStore";
 import { useTerminalStore } from "../../store/terminalStore";
 
 interface Task {
@@ -45,11 +44,11 @@ function TaskStatusIcon({ status }: { status: TaskStatus }) {
 export function TaskPanel() {
   const { projectContext } = useAIStore();
   const { openFolder, openFile } = useEditorStore();
-  const { showTerminal, toggleTerminal } = useUIStore();
-  const { runCommandInTerminal } = useTerminalStore();
+  const { showAndTrackCommand, showTerminalTab, commandRunStates } = useTerminalStore();
 
   const [taskStatuses, setTaskStatuses]   = useState<Record<string, TaskStatus>>({});
   const [taskDurations, setTaskDurations] = useState<Record<string, number>>({});
+  const [taskRunRequests, setTaskRunRequests] = useState<Record<string, { requestKey: string; startedAt: number }>>({});
   const [activeTab, setActiveTab]         = useState<"tasks" | "files">("tasks");
   const [fileQuery, setFileQuery]         = useState("");
   const [fileResults, setFileResults]     = useState<FileMatch[]>([]);
@@ -62,6 +61,45 @@ export function TaskPanel() {
     if (!openFolder) { setAllFiles([]); return; }
     loadAllFiles(openFolder);
   }, [openFolder]);
+
+  useEffect(() => {
+    const updates: Record<string, TaskStatus> = {};
+    const durations: Record<string, number> = {};
+    let nextRequests: Record<string, { requestKey: string; startedAt: number }> | null = null;
+
+    for (const [taskId, runMeta] of Object.entries(taskRunRequests)) {
+      const runState = commandRunStates[runMeta.requestKey];
+      if (!runState) continue;
+
+      if (runState.status === "queued" || runState.status === "running") {
+        updates[taskId] = "running";
+        continue;
+      }
+
+      updates[taskId] = runState.status === "success" ? "success" : "error";
+      durations[taskId] = Date.now() - runMeta.startedAt;
+      nextRequests ??= { ...taskRunRequests };
+      delete nextRequests[taskId];
+
+      setTimeout(() => {
+        setTaskStatuses((prev) => {
+          const next = { ...prev };
+          if (next[taskId] !== "running") delete next[taskId];
+          return next;
+        });
+      }, 5000);
+    }
+
+    if (Object.keys(updates).length > 0) {
+      setTaskStatuses((prev) => ({ ...prev, ...updates }));
+    }
+    if (Object.keys(durations).length > 0) {
+      setTaskDurations((prev) => ({ ...prev, ...durations }));
+    }
+    if (nextRequests) {
+      setTaskRunRequests(nextRequests);
+    }
+  }, [commandRunStates, taskRunRequests]);
 
   const loadAllFiles = async (folder: string) => {
     setLoadingFiles(true);
@@ -155,33 +193,33 @@ export function TaskPanel() {
   // ── run task ────────────────────────────────────────────────────────────────
   const runTask = (task: Task) => {
     if (!openFolder) return;
-    if (!showTerminal) toggleTerminal();
-    setTaskStatuses(s => ({ ...s, [task.id]: "running" }));
-    const start = Date.now();
-    runCommandInTerminal(task.command);
-    // Optimistic status — real tracking needs terminal output parsing
-    const timer = setTimeout(() => {
-      setTaskStatuses(s => ({ ...s, [task.id]: "success" }));
-      setTaskDurations(d => ({ ...d, [task.id]: Date.now() - start }));
-      setTimeout(() => setTaskStatuses(s => {
-        const n = { ...s }; delete n[task.id]; return n;
-      }), 5000);
-    }, 1200);
-    return () => clearTimeout(timer);
+    const startedAt = Date.now();
+    const requestKey = `task-${task.id}-${startedAt}`;
+    setTaskStatuses((s) => ({ ...s, [task.id]: "running" }));
+    setTaskDurations((d) => {
+      const next = { ...d };
+      delete next[task.id];
+      return next;
+    });
+    setTaskRunRequests((prev) => ({ ...prev, [task.id]: { requestKey, startedAt } }));
+    showAndTrackCommand(task.command, {
+      source: "manual",
+      analyzeWithAI: false,
+      requestKey,
+    });
+    showTerminalTab("terminal");
   };
 
   const runCustom = () => {
     const cmd = customCommand.trim();
     if (!cmd || !openFolder) return;
-    if (!showTerminal) toggleTerminal();
-    runCommandInTerminal(cmd);
+    showAndTrackCommand(cmd, { source: "manual", analyzeWithAI: false });
+    showTerminalTab("terminal");
     setCustomCommand("");
   };
 
-  // ── run test file ───────────────────────────────────────────────────────────
   const runTestFile = (file: FileMatch) => {
     if (!openFolder) return;
-    if (!showTerminal) toggleTerminal();
     const pm  = projectContext?.packageManager;
     const ext = file.name.split(".").pop()?.toLowerCase() || "";
     let cmd = "";
@@ -195,7 +233,8 @@ export function TaskPanel() {
       cmd = `go test ./${file.relativePath.replace(/\/[^/]+$/, "")}/...`;
     else
       cmd = `echo "No test runner detected for: ${file.relativePath}"`;
-    runCommandInTerminal(cmd);
+    showAndTrackCommand(cmd, { source: "manual", analyzeWithAI: false });
+    showTerminalTab("terminal");
   };
 
   const isTestFile = (name: string) =>

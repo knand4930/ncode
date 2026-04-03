@@ -1,5 +1,5 @@
 // src/components/ai/AIPanel.tsx
-import { useState, useRef, useEffect, useMemo } from "react";
+import { useState, useRef, useEffect, useMemo, useCallback } from "react";
 import {
   Send, Trash2, Database, Zap, ChevronDown, ExternalLink,
   Eye, EyeOff, Undo2, Check, X, StopCircle, Cpu, RefreshCw,
@@ -9,19 +9,24 @@ import {
 } from "lucide-react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen, emit } from "@tauri-apps/api/event";
+import { open as shellOpen } from "@tauri-apps/plugin-shell";
 import { useAIStore, CONTEXT_LIMITS, estimateMessagesTokenCount } from "../../store/aiStore";
 import type { BugReport, BugEntry } from "../../store/aiStore";
 import { useEditorStore } from "../../store/editorStore";
 import { useUIStore } from "../../store/uiStore";
 import { useTerminalStore } from "../../store/terminalStore";
+import { useReviewStore } from "../../store/reviewStore";
 import { readTextFile } from "@tauri-apps/plugin-fs";
-import { DiffModal } from "./DiffModal";
+import { SpecPanel } from "./SpecPanel";
 import { marked } from "marked";
 import DOMPurify from "dompurify";
 import { countThinkingSteps } from "../../utils/parseThinkingBlock";
 import { validatePromptTemplateContent } from "../../utils/promptTemplateValidation";
-
-type FileSuggestion = { path: string; content: string; language: string };
+import {
+  extractFileSuggestions,
+  extractShellCommands,
+  resolveSuggestionPath,
+} from "../../utils/aiSuggestionParser";
 type ArchitectureSectionKey = "Structure" | "Metrics" | "Risks" | "Improvements";
 
 const ARCHITECTURE_SECTION_ORDER: ArchitectureSectionKey[] = [
@@ -30,6 +35,14 @@ const ARCHITECTURE_SECTION_ORDER: ArchitectureSectionKey[] = [
   "Risks",
   "Improvements",
 ];
+
+function getCommandRunLabel(status: "queued" | "running" | "success" | "error" | "stopped", exitCode: number | null) {
+  if (status === "queued") return "Queued in Run tab";
+  if (status === "running") return "Running in terminal";
+  if (status === "success") return "Last run succeeded";
+  if (status === "stopped") return "Stopped before completion";
+  return `Last run failed${exitCode !== null ? ` (exit ${exitCode})` : ""}`;
+}
 
 interface AgentStepEvent {
   step: number;
@@ -53,101 +66,6 @@ async function checkFileExistsCached(path: string): Promise<boolean> {
 function extractFirstCodeBlock(md: string): string | null {
   const m = md.match(/```(?:[\w.+-]+)?\n([\s\S]*?)```/);
   return m ? m[1].trimEnd() : null;
-}
-
-function extractShellCommands(md: string): string[] {
-  const cmds: string[] = [];
-  const re = /```(bash|sh|shell|zsh)\n([\s\S]*?)```/gi;
-  let m: RegExpExecArray | null;
-  while ((m = re.exec(md)) !== null) {
-    const block = m[2].trim();
-    if (!block) continue;
-    if ((block.startsWith("{") && block.endsWith("}")) || (block.startsWith("[") && block.endsWith("]"))) continue;
-    const lines = block.split("\n").map(l => l.trim()).filter(l => l && !l.startsWith("#"));
-    if (!lines.length) continue;
-    const allDollar = lines.every(l => l.startsWith("$"));
-    if (allDollar) { cmds.push(...lines.map(l => l.replace(/^\$\s*/, ""))); continue; }
-    const isComplex = lines.some(l => l.endsWith("\\") || l.includes("{") || l.includes("}") || l.startsWith("if ") || l.startsWith("for "));
-    if (isComplex) cmds.push(block);
-    else cmds.push(...lines.map(l => l.replace(/^\$\s*/, "")));
-  }
-  return cmds.slice(0, 6);
-}
-
-function cleanPath(raw: string): string {
-  return raw.trim()
-    .replace(/^[-*]\s*/, "").replace(/^###\s*/i, "")
-    .replace(/^`|`$/g, "").replace(/^\*\*|\*\*$/g, "")
-    .replace(/^["']|["']$/g, "").replace(/^\.\//, "")
-    .replace(/\s+\(.*\)$/, "");
-}
-
-function inferLang(path: string): string {
-  const ext = cleanPath(path).toLowerCase().split(".").pop() || "";
-  const map: Record<string, string> = {
-    ts:"typescript",tsx:"tsx",js:"javascript",jsx:"jsx",py:"python",rs:"rust",
-    go:"go",java:"java",cpp:"cpp",c:"c",cs:"csharp",rb:"ruby",php:"php",
-    swift:"swift",kt:"kotlin",html:"html",css:"css",scss:"scss",json:"json",
-    yaml:"yaml",yml:"yaml",toml:"toml",md:"markdown",sh:"bash",bash:"bash",
-    sql:"sql",vue:"vue",svelte:"svelte",xml:"xml",
-  };
-  return map[ext] || "text";
-}
-
-function looksLikePath(v: string): boolean {
-  const c = cleanPath(v);
-  if (!c) return false;
-  if (c.includes(" ") && !c.includes("/")) return false;
-  return /[\\/]/.test(c) || /\.[A-Za-z0-9_-]{1,12}$/.test(c);
-}
-
-function findPathNear(md: string, idx: number): string | null {
-  const before = md.slice(Math.max(0, idx - 360), idx);
-  const patterns = [
-    /(?:^|\n)\s*(?:#{1,6}\s*)?(?:file|path)\s*:\s*`?([^\n`]+)`?\s*$/gi,
-    /(?:^|\n)\s*(?:[-*]\s*)?`([^`\n]+\.[A-Za-z0-9._/-]+)`\s*:?\s*$/gi,
-    /(?:^|\n)\s*(?:[-*]\s*)?\*\*([^*\n]+\.[A-Za-z0-9._/-]+)\*\*\s*:?\s*$/gi,
-    /(?:^|\n)\s*(?:[-*]\s*)?([A-Za-z0-9_./\\-]+\.[A-Za-z0-9_.-]+)\s*:?\s*$/gi,
-  ];
-  for (const re of patterns) {
-    let m: RegExpExecArray | null, last: string | null = null;
-    while ((m = re.exec(before)) !== null) last = m[1];
-    if (last && looksLikePath(last)) return cleanPath(last);
-  }
-  return null;
-}
-
-function extractFileSuggestions(md: string): FileSuggestion[] {
-  const out: FileSuggestion[] = [];
-  const seen = new Set<string>();
-  const push = (path: string, content: string, language?: string) => {
-    const c = cleanPath(path);
-    if (!c || !content.trim()) return;
-    const key = c.toLowerCase();
-    if (seen.has(key)) return;
-    seen.add(key);
-    out.push({ path: c, content: content.trimEnd(), language: (language || "").trim() || "text" });
-  };
-  let m: RegExpExecArray | null;
-  const variants = [
-    /(?:^|\n)(?:#{1,6}\s*)?file\s*:\s*`?([^\n`]+?)`?\s*\n```([\w.+-]*)\n([\s\S]*?)```/gi,
-    /(?:^|\n)(?:#{1,6}\s*)?path\s*:\s*`?([^\n`]+?)`?\s*\n```([\w.+-]*)\n([\s\S]*?)```/gi,
-    /(?:^|\n)#{1,6}\s*`?([^\n`]+\.[\w.-]+)`?\s*\n```([\w.+-]*)\n([\s\S]*?)```/gi,
-  ];
-  for (const re of variants) while ((m = re.exec(md)) !== null) push(m[1], m[3], m[2]);
-  const infoPath = /```([\w.+-]+)\s+([^\n`]+\.[\w.-]+)\n([\s\S]*?)```/gi;
-  while ((m = infoPath.exec(md)) !== null) push(m[2], m[3], m[1]);
-  const infoOnly = /```([^\n`\s]+\.[A-Za-z0-9_.-]+)\n([\s\S]*?)```/gi;
-  while ((m = infoOnly.exec(md)) !== null) if (looksLikePath(m[1])) push(m[1], m[2], inferLang(m[1]));
-  const generic = /```([\w.+-]*)\n([\s\S]*?)```/gi;
-  while ((m = generic.exec(md)) !== null) {
-    const info = (m[1] || "").trim();
-    let path: string | null = null, lang = info;
-    if (info && looksLikePath(info)) { path = info; lang = inferLang(info); }
-    else { path = findPathNear(md, m.index); if (path && !lang) lang = inferLang(path); }
-    if (path) push(path, m[2], lang);
-  }
-  return out.slice(0, 12);
 }
 
 function detectArchitectureHeading(line: string): { key: ArchitectureSectionKey; trailing: string } | null {
@@ -221,15 +139,6 @@ function extractArchitectureSections(
     sections,
     remainder: hideRemainder ? "" : cleanedRemainder,
   };
-}
-
-function isAbsPath(p: string) { return p.startsWith("/") || /^[A-Za-z]:[\\/]/.test(p); }
-function resolvePath(path: string, folder: string | null): string | null {
-  const n = cleanPath(path).replace(/\\/g, "/");
-  if (!n) return null;
-  if (isAbsPath(n)) return n;
-  if (!folder) return null;
-  return `${folder.replace(/[\\/]+$/, "")}/${n.replace(/^\.?\//, "")}`;
 }
 
 // ── Architecture section icons ───────────────────────────────
@@ -449,11 +358,61 @@ function formatBytes(bytes: number): string {
 }
 
 // ── Mode config ──────────────────────────────────────────────
-const MODES = [  { id: "chat",      label: "Chat",    emoji: null,  title: "Direct answers" },
-  { id: "think",     label: "Think",   emoji: null,  title: "Step-by-step reasoning" },
-  { id: "agent",     label: "Agent",   emoji: null,  title: "Plan + file-level actions" },
-  { id: "bug_hunt",  label: "Bugs",    emoji: "🐛",  title: "Find bugs & vulnerabilities" },
-  { id: "architect", label: "Arch",    emoji: "🏗️", title: "Architecture review" },
+const MODES = [
+  {
+    id: "chat",
+    label: "Chat",
+    title: "General questions, quick explanations, and lightweight code help",
+    feature: "Quick answers",
+    description: "Quick questions, edits, and file help.",
+    icon: MessageSquare,
+    tone: "chat",
+  },
+  {
+    id: "think",
+    label: "Think",
+    title: "Deeper reasoning before answering",
+    feature: "Step-by-step reasoning",
+    description: "Deeper reasoning before answering.",
+    icon: Sparkles,
+    tone: "think",
+  },
+  {
+    id: "agent",
+    label: "Agent",
+    title: "Multi-step planning and file-level action flow",
+    feature: "Execution mode",
+    description: "Plans and executes multi-step work.",
+    icon: Cpu,
+    tone: "agent",
+  },
+  {
+    id: "bug_hunt",
+    label: "Bug Hunt",
+    title: "Find bugs, edge cases, and reliability issues",
+    feature: "Quality review",
+    description: "Scans for bugs, regressions, and edge cases.",
+    icon: Bug,
+    tone: "bugs",
+  },
+  {
+    id: "architect",
+    label: "Architecture",
+    title: "Review system structure, scalability, and maintainability",
+    feature: "System design review",
+    description: "Reviews structure and system design.",
+    icon: FileCode,
+    tone: "arch",
+  },
+  {
+    id: "spec",
+    label: "Spec Flow",
+    title: "Spec-driven requirements, design, tasks, and execution",
+    feature: "Structured planning",
+    description: "Turns ideas into requirements, tasks, and execution.",
+    icon: FileText,
+    tone: "spec",
+  },
 ] as const;
 
 export function AIPanel() {
@@ -474,10 +433,6 @@ export function AIPanel() {
     diff: string;
     tool: string;
   } | null>(null);
-  const [diffModalData, setDiffModalData] = useState<{
-    isOpen: boolean; suggestionKey: string; originalPath: string;
-    originalContent: string; modifiedContent: string; onAccept: () => void;
-  }>({ isOpen: false, suggestionKey: "", originalPath: "", originalContent: "", modifiedContent: "", onAccept: () => {} });
 
   // @-mention autocomplete state (Task 7.1)
   const [mentionQuery, setMentionQuery] = useState<string | null>(null);
@@ -496,6 +451,9 @@ export function AIPanel() {
 
   // HuggingFace inline error state (Task 10.1)
   const [hfTokenError, setHfTokenError] = useState(false);
+
+  // Pasted image state
+  const [pastedImages, setPastedImages] = useState<Array<{ id: string; dataUrl: string; name: string }>>([]);
 
   // Custom provider form state (Task 11.1)
   const [customProviderName, setCustomProviderName] = useState("");
@@ -519,28 +477,31 @@ export function AIPanel() {
   const [localSearchMaxSize, setLocalSearchMaxSize] = useState("");
   const [localSearchDebounceTimer, setLocalSearchDebounceTimer] = useState<ReturnType<typeof setTimeout> | null>(null);
 
+  const { openDiffReview } = useReviewStore();
+
   // Show Fix handler for bug report cards (Req 5.4)
   const handleShowFix = async (bug: BugEntry) => {
-    const rp = resolvePath(bug.filePath, openFolder ?? null);
+    const rp = resolveSuggestionPath(bug.filePath, openFolder ?? null);
     let originalContent = "";
     if (rp) {
       try { originalContent = await readTextFile(rp); } catch { /* file may not exist */ }
     }
-    setDiffModalData({
-      isOpen: true,
-      suggestionKey: `bug-fix-${bug.filePath}-${bug.line}`,
-      originalPath: rp ?? bug.filePath,
+    openDiffReview({
+      id: `bug-fix-${bug.filePath}-${bug.line}`,
+      title: "Review AI Fix",
+      description: bug.description,
+      sourcePath: rp ?? bug.filePath,
       originalContent,
       modifiedContent: bug.fix,
+      acceptLabel: "Apply Fix",
+      note: "Applied fixes are recorded in Change History so you can restore older states later.",
       onAccept: async () => {
-        if (!rp) { addToast("Open a project folder first.", "warning"); return; }
-        try {
-          await applyAIChangeToFile(rp, bug.fix, `Bug fix: ${bug.description}`);
-          addToast("Fix applied.", "success");
-        } catch (e) {
-          addToast(`Failed to apply fix: ${String(e)}`, "error");
+        if (!rp) {
+          addToast("Open a project folder first.", "warning");
+          throw new Error("Missing project folder");
         }
-        setDiffModalData(p => ({ ...p, isOpen: false }));
+        await applyAIChangeToFile(rp, bug.fix, `Bug fix: ${bug.description}`);
+        addToast("Fix applied. Tracked in Change History.", "success");
       },
     });
   };
@@ -772,7 +733,10 @@ export function AIPanel() {
     openFolder, tabs, activeTabId, openFile,
     applyAIChangeToTab, applyAIChangeToFile, rollbackLastAIChange, aiChangeHistory,
   } = useEditorStore();
-  const { toggleSettingsPanel, addToast } = useUIStore();
+  const { toggleSettingsPanel, addToast, openView } = useUIStore();
+  const commandRunStates = useTerminalStore((state) => state.commandRunStates);
+  const showAndTrackCommand = useTerminalStore((state) => state.showAndTrackCommand);
+  const showTerminalTab = useTerminalStore((state) => state.showTerminalTab);
 
   const activeTab = tabs.find(t => t.id === activeTabId);
 
@@ -826,7 +790,11 @@ export function AIPanel() {
   // Check file existence for suggestions
   useEffect(() => {
     const allPaths = chatHistory.flatMap(msg =>
-      msg.role === "assistant" ? extractFileSuggestions(msg.content).map(s => resolvePath(s.path, openFolder ?? null)).filter(Boolean) as string[] : []
+      msg.role === "assistant"
+        ? extractFileSuggestions(msg.content, openFolder ?? null)
+            .map(s => resolveSuggestionPath(s.path, openFolder ?? null))
+            .filter(Boolean) as string[]
+        : []
     );
     const unchecked = allPaths.filter(p => !(p in fileExistenceMap));
     if (!unchecked.length) return;
@@ -839,32 +807,77 @@ export function AIPanel() {
     });
   }, [chatHistory, openFolder]);
 
+  const runSuggestedCommand = useCallback((requestKey: string, command: string) => {
+    showAndTrackCommand(command, {
+      source: "ai",
+      analyzeWithAI: true,
+      requestKey,
+    });
+    // Keep the terminal visible so users can follow live output while still tracking the run.
+    showTerminalTab("terminal");
+    addToast("Running command in terminal and checking the result with AI…", "info");
+  }, [addToast, showAndTrackCommand, showTerminalTab]);
+
+  const openCommandRun = useCallback(() => {
+    showTerminalTab("run");
+  }, [showTerminalTab]);
+
+  const openCommandTerminal = useCallback(() => {
+    showTerminalTab("terminal");
+  }, [showTerminalTab]);
+
   const handleSend = async () => {
     const text = input.trim();
-    if (!text || isThinking) return;
+    if (!text && pastedImages.length === 0 || isThinking) return;
     if (selectedProvider === "huggingface" && !hfApiKey) {
       setHfTokenError(true);
       return;
     }
     if (noModelConfigured) {
-      // Inline error — do not send (1.5)
       return;
     }
-    // Clear agent steps when starting a new task
     if (aiMode === 'agent') {
       setAgentSteps([]);
     }
     let content = text;
+    // Append image descriptions to message
+    if (pastedImages.length > 0) {
+      const imgNote = pastedImages.map(img => `[Image attached: ${img.name}]`).join("\n");
+      content = content ? `${content}\n\n${imgNote}` : imgNote;
+    }
     let activeFileContext: string | undefined;
     if (activeTabId && activeTab) {
       const fileCode = `\`\`\`${activeTab.language}\n// ${activeTab.fileName}\n${activeTab.content.slice(0, 4000)}\n\`\`\``;
-      if (text.includes("@file")) content = text.replace("@file", `\n${fileCode}\n`);
+      if (text.includes("@file")) content = content.replace("@file", `\n${fileCode}\n`);
       else activeFileContext = fileCode;
     }
     setInput("");
+    setPastedImages([]);
     setMentionQuery(null);
     setMentionDropdown([]);
     await sendMessage(content, activeFileContext);
+  };
+
+  // Handle paste — capture images from clipboard
+  const handlePaste = (e: React.ClipboardEvent<HTMLTextAreaElement>) => {
+    const items = Array.from(e.clipboardData.items);
+    const imageItems = items.filter(item => item.type.startsWith("image/"));
+    if (imageItems.length === 0) return;
+    e.preventDefault();
+    imageItems.forEach(item => {
+      const file = item.getAsFile();
+      if (!file) return;
+      const reader = new FileReader();
+      reader.onload = (ev) => {
+        const dataUrl = ev.target?.result as string;
+        setPastedImages(prev => [...prev, {
+          id: `img-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
+          dataUrl,
+          name: file.name || `image-${Date.now()}.png`,
+        }]);
+      };
+      reader.readAsDataURL(file);
+    });
   };
 
   const handleKeyDown = (e: React.KeyboardEvent) => {
@@ -874,12 +887,25 @@ export function AIPanel() {
   // Model label
   const totalSelected = selectedOllamaModels.length + selectedApiKeyIndices.length;
   const hfReady = selectedProvider === "huggingface" && !!hfApiKey;
-
-  // No model configured at all (1.5)
-  const noModelConfigured = selectedOllamaModels.length === 0 && selectedApiKeyIndices.length === 0 && !hfReady;
+  const localReady = selectedProvider === "local" && !!selectedLocalModel;
+  const hasModelSelection =
+    selectedOllamaModels.length > 0 ||
+    selectedApiKeyIndices.length > 0 ||
+    hfReady ||
+    localReady ||
+    (selectedProvider === "ollama" && !isOllamaRunning && !!hfApiKey);
+  const blocksOnOllamaOffline =
+    selectedProvider === "ollama" &&
+    selectedOllamaModels.length > 0 &&
+    !isOllamaRunning &&
+    !hfApiKey;
+  const noModelConfigured = !hasModelSelection;
 
   let modelLabel = "Select Model";
-  if (selectedProvider === "huggingface" && hfApiKey) {
+  if (localReady) {
+    const localModel = localModels.find((model) => model.modelId === selectedLocalModel);
+    modelLabel = `Local: ${localModel?.modelId ?? selectedLocalModel}`;
+  } else if (selectedProvider === "huggingface" && hfApiKey) {
     modelLabel = `HuggingFace: ${hfSelectedModel || "no model"}`;
   } else if (totalSelected === 1) {
     if (selectedOllamaModels.length === 1) modelLabel = selectedOllamaModels[0];
@@ -888,10 +914,23 @@ export function AIPanel() {
     modelLabel = `${totalSelected} models`;
   }
 
-  const needsOllama = aiMode === "agent" || useRAG || selectedOllamaModels.length > 0;
-  const showOllamaWarn = selectedOllamaModels.length > 0 && !isOllamaRunning;
-  const isOnline = !showOllamaWarn;
-  const canSend = !isThinking && !!input.trim() && (hfReady || (!needsOllama || isOllamaRunning) && !noModelConfigured);
+  const showOllamaWarn = selectedProvider === "ollama" && selectedOllamaModels.length > 0 && !isOllamaRunning;
+  const isOnline = !noModelConfigured && !blocksOnOllamaOffline;
+  const statusTitle =
+    selectedProvider === "local"
+      ? (localReady ? "Local model ready" : "No local model selected")
+      : selectedProvider === "huggingface"
+        ? (hfReady ? "HuggingFace ready" : "HuggingFace API key required")
+        : selectedProvider === "api"
+          ? (selectedApiKeyIndices.length > 0 ? "API model ready" : "No API model selected")
+          : (isOllamaRunning ? "Ollama connected" : hfApiKey ? "Ollama offline, HuggingFace fallback ready" : "Ollama offline");
+  const canSend =
+    !isThinking &&
+    (!!input.trim() || pastedImages.length > 0) &&
+    !noModelConfigured &&
+    !blocksOnOllamaOffline;
+  const activeModeMeta = MODES.find((mode) => mode.id === aiMode) ?? MODES[0];
+  const ActiveModeIcon = activeModeMeta.icon;
 
   const filteredSessions = useMemo(() => {
     const q = sessionSearch.trim().toLowerCase();
@@ -1047,7 +1086,7 @@ export function AIPanel() {
           </button>
           <span className="aip-logo">✦</span>
           <span className="aip-title">AI Assistant</span>
-          <span className={`aip-dot ${isOnline ? "on" : "off"}`} title={isOnline ? "Ollama connected" : "Ollama offline"} />
+          <span className={`aip-dot ${isOnline ? "on" : "off"}`} title={statusTitle} />
           {estimatedTokens > 0 && (
             <span className="aip-token-counter" title="Estimated token usage">
               ~{estimatedTokens >= 1000 ? `${(estimatedTokens / 1000).toFixed(1)}k` : estimatedTokens} tokens
@@ -1068,16 +1107,20 @@ export function AIPanel() {
             <button
               className="aip-icon-btn"
               onClick={async () => {
-                setRollingBack(true);
-                try {
-                  const ok = await rollbackLastAIChange();
-                  if (!ok) addToast("Nothing to rollback.", "warning");
-                } finally { setRollingBack(false); }
+                // Open history panel for full rollback control
+                openView("history");
               }}
-              disabled={rollingBack || aiChangeHistory.length === 0}
-              title="Rollback last AI change"
+              disabled={rollingBack || aiChangeHistory.filter(e => !e.rolledBack).length === 0}
+              title={`Change history & rollback (${aiChangeHistory.filter(e => !e.rolledBack).length} pending)`}
             >
               <Undo2 size={13} />
+              {aiChangeHistory.filter(e => !e.rolledBack).length > 0 && (
+                <span style={{
+                  position: "absolute", top: 2, right: 2,
+                  width: 6, height: 6, borderRadius: "50%",
+                  background: "var(--accent)",
+                }} />
+              )}
             </button>
             <button className="aip-icon-btn" onClick={clearChat} title="Clear chat">
               <Trash2 size={13} />
@@ -1089,18 +1132,36 @@ export function AIPanel() {
         </div>
 
         {/* Mode pills */}
-        <div className="aip-modes">
-          {MODES.map(m => (
+        <div className="aip-modes" role="tablist" aria-label="AI features">
+          {MODES.map(m => {
+            const Icon = m.icon;
+            const isActive = aiMode === m.id;
+            return (
             <button
               key={m.id}
-              className={`aip-mode-pill ${aiMode === m.id ? "active" : ""}`}
+              type="button"
+              className={`aip-mode-pill ${isActive ? "active" : ""}`}
+              data-tone={m.tone}
               onClick={() => setAIMode(m.id as any)}
               title={m.title}
+              role="tab"
+              aria-selected={isActive}
             >
-              {m.emoji && <span>{m.emoji}</span>}
-              {m.label}
+              <span className="aip-mode-pill-icon">
+                <Icon size={12} />
+              </span>
+              <span className="aip-mode-pill-label">{m.label}</span>
             </button>
-          ))}
+          )})}
+        </div>
+        <div className="aip-mode-note" title={activeModeMeta.title}>
+          <div className="aip-mode-note-icon">
+            <ActiveModeIcon size={14} />
+          </div>
+          <div className="aip-mode-note-copy">
+            <span className="aip-mode-note-title">{activeModeMeta.label} · {activeModeMeta.feature}</span>
+            <span className="aip-mode-note-text">{activeModeMeta.description}</span>
+          </div>
         </div>
       </div>
 
@@ -1147,7 +1208,12 @@ export function AIPanel() {
             <a
               className="aip-btn-sm"
               href="#"
-              onClick={(e) => { e.preventDefault(); invoke("open_file", { path: "SETUP_GRPC.md" }).catch(() => {}); }}
+              onClick={(e) => {
+                e.preventDefault();
+                openFile("/home/ubuntu/Projects/vscode-clone/SETUP_GRPC.md").catch(() => {
+                  addToast("Could not open SETUP_GRPC.md", "warning");
+                });
+              }}
             >
               Setup Docs
             </a>
@@ -1195,32 +1261,36 @@ export function AIPanel() {
 
       {/* ── Model selector ── */}
       <div className="aip-model-bar" ref={modelSelectorRef}>
-        <button className="aip-model-btn" onClick={() => setShowModelSelect(s => !s)}>
-          <Cpu size={12} />
-          <span className="aip-model-label">{modelLabel}</span>
-          <ChevronDown size={11} className={showModelSelect ? "rotated" : ""} />
-        </button>
+        <div className="aip-model-bar-inner">
+          <button className="aip-model-btn" onClick={() => setShowModelSelect(s => !s)}>
+            <Cpu size={12} />
+            <span className="aip-model-label">{modelLabel}</span>
+            <ChevronDown size={11} className={showModelSelect ? "rotated" : ""} />
+          </button>
 
-        <button
-          className={`aip-model-btn aip-turbo-btn ${turboQuantStatus === "downloading" || turboQuantStatus === "quantizing" ? "active" : ""}`}
-          onClick={() => {
-            setShowTurboQuant(s => {
-              if (!s) listQuantizedModels();
-              return !s;
-            });
-          }}
-          title="TurboQuant — quantize models"
-        >
-          ⚡ TurboQuant
-        </button>
+          <div className="aip-model-btn-row">
+            <button
+              className={`aip-model-btn aip-turbo-btn ${turboQuantStatus === "downloading" || turboQuantStatus === "quantizing" ? "active" : ""}`}
+              onClick={() => {
+                setShowLocalModels(false);
+                setShowTurboQuant(s => {
+                  if (!s) listQuantizedModels();
+                  return !s;
+                });
+              }}
+              title="TurboQuant — quantize models"
+            >
+              ⚡ TurboQuant
+            </button>
 
-        <button
-          className={`aip-model-btn ${showLocalModels ? "active" : ""}`}
-          onClick={() => setShowLocalModels(s => !s)}
-          title="Browse and manage local HuggingFace models"
-        >
-          <Download size={12} /> Local Models
-        </button>
+            <button
+              className={`aip-model-btn ${showLocalModels ? "active" : ""}`}
+              onClick={() => { setShowTurboQuant(false); setShowLocalModels(s => !s); }}
+              title="Browse and manage local HuggingFace models"
+            >
+              <Download size={12} /> Local Models
+            </button>
+          </div>
 
         {showModelSelect && (
           <div className="aip-model-dropdown" id="aip-model-dropdown">
@@ -1381,10 +1451,12 @@ export function AIPanel() {
             </div>
           </div>
         )}
+        </div>{/* end aip-model-bar-inner */}
+      </div>{/* end aip-model-bar */}
 
-        {/* TurboQuant panel (Task 12.1) */}
-        {showTurboQuant && (
-          <div className="aip-session-list aip-turbo-panel">
+      {/* TurboQuant panel — rendered at ai-panel level so it covers the full panel */}
+      {showTurboQuant && (
+        <div className="aip-session-list aip-turbo-panel">
             <div className="aip-session-list-hdr">
               <span>⚡ TurboQuant</span>
               <button className="aip-icon-btn" onClick={() => setShowTurboQuant(false)} title="Close"><X size={13} /></button>
@@ -1493,9 +1565,9 @@ export function AIPanel() {
           </div>
         )}
 
-        {/* Local Models panel (Req 9.1–9.9, 10.2, 10.3) */}
-        {showLocalModels && (
-          <div className="aip-session-list aip-local-models-panel">
+      {/* Local Models panel — rendered at ai-panel level */}
+      {showLocalModels && (
+        <div className="aip-session-list aip-local-models-panel">
             <div className="aip-session-list-hdr">
               <span>🤗 Local Models</span>
               <button className="aip-icon-btn" onClick={() => setShowLocalModels(false)} title="Close"><X size={13} /></button>
@@ -1753,9 +1825,12 @@ export function AIPanel() {
             </div>
           </div>
         )}
-      </div>
 
-      {/* ── Messages ── */}      <div className="aip-messages">
+      {/* ── Messages ── */}
+      {aiMode === "spec" ? (
+        <SpecPanel />
+      ) : (
+      <div className="aip-messages">
         {chatHistory.length === 0 ? (
           noModelConfigured ? (
             /* First-run setup checklist (Req 12.5) */
@@ -1768,7 +1843,12 @@ export function AIPanel() {
                   <span className="aip-checklist-num">{isOllamaRunning ? "✓" : "1"}</span>
                   <div className="aip-checklist-body">
                     <strong>Install Ollama</strong>
-                    <span>Download and install Ollama from <a href="#" onClick={(e) => { e.preventDefault(); invoke("open_url", { url: "https://ollama.ai" }).catch(() => {}); }}>ollama.ai</a></span>
+                    <span>Download and install Ollama from <a href="#" onClick={(e) => {
+                      e.preventDefault();
+                      shellOpen("https://ollama.ai").catch(() => {
+                        addToast("Could not open ollama.ai", "warning");
+                      });
+                    }}>ollama.ai</a></span>
                   </div>
                 </li>
                 <li className={`aip-checklist-item ${availableModels.length > 0 ? "done" : ""}`}>
@@ -1806,7 +1886,7 @@ export function AIPanel() {
         ) : (
           chatHistory.map(msg => {
             const codeSuggestion = msg.role === "assistant" ? extractFirstCodeBlock(msg.content) : null;
-            const fileSuggestions = msg.role === "assistant" ? extractFileSuggestions(msg.content) : [];
+            const fileSuggestions = msg.role === "assistant" ? extractFileSuggestions(msg.content, openFolder ?? null) : [];
             const shellCmds = msg.role === "assistant" ? extractShellCommands(msg.content) : [];
             const architectureSections =
               msg.role === "assistant"
@@ -1929,7 +2009,10 @@ export function AIPanel() {
                         if (!activeTabId || !codeSuggestion || !activeTab) return;
                         if (!window.confirm(`Apply to ${activeTab.fileName}?`)) return;
                         setApplyingMessageId(msg.id);
-                        try { await applyAIChangeToTab(activeTabId, codeSuggestion, `AI suggestion ${new Date(msg.timestamp).toLocaleTimeString()}`); }
+                        try {
+                          await applyAIChangeToTab(activeTabId, codeSuggestion, `AI suggestion ${new Date(msg.timestamp).toLocaleTimeString()}`);
+                          addToast(`Updated ${activeTab.fileName}. Tracked in Change History.`, "success");
+                        }
                         finally { setApplyingMessageId(null); }
                       }}>
                       <Check size={11} /> Accept
@@ -1946,7 +2029,7 @@ export function AIPanel() {
                     {fileSuggestions.map((s, idx) => {
                       const key = `${msg.id}-f${idx}-${s.path}`;
                       if (rejectedFileKeys.has(key)) return null;
-                      const rp = resolvePath(s.path, openFolder ?? null);
+                      const rp = resolveSuggestionPath(s.path, openFolder ?? null);
                       const disabled = applyingFileKey === key || !rp;
                       const exists = rp ? fileExistenceMap[rp] : false;
                       return (
@@ -1962,19 +2045,37 @@ export function AIPanel() {
                                 if (!rp) { addToast("Open a project folder first.", "warning"); return; }
                                 let orig = "";
                                 if (exists) { try { orig = await readTextFile(rp); } catch {} }
-                                setDiffModalData({
-                                  isOpen: true, suggestionKey: key, originalPath: rp,
-                                  originalContent: orig, modifiedContent: s.content,
+                                openDiffReview({
+                                  id: key,
+                                  title: exists ? "Review AI Update" : "Review AI Create",
+                                  description: exists
+                                    ? "Compare the current file with the suggested update before applying it."
+                                    : "Review the generated file contents before creating it in the project.",
+                                  sourcePath: rp,
+                                  originalContent: orig,
+                                  modifiedContent: s.content,
+                                  acceptLabel: exists ? "Apply Update" : "Create File",
+                                  rejectLabel: "Reject Suggestion",
+                                  note: "Accepted changes are recorded in Change History with dependency tracking for full rollback.",
                                   onAccept: async () => {
                                     setApplyingFileKey(key);
                                     try {
-                                      await applyAIChangeToFile(rp, s.content, `AI file suggestion`);
+                                      await applyAIChangeToFile(rp, s.content, "AI file suggestion");
                                       setFileExistenceMap(p => ({ ...p, [rp]: true }));
                                       fileExistsCache.set(rp, true);
+                                      addToast(`${exists ? "Updated" : "Created"} ${s.path}. Tracked in Change History.`, "success");
                                       setTimeout(() => useAIStore.getState().sendMessage(`Accepted \`${s.path}\`. Proceed or output \`<task_complete>\`.`), 500);
-                                      setDiffModalData(p => ({ ...p, isOpen: false }));
-                                    } finally { setApplyingFileKey(null); }
-                                  }
+                                    } finally {
+                                      setApplyingFileKey(null);
+                                    }
+                                  },
+                                  onReject: () => {
+                                    setRejectedFileKeys((prev) => {
+                                      const next = new Set(prev);
+                                      next.add(key);
+                                      return next;
+                                    });
+                                  },
                                 });
                               }}>
                               <Eye size={11} /> Diff
@@ -1988,6 +2089,7 @@ export function AIPanel() {
                                   await applyAIChangeToFile(rp, s.content, `AI file suggestion`);
                                   setFileExistenceMap(p => ({ ...p, [rp]: true }));
                                   fileExistsCache.set(rp, true);
+                                  addToast(`${exists ? "Updated" : "Created"} ${s.path}. Tracked in Change History.`, "success");
                                   setTimeout(() => useAIStore.getState().sendMessage(`Accepted \`${s.path}\`. Proceed or output \`<task_complete>\`.`), 500);
                                 } finally { setApplyingFileKey(null); }
                               }}>
@@ -2007,22 +2109,75 @@ export function AIPanel() {
                 {shellCmds.length > 0 && (
                   <div className="aip-cmd-list">
                     {shellCmds.map((cmd, idx) => {
-                      const key = `${msg.id}-c${idx}`;
+                      const key = `${msg.id}-c${idx}-${cmd.display}`;
                       if (rejectedCmdKeys.has(key)) return null;
+                      const runState = commandRunStates[key];
+                      const isRunning = runState?.status === "queued" || runState?.status === "running";
+                      const handleCommandAction = () => {
+                        if (isRunning) {
+                          openCommandTerminal();
+                          return;
+                        }
+                        runSuggestedCommand(key, cmd.command);
+                      };
                       return (
-                        <div key={key} className="aip-cmd-row">
+                        <div
+                          key={key}
+                          className={`aip-cmd-row clickable ${runState ? `is-${runState.status}` : ""}`}
+                          onClick={handleCommandAction}
+                          onKeyDown={(event) => {
+                            if (event.key === "Enter" || event.key === " ") {
+                              event.preventDefault();
+                              handleCommandAction();
+                            }
+                          }}
+                          role="button"
+                          tabIndex={0}
+                        >
                           <Terminal size={11} className="aip-cmd-icon" />
-                          <code className="aip-cmd-code">{cmd}</code>
+                          <div className="aip-cmd-body">
+                            <code className="aip-cmd-code" title={cmd.command}>{cmd.display}</code>
+                            {cmd.context && cmd.command !== cmd.display && (
+                              <span className="aip-cmd-meta">Runs with context: <code>{cmd.context}</code></span>
+                            )}
+                            {runState && (
+                              <span className={`aip-cmd-status ${runState.status}`}>
+                                {getCommandRunLabel(runState.status, runState.exitCode)}
+                              </span>
+                            )}
+                          </div>
                           <div className="aip-actions">
-                            <button className="aip-action-btn primary"
-                              onClick={() => {
-                                useTerminalStore.getState().runCommandInTerminal(cmd);
-                                addToast("Running in terminal…", "info");
-                                setRejectedCmdKeys(s => { const n = new Set(s); n.add(key); return n; });
-                              }}>
-                              <Check size={11} /> Run
+                            <button
+                              type="button"
+                              className="aip-action-btn primary"
+                              onClick={(event) => {
+                                event.stopPropagation();
+                                handleCommandAction();
+                              }}
+                            >
+                              {isRunning ? <Terminal size={11} /> : <Check size={11} />}
+                              {isRunning ? "Show Terminal" : runState ? "Re-run & Check" : "Run & Check"}
                             </button>
-                            <button className="aip-action-btn" onClick={() => setRejectedCmdKeys(s => { const n = new Set(s); n.add(key); return n; })}>
+                            {runState && (
+                              <button
+                                type="button"
+                                className="aip-action-btn"
+                                onClick={(event) => {
+                                  event.stopPropagation();
+                                  openCommandRun();
+                                }}
+                              >
+                                <Eye size={11} /> Show Run Log
+                              </button>
+                            )}
+                            <button
+                              type="button"
+                              className="aip-action-btn"
+                              onClick={(event) => {
+                                event.stopPropagation();
+                                setRejectedCmdKeys(s => { const n = new Set(s); n.add(key); return n; });
+                              }}
+                            >
                               <X size={11} />
                             </button>
                           </div>
@@ -2105,6 +2260,7 @@ export function AIPanel() {
         )}
         <div ref={messagesEndRef} />
       </div>
+      )}{/* end spec conditional */}
 
       {/* ── Agent control bar ── */}
       {aiMode === "agent" && isThinking && (
@@ -2121,7 +2277,7 @@ export function AIPanel() {
       )}
 
       {/* ── Input ── */}
-      <div className="aip-input-wrap">
+      {aiMode !== "spec" && <div className="aip-input-wrap">
         {activeTab && (
           <div className="aip-context-pill">
             <FileCode size={10} />
@@ -2163,6 +2319,23 @@ export function AIPanel() {
           </div>
         )}
         <div className="aip-input-row" style={{ position: "relative" }}>
+          {/* Pasted images strip */}
+          {pastedImages.length > 0 && (
+            <div className="aip-pasted-images">
+              {pastedImages.map(img => (
+                <div key={img.id} className="aip-pasted-img">
+                  <img src={img.dataUrl} alt={img.name} className="aip-pasted-img-thumb" />
+                  <button
+                    className="aip-pasted-img-remove"
+                    onClick={() => setPastedImages(prev => prev.filter(i => i.id !== img.id))}
+                    title="Remove image"
+                  >
+                    <X size={9} />
+                  </button>
+                </div>
+              ))}
+            </div>
+          )}
           {/* @-mention autocomplete dropdown (Task 7.1) */}
           {mentionQuery !== null && mentionDropdown.length > 0 && (
             <div className="aip-mention-dropdown" ref={mentionDropdownRef}>
@@ -2188,29 +2361,17 @@ export function AIPanel() {
             value={input}
             onChange={handleInputChange}
             onKeyDown={handleInputKeyDown}
-            placeholder={`Ask AI… (${aiMode}${useRAG ? " + RAG" : ""}) — type @ to mention files`}
+            onPaste={handlePaste}
+            placeholder={`Ask AI… (${aiMode}${useRAG ? " + RAG" : ""}) — type @ to mention files, paste images`}
             rows={3}
-            disabled={(needsOllama && !isOllamaRunning) || isThinking}
+            disabled={blocksOnOllamaOffline || isThinking}
             className="aip-textarea"
           />
           <button className="aip-send" onClick={handleSend} disabled={!canSend} title="Send (Enter)">
             <Send size={14} />
           </button>
         </div>
-      </div>
-
-      {/* Diff modal */}
-      {diffModalData.isOpen && (
-        <DiffModal
-          isOpen={diffModalData.isOpen}
-          originalPath={diffModalData.originalPath}
-          originalContent={diffModalData.originalContent}
-          modifiedContent={diffModalData.modifiedContent}
-          onAccept={diffModalData.onAccept}
-          onReject={() => setDiffModalData(p => ({ ...p, isOpen: false }))}
-          onClose={() => setDiffModalData(p => ({ ...p, isOpen: false }))}
-        />
-      )}
+      </div>}{/* end spec input conditional */}
 
       {/* Agent confirmation dialog (Task 3.8) */}
       {confirmPending && (
